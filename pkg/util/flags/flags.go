@@ -16,7 +16,6 @@ limitations under the License.
 package flags
 
 import (
-	"flag"
 	"fmt"
 	"os"
 	"regexp"
@@ -27,9 +26,7 @@ import (
 	"github.com/spf13/pflag"
 )
 
-var (
-	logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-flags")
-)
+var logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-flags")
 
 func VerifyRequiredFlags(cmd *cobra.Command, requiredFlags []string) error {
 	var missingFlags []string
@@ -55,25 +52,11 @@ func createRequiredFlagError(name string, flags []string) error {
 	return fmt.Errorf("%s are required for %s", strings.Join(flags, ","), name)
 }
 
-func SetLoggingFlags(flags *pflag.FlagSet) {
-	//Add commandline flags to the flagset. We will always write to stderr
-	//and not to a file by default
-	flags.AddGoFlagSet(flag.CommandLine)
-	if err := flags.Set("logtostderr", "true"); err != nil {
-		// TODO: fix me
-		// 2021-09-02 09:41:29.645366 I | op-flags: failed to set flag "logtostderr". no such flag -logtostderr
-		logger.Infof("failed to set flag %q. %v", "logtostderr", err)
-	}
-	if err := flags.Parse(nil); err != nil {
-		panic(err)
-	}
-}
-
 func SetFlagsFromEnv(flags *pflag.FlagSet, prefix string) {
 	var errorFlag bool
 	var err error
 	flags.VisitAll(func(f *pflag.Flag) {
-		envVar := prefix + "_" + strings.Replace(strings.ToUpper(f.Name), "-", "_", -1)
+		envVar := prefix + "_" + strings.ReplaceAll(strings.ToUpper(f.Name), "-", "_")
 		value := os.Getenv(envVar)
 		if value != "" {
 			// Set the environment variable. Will override default values, but be overridden by command line parameters.

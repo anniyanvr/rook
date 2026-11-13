@@ -28,13 +28,13 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// ObjectUserOperation is wrapper for k8s rook object user operations
+// ObjectUserOperation is a wrapper for k8s rook object user operations
 type ObjectUserOperation struct {
 	k8sh      *utils.K8sHelper
 	manifests installer.CephManifests
 }
 
-// CreateObjectUserOperation creates new rook object user client
+// CreateObjectUserOperation creates a new rook object user client
 func CreateObjectUserOperation(k8sh *utils.K8sHelper, manifests installer.CephManifests) *ObjectUserOperation {
 	return &ObjectUserOperation{k8sh, manifests}
 }
@@ -42,7 +42,7 @@ func CreateObjectUserOperation(k8sh *utils.K8sHelper, manifests installer.CephMa
 // ObjectUserGet Function to get the details of an object user from radosgw
 func (o *ObjectUserOperation) GetUser(namespace string, store string, userid string) (*rgw.ObjectUser, error) {
 	ctx := o.k8sh.MakeContext()
-	clusterInfo := client.AdminClusterInfo(namespace)
+	clusterInfo := client.AdminTestClusterInfo(namespace)
 	objectStore, err := o.k8sh.RookClientset.CephV1().CephObjectStores(namespace).Get(context.TODO(), store, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("failed to get objectstore info: %+v", err)
@@ -61,10 +61,10 @@ func (o *ObjectUserOperation) GetUser(namespace string, store string, userid str
 // UserSecretExists Function to check that user secret was created
 func (o *ObjectUserOperation) UserSecretExists(namespace string, store string, userid string) bool {
 	message, err := o.k8sh.GetResource("-n", namespace, "secrets", "-l", "rook_object_store="+store, "-l", "user="+userid)
-	//GetResource(blah) returns success if blah is or is not found.
-	//err = success and found_sec not "No resources found." means it was found
-	//err = success and found_sec contains "No resources found." means it was not found
-	//err != success is an other error
+	// GetResource(blah) returns success if blah is or is not found.
+	// err = success and found_sec does not contain "No resources found." means it was found
+	// err = success and found_sec contains "No resources found." means it was not found
+	// err != success is another error
 	if err == nil && !strings.Contains(message, "No resources found") {
 		logger.Infof("Object User Secret Exists")
 		return true
@@ -73,9 +73,8 @@ func (o *ObjectUserOperation) UserSecretExists(namespace string, store string, u
 	return false
 }
 
-// ObjectUserCreate Function to create a object store user in rook
+// ObjectUserCreate Function to create an object store user in rook
 func (o *ObjectUserOperation) Create(userid, displayName, store, usercaps, maxsize string, maxbuckets, maxobjects int) error {
-
 	logger.Infof("creating the object store user via CRD")
 	if err := o.k8sh.ResourceOperation("apply", o.manifests.GetObjectStoreUser(userid, displayName, store, usercaps, maxsize, maxbuckets, maxobjects)); err != nil {
 		return err
@@ -84,7 +83,6 @@ func (o *ObjectUserOperation) Create(userid, displayName, store, usercaps, maxsi
 }
 
 func (o *ObjectUserOperation) Delete(namespace string, userid string) error {
-
 	logger.Infof("Deleting the object store user via CRD")
 	if err := o.k8sh.DeleteResource("-n", namespace, "CephObjectStoreUser", userid); err != nil {
 		return err

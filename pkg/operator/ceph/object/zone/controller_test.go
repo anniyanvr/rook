@@ -18,13 +18,16 @@ limitations under the License.
 package zone
 
 import (
-	"context"
+	"bytes"
+	"fmt"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/coreos/pkg/capnslog"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
+	"github.com/rook/rook/pkg/operator/ceph/object"
 	"github.com/rook/rook/pkg/operator/test"
 
 	"github.com/rook/rook/pkg/clusterd"
@@ -32,11 +35,13 @@ import (
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -46,7 +51,7 @@ const (
 		"id": "fd8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
 		"name": "zonegroup-a",
 		"api_name": "zonegroup-a",
-		"is_master": "true",
+		"is_master": true,
 		"endpoints": [
 			":80"
 		],
@@ -124,11 +129,29 @@ const (
 )
 
 func TestCephObjectZoneController(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	name := "zone-a"
 	zonegroup := "zonegroup-a"
 	namespace := "rook-ceph"
+
+	createPoolsCalled := false
+	createObjectStorePoolsFunc = func(context *object.Context, cluster *cephv1.ClusterSpec, metadataPool, dataPool cephv1.PoolSpec) error {
+		createPoolsCalled = true
+		return nil
+	}
+	defer func() {
+		createObjectStorePoolsFunc = object.CreateObjectStorePools
+	}()
+
+	commitChangesCalled := false
+	commitConfigChangesFunc = func(c *object.Context) error {
+		commitChangesCalled = true
+		return nil
+	}
+	defer func() {
+		commitConfigChangesFunc = object.CommitConfigChanges
+	}()
 
 	//
 	// TEST 1 SETUP
@@ -140,8 +163,10 @@ func TestCephObjectZoneController(t *testing.T) {
 	dataPool := cephv1.PoolSpec{}
 	objectZone := &cephv1.CephObjectZone{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:       name,
+			Namespace:  namespace,
+			Generation: 0,
+			Finalizers: []string{"cephobjectzone.ceph.rook.io"},
 		},
 		TypeMeta: metav1.TypeMeta{
 			Kind: "CephObjectZone",
@@ -182,9 +207,9 @@ func TestCephObjectZoneController(t *testing.T) {
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 	// Create a ReconcileObjectZone object with the scheme and fake client.
-	clusterInfo := cephclient.AdminClusterInfo("rook")
+	clusterInfo := cephclient.AdminTestClusterInfo("rook")
 
-	r := &ReconcileObjectZone{client: cl, scheme: s, context: c, clusterInfo: clusterInfo}
+	r := &ReconcileObjectZone{client: cl, scheme: s, context: c, clusterInfo: clusterInfo, recorder: events.NewFakeRecorder(50)}
 
 	// Mock request to simulate Reconcile() being called on an event for a
 	// watched resource .
@@ -226,7 +251,7 @@ func TestCephObjectZoneController(t *testing.T) {
 	cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 	// Create a ReconcileObjectZone object with the scheme and fake client.
-	r = &ReconcileObjectZone{client: cl, scheme: r.scheme, context: r.context}
+	r = &ReconcileObjectZone{client: cl, scheme: r.scheme, context: r.context, recorder: events.NewFakeRecorder(50)}
 	res, err = r.Reconcile(ctx, req)
 	assert.NoError(t, err)
 	assert.True(t, res.Requeue)
@@ -277,10 +302,10 @@ func TestCephObjectZoneController(t *testing.T) {
 	}
 	r.context.Executor = executor
 
-	r = &ReconcileObjectZone{client: cl, scheme: r.scheme, context: r.context}
+	r = &ReconcileObjectZone{client: cl, scheme: r.scheme, context: r.context, recorder: events.NewFakeRecorder(50)}
 
 	res, err = r.Reconcile(ctx, req)
-	assert.Error(t, err)
+	assert.NoError(t, err)
 	assert.True(t, res.Requeue)
 
 	//
@@ -342,9 +367,9 @@ func TestCephObjectZoneController(t *testing.T) {
 
 	cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
-	r = &ReconcileObjectZone{client: cl, scheme: s, context: c, clusterInfo: clusterInfo}
+	r = &ReconcileObjectZone{client: cl, scheme: s, context: c, clusterInfo: clusterInfo, recorder: events.NewFakeRecorder(50)}
 
-	err = r.client.Get(context.TODO(), types.NamespacedName{Name: zonegroup, Namespace: namespace}, objectZoneGroup)
+	err = r.client.Get(t.Context(), types.NamespacedName{Name: zonegroup, Namespace: namespace}, objectZoneGroup)
 	assert.NoError(t, err, objectZoneGroup)
 
 	req = reconcile.Request{
@@ -354,9 +379,88 @@ func TestCephObjectZoneController(t *testing.T) {
 		},
 	}
 
+	assert.False(t, createPoolsCalled)
+	assert.False(t, commitChangesCalled)
 	res, err = r.Reconcile(ctx, req)
 	assert.NoError(t, err)
 	assert.False(t, res.Requeue)
-	err = r.client.Get(context.TODO(), req.NamespacedName, objectZone)
+	err = r.client.Get(t.Context(), req.NamespacedName, objectZone)
 	assert.NoError(t, err)
+	assert.True(t, createPoolsCalled)
+	assert.True(t, commitChangesCalled)
+}
+
+// captureLogsAtLevel redirects the capnslog sink into a buffer at the given level for the
+// duration of the test, restoring the package default afterwards so later tests still log to
+// stderr and never at TRACE.
+func captureLogsAtLevel(t *testing.T, level capnslog.LogLevel) *bytes.Buffer {
+	t.Helper()
+
+	logBuf := bytes.NewBuffer([]byte{})
+	capnslog.SetFormatter(capnslog.NewLogFormatter(logBuf, "", 0))
+	capnslog.SetGlobalLogLevel(level)
+	t.Cleanup(func() {
+		capnslog.SetFormatter(capnslog.NewDefaultFormatter(os.Stderr))
+		capnslog.SetGlobalLogLevel(capnslog.INFO)
+	})
+
+	return logBuf
+}
+
+func TestDeleteZonePoolsOmitsZoneJSONFromError(t *testing.T) {
+	// 'zone get' answers with the realm system user's live S3 credentials, and this error
+	// reaches the CephObjectZone status and a Kubernetes event through reporting, so the
+	// payload is dropped rather than filtered: a document that failed to parse cannot be
+	// filtered at all.
+	const (
+		accessKey = "EXAMPLEZONEACCESSKEY"
+		secretKey = "EXAMPLEZONESYSTEMSECRETKEY00000000000001"
+	)
+	// malformed, so decodePoolPrefixfromZone fails on it; still brace delimited, so it gets
+	// past the json extraction 'zone get' does before returning
+	zoneGetOutput := `{"domain_root": "zone-a.rgw.meta:root", "system_key": {"access_key": "` + accessKey + `", "secret_key": "` + secretKey + `"},}`
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			return zoneGetOutput, nil
+		},
+	}
+
+	r := &ReconcileObjectZone{
+		context:     &clusterd.Context{Executor: executor},
+		clusterInfo: cephclient.AdminTestClusterInfo("rook"),
+	}
+	objectZone := &cephv1.CephObjectZone{
+		ObjectMeta: metav1.ObjectMeta{Name: "zone-a", Namespace: "rook-ceph"},
+		Spec:       cephv1.ObjectZoneSpec{ZoneGroup: "zonegroup-a"},
+	}
+	objContext := object.NewContext(r.context, r.clusterInfo, objectZone.Name)
+	objContext.Realm = "realm-a"
+	objContext.ZoneGroup = objectZone.Spec.ZoneGroup
+	objContext.Zone = objectZone.Name
+
+	t.Run("not in the error nor the debug log", func(t *testing.T) {
+		logBuf := captureLogsAtLevel(t, capnslog.DEBUG)
+
+		err := r.deleteZonePools(objContext, objectZone, "realm-a")
+
+		require.Error(t, err)
+		assert.NotContains(t, err.Error(), accessKey)
+		assert.NotContains(t, err.Error(), secretKey)
+		// the response size is the only context a json syntax error leaves
+		assert.Contains(t, err.Error(), fmt.Sprintf("(%d bytes)", len(zoneGetOutput)))
+		assert.NotContains(t, logBuf.String(), accessKey)
+		assert.NotContains(t, logBuf.String(), secretKey)
+	})
+
+	t.Run("raw response only at trace", func(t *testing.T) {
+		// TRACE is unlocked only by ROOK_LOG_LEVEL=TRACE_INSECURE and is the level rook allows
+		// to carry credentials
+		logBuf := captureLogsAtLevel(t, capnslog.TRACE)
+
+		err := r.deleteZonePools(objContext, objectZone, "realm-a")
+
+		require.Error(t, err)
+		assert.Contains(t, logBuf.String(), zoneGetOutput)
+	})
 }

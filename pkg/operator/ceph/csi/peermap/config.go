@@ -46,6 +46,8 @@ const (
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "peer-map")
 
+var peerPoolTempFile = "peerPool"
+
 type PeerIDMapping struct {
 	ClusterIDMapping map[string]string
 	RBDPoolIDMapping []map[string]string
@@ -135,7 +137,7 @@ func toObj(in string) (PeerIDMappings, error) {
 	return mappings, nil
 }
 
-func ReconcilePoolIDMap(clusterContext *clusterd.Context, clusterInfo *cephclient.ClusterInfo, pool *cephv1.CephBlockPool) error {
+func ReconcilePoolIDMap(ctx context.Context, clusterContext *clusterd.Context, clusterInfo *cephclient.ClusterInfo, pool *cephv1.CephBlockPool) error {
 	if pool.Spec.Mirroring.Peers == nil {
 		logger.Infof("no peer secrets added in ceph block pool %q. skipping pool ID mappings with peer cluster", pool.Name)
 		return nil
@@ -146,7 +148,7 @@ func ReconcilePoolIDMap(clusterContext *clusterd.Context, clusterInfo *cephclien
 		return errors.Wrapf(err, "failed to get peer pool ID mappings for the pool %q", pool.Name)
 	}
 
-	err = CreateOrUpdateConfig(clusterContext, mappings)
+	err = CreateOrUpdateConfig(ctx, clusterContext, mappings)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create or update peer pool ID mappings configMap for the pool %q", pool.Name)
 	}
@@ -200,7 +202,7 @@ func getClusterPoolIDMap(clusterContext *clusterd.Context, clusterInfo *cephclie
 		}
 		defer os.Remove(keyringFile.Name())
 
-		// Generate an empty config file to be passed as `--conf`argument in ceph CLI
+		// Generate an empty config file to be passed as the `--conf` argument in ceph CLI
 		configFile, err := util.CreateTempFile("")
 		if err != nil {
 			return mappings, errors.Wrap(err, "failed to create a temp config file")
@@ -208,7 +210,8 @@ func getClusterPoolIDMap(clusterContext *clusterd.Context, clusterInfo *cephclie
 		defer os.Remove(configFile.Name())
 
 		// Build command
-		args := []string{"osd", "pool", "get", pool.Name, "all",
+		args := []string{
+			"osd", "pool", "get", pool.Name, "all",
 			fmt.Sprintf("--cluster=%s", decodedTokenToGo.Namespace),
 			fmt.Sprintf("--conf=%s", configFile.Name()),
 			fmt.Sprintf("--fsid=%s", decodedTokenToGo.ClusterFSID),
@@ -236,8 +239,7 @@ func getClusterPoolIDMap(clusterContext *clusterd.Context, clusterInfo *cephclie
 	return mappings, nil
 }
 
-func CreateOrUpdateConfig(clusterContext *clusterd.Context, mappings *PeerIDMappings) error {
-	ctx := context.TODO()
+func CreateOrUpdateConfig(ctx context.Context, clusterContext *clusterd.Context, mappings *PeerIDMappings) error {
 	data, err := mappings.String()
 	if err != nil {
 		return errors.Wrap(err, "failed to convert peer cluster mappings struct to string")
@@ -251,7 +253,7 @@ func CreateOrUpdateConfig(clusterContext *clusterd.Context, mappings *PeerIDMapp
 	if err != nil {
 		if kerrors.IsNotFound(err) {
 			// Create new configMap
-			return createConfig(clusterContext, request, data)
+			return createConfig(ctx, clusterContext, request, data)
 		}
 		return errors.Wrapf(err, "failed to get existing mapping config map %q", existingConfigMap.Name)
 	}
@@ -295,7 +297,7 @@ func UpdateExistingData(existingMappings, newMappings *PeerIDMappings) (string, 
 	return data, nil
 }
 
-func createConfig(clusterContext *clusterd.Context, request types.NamespacedName, data string) error {
+func createConfig(ctx context.Context, clusterContext *clusterd.Context, request types.NamespacedName, data string) error {
 	newConfigMap := &v1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      request.Name,
@@ -308,7 +310,7 @@ func createConfig(clusterContext *clusterd.Context, request types.NamespacedName
 
 	// Get Operator owner reference
 	operatorPodName := os.Getenv(k8sutil.PodNameEnvVar)
-	ownerRef, err := k8sutil.GetDeploymentOwnerReference(clusterContext.Clientset, operatorPodName, request.Namespace)
+	ownerRef, err := k8sutil.GetDeploymentOwnerReference(ctx, clusterContext.Clientset, operatorPodName, request.Namespace)
 	if err != nil {
 		return errors.Wrap(err, "failed to get operator owner reference")
 	}
@@ -325,7 +327,7 @@ func createConfig(clusterContext *clusterd.Context, request types.NamespacedName
 		return errors.Wrapf(err, "failed to set owner reference on configMap %q", newConfigMap.Name)
 	}
 
-	err = clusterContext.Client.Create(context.TODO(), newConfigMap)
+	err = clusterContext.Client.Create(ctx, newConfigMap)
 	if err != nil {
 		return errors.Wrapf(err, "failed to create mapping configMap %q", newConfigMap.Name)
 	}
@@ -346,18 +348,40 @@ func decodePeerToken(token string) (*cephclient.PeerToken, error) {
 		return nil, errors.Wrap(err, "failed to unmarshal decoded token")
 	}
 
-	logger.Debugf("peer cluster info %+v", decodedTokenToGo)
+	// Log only the non-sensitive fields; the token embeds the peer cluster's
+	// cephx auth key (decodedTokenToGo.Key), which must never be logged.
+	logger.Debugf("decoded peer cluster info fsid=%q clientID=%q monHost=%q namespace=%q",
+		decodedTokenToGo.ClusterFSID, decodedTokenToGo.ClientID, decodedTokenToGo.MonHost, decodedTokenToGo.Namespace)
 
 	return &decodedTokenToGo, nil
 }
 
 func getPeerPoolDetails(ctx *clusterd.Context, args ...string) (cephclient.CephStoragePoolDetails, error) {
-	peerPoolDetails, err := ctx.Executor.ExecuteCommandWithTimeout(exec.CephCommandsTimeout, "ceph", args...)
+	poolDetailsTempFile, err := os.CreateTemp("", peerPoolTempFile)
+	if err != nil {
+		return cephclient.CephStoragePoolDetails{}, errors.Wrap(err, "failed to generate temporary file")
+	}
+
+	defer func() {
+		err := os.Remove(poolDetailsTempFile.Name())
+		if err != nil {
+			logger.Errorf("failed to remove file %q. %v", poolDetailsTempFile.Name(), err)
+		}
+	}()
+
+	args = append(args, "--out-file", poolDetailsTempFile.Name())
+
+	_, err = ctx.Executor.ExecuteCommandWithTimeout(exec.CephCommandsTimeout, "ceph", args...)
 	if err != nil {
 		return cephclient.CephStoragePoolDetails{}, errors.Wrap(err, "failed to get pool details from peer cluster")
 	}
 
-	return cephclient.ParsePoolDetails([]byte(peerPoolDetails))
+	data, err := os.ReadFile(poolDetailsTempFile.Name())
+	if err != nil {
+		return cephclient.CephStoragePoolDetails{}, errors.Wrapf(err, "failed to read from the temporary json output file %q", poolDetailsTempFile.Name())
+	}
+
+	return cephclient.ParsePoolDetails(data)
 }
 
 func getMapKV(input map[string]string) (string, string) {

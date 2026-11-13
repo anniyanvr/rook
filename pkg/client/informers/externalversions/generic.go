@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,7 +19,7 @@ limitations under the License.
 package externalversions
 
 import (
-	"fmt"
+	fmt "fmt"
 
 	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	schema "k8s.io/apimachinery/pkg/runtime/schema"
@@ -55,6 +55,14 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 	// Group=ceph.rook.io, Version=v1
 	case v1.SchemeGroupVersion.WithResource("cephblockpools"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephBlockPools().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("cephblockpoolradosnamespaces"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephBlockPoolRadosNamespaces().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("cephbucketnotifications"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephBucketNotifications().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("cephbuckettopics"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephBucketTopics().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("cephcosidrivers"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephCOSIDrivers().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("cephclients"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephClients().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("cephclusters"):
@@ -63,12 +71,18 @@ func (f *sharedInformerFactory) ForResource(resource schema.GroupVersionResource
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephFilesystems().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("cephfilesystemmirrors"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephFilesystemMirrors().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("cephfilesystemsubvolumegroups"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephFilesystemSubVolumeGroups().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("cephnfses"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephNFSes().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("cephnvmeofgateways"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephNVMeOFGateways().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("cephobjectrealms"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephObjectRealms().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("cephobjectstores"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephObjectStores().Informer()}, nil
+	case v1.SchemeGroupVersion.WithResource("cephobjectstoreaccounts"):
+		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephObjectStoreAccounts().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("cephobjectstoreusers"):
 		return &genericInformer{resource: resource.GroupResource(), informer: f.Ceph().V1().CephObjectStoreUsers().Informer()}, nil
 	case v1.SchemeGroupVersion.WithResource("cephobjectzones"):

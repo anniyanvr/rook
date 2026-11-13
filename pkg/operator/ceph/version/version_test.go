@@ -24,19 +24,19 @@ import (
 )
 
 func TestToString(t *testing.T) {
-	assert.Equal(t, "15.0.0-0 octopus", Octopus.String())
-	received := CephVersion{-1, 0, 0, 0, ""}
+	assert.Equal(t, "19.0.0-0 squid", Squid.String())
 
+	received := CephVersion{-1, 0, 0, 0, ""}
 	expected := fmt.Sprintf("-1.0.0-0 %s", unknownVersionString)
 	assert.Equal(t, expected, received.String())
 }
 
 func TestCephVersionFormatted(t *testing.T) {
-	assert.Equal(t, "ceph version 15.0.0-0 octopus", Octopus.CephVersionFormatted())
+	assert.Equal(t, "ceph version 19.0.0-0 squid", Squid.CephVersionFormatted())
 }
 
 func TestReleaseName(t *testing.T) {
-	assert.Equal(t, "octopus", Octopus.ReleaseName())
+	assert.Equal(t, "squid", Squid.ReleaseName())
 	ver := CephVersion{-1, 0, 0, 0, ""}
 	assert.Equal(t, unknownVersionString, ver.ReleaseName())
 }
@@ -50,24 +50,24 @@ func extractVersionHelper(t *testing.T, text string, major, minor, extra, build 
 
 func TestExtractVersion(t *testing.T) {
 	// release build
-	v0c := "ceph version 16.2.6 (ae699615bac534ea496ee965ac6192cb7e0e07c1) pacific (stable)"
+	v0c := "ceph version 19.2.6 (ae699615bac534ea496ee965ac6192cb7e0e07c1) squid (stable)"
 	v0d := `
 root@7a97f5a78bc6:/# ceph --version
-ceph version 16.2.6 (ae699615bac534ea496ee965ac6192cb7e0e07c1) pacific (stable)
+ceph version 19.2.6 (ae699615bac534ea496ee965ac6192cb7e0e07c1) squid (stable)
 `
-	extractVersionHelper(t, v0c, 16, 2, 6, 0, "ae699615bac534ea496ee965ac6192cb7e0e07c1")
-	extractVersionHelper(t, v0d, 16, 2, 6, 0, "ae699615bac534ea496ee965ac6192cb7e0e07c1")
+	extractVersionHelper(t, v0c, 19, 2, 6, 0, "ae699615bac534ea496ee965ac6192cb7e0e07c1")
+	extractVersionHelper(t, v0d, 19, 2, 6, 0, "ae699615bac534ea496ee965ac6192cb7e0e07c1")
 
 	// development build
-	v1c := "ceph version 16.1.33-403-g7ba6bece41 (7ba6bece4187eda5d05a9b84211fe6ba8dd287bd) pacific (rc)"
+	v1c := "ceph version 19.1.33-403-g7ba6bece41 (7ba6bece4187eda5d05a9b84211fe6ba8dd287bd) squid (rc)"
 	v1d := `
 bin/ceph --version
 *** DEVELOPER MODE: setting PATH, PYTHONPATH and LD_LIBRARY_PATH ***
-ceph version 16.1.33-403-g7ba6bece41
-(7ba6bece4187eda5d05a9b84211fe6ba8dd287bd) pacific (rc)
+ceph version 19.1.33-403-g7ba6bece41
+(7ba6bece4187eda5d05a9b84211fe6ba8dd287bd) squid (rc)
 `
-	extractVersionHelper(t, v1c, 16, 1, 33, 403, "7ba6bece4187eda5d05a9b84211fe6ba8dd287bd")
-	extractVersionHelper(t, v1d, 16, 1, 33, 403, "7ba6bece4187eda5d05a9b84211fe6ba8dd287bd")
+	extractVersionHelper(t, v1c, 19, 1, 33, 403, "7ba6bece4187eda5d05a9b84211fe6ba8dd287bd")
+	extractVersionHelper(t, v1d, 19, 1, 33, 403, "7ba6bece4187eda5d05a9b84211fe6ba8dd287bd")
 
 	// build without git version info. it is possible to build the ceph tree
 	// without a version number, but none of the container builds do this.
@@ -75,11 +75,11 @@ ceph version 16.1.33-403-g7ba6bece41
 	// explicitly adding fine-grained versioning to avoid issues with
 	// release granularity. adding the reverse name-to-version is easy
 	// enough if this ever becomes a need.
-	v2c := "ceph version Development (no_version) pacific (rc)"
+	v2c := "ceph version Development (no_version) squid (rc)"
 	v2d := `
 bin/ceph --version
 *** DEVELOPER MODE: setting PATH, PYTHONPATH and LD_LIBRARY_PATH ***
-ceph version Development (no_version) octopus (rc)
+ceph version Development (no_version) squid (rc)
 `
 	v, err := ExtractCephVersion(v2c)
 	assert.Error(t, err)
@@ -90,38 +90,48 @@ ceph version Development (no_version) octopus (rc)
 	assert.Nil(t, v)
 
 	// Test the round trip for serializing and deserializing the version
-	v3c := "ceph version 16.2.5-1 pacific"
+	v3c := "ceph version 19.2.5-1 squid"
 	v, err = ExtractCephVersion(v3c)
 	assert.NoError(t, err)
 	assert.NotNil(t, v)
-	assert.Equal(t, "16.2.5-1 pacific", v.String())
+	assert.Equal(t, "19.2.5-1 squid", v.String())
 }
 
 func TestSupported(t *testing.T) {
 	for _, v := range supportedVersions {
 		assert.True(t, v.Supported())
 	}
+	assert.False(t, (&CephVersion{22, 0, 0, 0, ""}).Supported())
+}
+
+func TestMinimumMajor(t *testing.T) {
+	// compile-time guards key on the constant; Minimum is what the operator
+	// enforces at runtime. They must not drift apart.
+	assert.Equal(t, MinimumMajor, Minimum.Major)
+	assert.True(t, Minimum.Supported())
 }
 
 func TestIsRelease(t *testing.T) {
-	assert.True(t, Octopus.isRelease(Octopus))
-	assert.True(t, Pacific.isRelease(Pacific))
-	assert.True(t, Quincy.isRelease(Quincy))
+	assert.True(t, Squid.isRelease(Squid))
+	assert.True(t, Tentacle.isRelease(Tentacle))
+	assert.True(t, Umbrella.isRelease(Umbrella))
 
-	assert.False(t, Pacific.isRelease(Octopus))
+	assert.False(t, Squid.isRelease(Tentacle))
+	assert.False(t, Tentacle.isRelease(Umbrella))
 
-	OctopusUpdate := Octopus
-	OctopusUpdate.Minor = 33
-	OctopusUpdate.Extra = 4
-	assert.True(t, OctopusUpdate.isRelease(Octopus))
-}
-
-func TestIsReleaseX(t *testing.T) {
-	assert.False(t, Pacific.IsOctopus())
+	SquidUpdate := Squid
+	SquidUpdate.Minor = 33
+	SquidUpdate.Extra = 4
+	assert.True(t, SquidUpdate.isRelease(Squid))
 }
 
 func TestVersionAtLeast(t *testing.T) {
-	assert.True(t, Octopus.IsAtLeast(Octopus))
+	assert.True(t, Squid.IsAtLeast(Squid))
+	assert.True(t, Tentacle.IsAtLeast(Tentacle))
+	assert.True(t, Umbrella.IsAtLeast(Umbrella))
+	assert.True(t, Tentacle.IsAtLeast(Squid))
+	assert.True(t, Umbrella.IsAtLeast(Tentacle))
+	assert.True(t, Umbrella.IsAtLeast(Squid))
 
 	assert.True(t, (&CephVersion{1, 0, 0, 0, ""}).IsAtLeast(CephVersion{0, 0, 0, 0, ""}))
 	assert.False(t, (&CephVersion{0, 0, 0, 0, ""}).IsAtLeast(CephVersion{1, 0, 0, 0, ""}))
@@ -130,12 +140,23 @@ func TestVersionAtLeast(t *testing.T) {
 	assert.True(t, (&CephVersion{1, 1, 1, 0, ""}).IsAtLeast(CephVersion{1, 1, 0, 0, ""}))
 	assert.False(t, (&CephVersion{1, 1, 0, 0, ""}).IsAtLeast(CephVersion{1, 1, 1, 0, ""}))
 	assert.True(t, (&CephVersion{1, 1, 1, 0, ""}).IsAtLeast(CephVersion{1, 1, 1, 0, ""}))
+
+	// Build number comparisons
+	assert.True(t, (&CephVersion{20, 2, 1, 324, ""}).IsAtLeast(CephVersion{20, 2, 1, 297, ""}))
+	assert.False(t, (&CephVersion{20, 2, 1, 294, ""}).IsAtLeast(CephVersion{20, 2, 1, 297, ""}))
+	assert.True(t, (&CephVersion{20, 2, 1, 297, ""}).IsAtLeast(CephVersion{20, 2, 1, 297, ""}))
 }
 
 func TestVersionAtLeastX(t *testing.T) {
-	assert.True(t, Octopus.IsAtLeastOctopus())
-	assert.True(t, Pacific.IsAtLeastPacific())
-	assert.False(t, Octopus.IsAtLeastPacific())
+	assert.True(t, Squid.IsAtLeastSquid())
+	assert.False(t, Squid.IsAtLeastTentacle())
+	assert.False(t, Squid.IsAtLeastUmbrella())
+	assert.True(t, Tentacle.IsAtLeastSquid())
+	assert.True(t, Tentacle.IsAtLeastTentacle())
+	assert.False(t, Tentacle.IsAtLeastUmbrella())
+	assert.True(t, Umbrella.IsAtLeastSquid())
+	assert.True(t, Umbrella.IsAtLeastTentacle())
+	assert.True(t, Umbrella.IsAtLeastUmbrella())
 }
 
 func TestIsIdentical(t *testing.T) {
@@ -152,6 +173,36 @@ func TestIsSuperior(t *testing.T) {
 	assert.True(t, IsSuperior(CephVersion{15, 2, 2, 1, ""}, CephVersion{15, 2, 1, 0, ""}))
 }
 
+func TestIsStrictlySuperior(t *testing.T) {
+	// same ordering as IsSuperior when the commit IDs are equal
+	assert.False(t, IsStrictlySuperior(CephVersion{15, 2, 2, 0, ""}, CephVersion{15, 2, 2, 0, ""}))
+	assert.False(t, IsStrictlySuperior(CephVersion{15, 2, 2, 0, ""}, CephVersion{16, 2, 2, 0, ""}))
+	assert.True(t, IsStrictlySuperior(CephVersion{16, 2, 2, 0, ""}, CephVersion{15, 2, 2, 0, ""}))
+	assert.True(t, IsStrictlySuperior(CephVersion{15, 2, 2, 0, ""}, CephVersion{15, 1, 3, 0, ""}))
+	assert.True(t, IsStrictlySuperior(CephVersion{15, 2, 2, 0, ""}, CephVersion{15, 2, 1, 0, ""}))
+	assert.True(t, IsStrictlySuperior(CephVersion{15, 2, 2, 1, ""}, CephVersion{15, 2, 1, 0, ""}))
+
+	// unlike IsSuperior, a differing commit ID alone does not make either version superior
+	a := CephVersion{15, 2, 2, 0, "aaaaaaaaaaaaaaaa"}
+	b := CephVersion{15, 2, 2, 0, "bbbbbbbbbbbbbbbb"}
+	assert.True(t, IsSuperior(a, b))
+	assert.True(t, IsSuperior(b, a))
+	assert.False(t, IsStrictlySuperior(a, b))
+	assert.False(t, IsStrictlySuperior(b, a))
+
+	// the same holds when only one side reports a commit ID
+	assert.False(t, IsStrictlySuperior(CephVersion{15, 2, 2, 0, ""}, a))
+	assert.False(t, IsStrictlySuperior(a, CephVersion{15, 2, 2, 0, ""}))
+
+	// a differing commit ID must not mask a real version difference
+	assert.True(t, IsStrictlySuperior(CephVersion{15, 2, 3, 0, "aaaaaaaaaaaaaaaa"}, b))
+	assert.False(t, IsStrictlySuperior(CephVersion{15, 2, 1, 0, "aaaaaaaaaaaaaaaa"}, b))
+
+	// the caller's versions are not modified
+	assert.Equal(t, "aaaaaaaaaaaaaaaa", a.CommitID)
+	assert.Equal(t, "bbbbbbbbbbbbbbbb", b.CommitID)
+}
+
 func TestIsInferior(t *testing.T) {
 	assert.False(t, IsInferior(CephVersion{15, 2, 2, 0, ""}, CephVersion{15, 2, 2, 0, ""}))
 	assert.False(t, IsInferior(CephVersion{16, 2, 2, 0, ""}, CephVersion{15, 2, 2, 0, ""}))
@@ -163,27 +214,27 @@ func TestIsInferior(t *testing.T) {
 
 func TestValidateCephVersionsBetweenLocalAndExternalClusters(t *testing.T) {
 	// TEST 1: versions are identical
-	localCephVersion := CephVersion{Major: 15, Minor: 2, Extra: 1}
-	externalCephVersion := CephVersion{Major: 15, Minor: 2, Extra: 1}
+	localCephVersion := CephVersion{Major: 17, Minor: 2, Extra: 1}
+	externalCephVersion := CephVersion{Major: 17, Minor: 2, Extra: 1}
 	err := ValidateCephVersionsBetweenLocalAndExternalClusters(localCephVersion, externalCephVersion)
 	assert.NoError(t, err)
 
 	// TEST 2: local cluster version major is lower than external cluster version
-	localCephVersion = CephVersion{Major: 15, Minor: 2, Extra: 1}
-	externalCephVersion = CephVersion{Major: 16, Minor: 2, Extra: 1}
+	localCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 1}
+	externalCephVersion = CephVersion{Major: 18, Minor: 2, Extra: 1}
 	err = ValidateCephVersionsBetweenLocalAndExternalClusters(localCephVersion, externalCephVersion)
 	assert.NoError(t, err)
 
 	// TEST 3: local cluster version major is higher than external cluster version
-	localCephVersion = CephVersion{Major: 16, Minor: 2, Extra: 1}
-	externalCephVersion = CephVersion{Major: 15, Minor: 2, Extra: 1}
+	localCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 1}
+	externalCephVersion = CephVersion{Major: 16, Minor: 2, Extra: 1}
 	err = ValidateCephVersionsBetweenLocalAndExternalClusters(localCephVersion, externalCephVersion)
 	assert.Error(t, err)
 
 	// TEST 4: local version is > but from a minor release
 	// local version must never be higher
-	localCephVersion = CephVersion{Major: 15, Minor: 2, Extra: 2}
-	externalCephVersion = CephVersion{Major: 15, Minor: 2, Extra: 1}
+	localCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 2}
+	externalCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 1}
 	err = ValidateCephVersionsBetweenLocalAndExternalClusters(localCephVersion, externalCephVersion)
 	assert.Error(t, err)
 
@@ -192,6 +243,26 @@ func TestValidateCephVersionsBetweenLocalAndExternalClusters(t *testing.T) {
 	externalCephVersion = CephVersion{Major: 15, Minor: 2, Extra: 2}
 	err = ValidateCephVersionsBetweenLocalAndExternalClusters(localCephVersion, externalCephVersion)
 	assert.NoError(t, err)
+
+	// TEST 6: same release on both sides, but the images were built from different commits.
+	// Neither version is higher than the other, so connecting must be allowed.
+	localCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 1, CommitID: "aaaaaaaaaaaaaaaa"}
+	externalCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 1, CommitID: "bbbbbbbbbbbbbbbb"}
+	err = ValidateCephVersionsBetweenLocalAndExternalClusters(localCephVersion, externalCephVersion)
+	assert.NoError(t, err)
+
+	// TEST 7: same release, but only the external cluster reports a commit ID
+	localCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 1}
+	externalCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 1, CommitID: "bbbbbbbbbbbbbbbb"}
+	err = ValidateCephVersionsBetweenLocalAndExternalClusters(localCephVersion, externalCephVersion)
+	assert.NoError(t, err)
+
+	// TEST 8: a commit ID difference must not mask a real version difference. The local
+	// cluster is still higher than the external one, so this must be rejected.
+	localCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 2, CommitID: "aaaaaaaaaaaaaaaa"}
+	externalCephVersion = CephVersion{Major: 17, Minor: 2, Extra: 1, CommitID: "bbbbbbbbbbbbbbbb"}
+	err = ValidateCephVersionsBetweenLocalAndExternalClusters(localCephVersion, externalCephVersion)
+	assert.Error(t, err)
 }
 
 func TestCephVersion_Unsupported(t *testing.T) {
@@ -206,11 +277,8 @@ func TestCephVersion_Unsupported(t *testing.T) {
 		fields fields
 		want   bool
 	}{
-		{"supported", fields{Major: 16, Minor: 2, Extra: 1, Build: 0}, false},
-		{"supported", fields{Major: 15, Minor: 2, Extra: 1, Build: 0}, false},
-		{"supported", fields{Major: 15, Minor: 2, Extra: 6, Build: 0}, false},
-		{"unsupported", fields{Major: 14, Minor: 2, Extra: 13, Build: 0}, true},
-		{"unsupported", fields{Major: 17, Minor: 2, Extra: 0, Build: 0}, false},
+		{"squid", fields{Major: 19, Minor: 2, Extra: 0, Build: 0}, false},
+		{"squid", fields{Major: 19, Minor: 2, Extra: 0, Build: 0}, false},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

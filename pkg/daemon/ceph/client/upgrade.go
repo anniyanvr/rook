@@ -46,7 +46,7 @@ func getCephMonVersionString(context *clusterd.Context, clusterInfo *ClusterInfo
 	args := []string{"version"}
 	buf, err := NewCephCommand(context, clusterInfo, args).Run()
 	if err != nil {
-		return "", errors.Wrap(err, "failed to run 'ceph version'")
+		return "", errors.Wrapf(err, "failed to run 'ceph version'. %s", string(buf))
 	}
 	output := string(buf)
 	logger.Debug(output)
@@ -99,20 +99,6 @@ func GetAllCephDaemonVersions(context *clusterd.Context, clusterInfo *ClusterInf
 	return &cephVersionsResult, nil
 }
 
-// EnableMessenger2 enable the messenger 2 protocol on Nautilus clusters
-func EnableMessenger2(context *clusterd.Context, clusterInfo *ClusterInfo) error {
-	args := []string{"mon", "enable-msgr2"}
-	buf, err := NewCephCommand(context, clusterInfo, args).Run()
-	if err != nil {
-		return errors.Wrap(err, "failed to enable msgr2 protocol")
-	}
-	output := string(buf)
-	logger.Debug(output)
-	logger.Infof("successfully enabled msgr2 protocol")
-
-	return nil
-}
-
 // EnableReleaseOSDFunctionality disallows pre-Nautilus OSDs and enables all new Nautilus-only functionality
 func EnableReleaseOSDFunctionality(context *clusterd.Context, clusterInfo *ClusterInfo, release string) error {
 	args := []string{"osd", "require-osd-release", release}
@@ -141,11 +127,11 @@ func OkToStop(context *clusterd.Context, clusterInfo *ClusterInfo, deployment, d
 		// if len(versions.Mon) > 1, this means we have different Ceph versions for some monitor(s).
 		// This is fine, we can run the upgrade checks
 		if len(versions.Mon) == 1 {
-			// now trying to parse and find how many mons are presents
+			// now trying to parse and find how many mons are present
 			// if we have less than 3 mons we skip the check and do best-effort
 			// we do less than 3 because during the initial bootstrap the mon sequence is updated too
-			// so running running the check on 2/3 mon fails
-			// versions.Mon looks like this map[ceph version 15.0.0-12-g6c8fb92 (6c8fb920cb1d862f36ee852ed849a15f9a50bd68) octopus (dev):1]
+			// so running the check on 2/3 mon fails
+			// versions.Mon looks like this map[ceph version 19.0.0-12-g6c8fb92 (6c8fb920cb1d862f36ee852ed849a15f9a50bd68) squid (dev):1]
 			// now looping over a single element since we can't address the key directly (we don't know its name)
 			for _, monCount := range versions.Mon {
 				if monCount < 3 {
@@ -162,10 +148,10 @@ func OkToStop(context *clusterd.Context, clusterInfo *ClusterInfo, deployment, d
 	}
 
 	// we don't implement any checks for mon, rgw and rbdmirror since:
-	//  - mon: the is done in the monitor code since it ensures all the mons are always in quorum before continuing
-	//  - rgw: the pod spec has a liveness probe so if the pod successfully start
+	//  - mon: this is done in the monitor code since it ensures all the mons are always in quorum before continuing
+	//  - rgw: the pod spec has a liveness probe so if the pod successfully starts
 	//  - rbdmirror: you can chain as many as you want like mdss but there is no ok-to-stop logic yet
-	err = util.Retry(okToStopRetries, okToStopDelay, func() error {
+	err = util.RetryWithContext(clusterInfo.Context, okToStopRetries, okToStopDelay, func() error {
 		return okToStopDaemon(context, clusterInfo, deployment, daemonType, daemonName)
 	})
 	if err != nil {
@@ -194,15 +180,15 @@ func okToStopDaemon(context *clusterd.Context, clusterInfo *ClusterInfo, deploym
 		args := []string{daemonType, "ok-to-stop", daemonName}
 		buf, err := NewCephCommand(context, clusterInfo, args).Run()
 		if err != nil {
-			return errors.Wrapf(err, "deployment %s cannot be stopped", deployment)
+			return errors.Wrapf(err, "deployment %s cannot be stopped. %s", deployment, string(buf))
 		}
 		output := string(buf)
 		logger.Debugf("deployment %s is ok to be updated. %s", deployment, output)
 	}
 
-	// At this point, we can't tell if the daemon is unknown or if
-	// but it's not a problem since perhaps it has no "ok-to-stop" call
-	// It's fine to return nil here
+	// Reaching this point means either the daemon type has no "ok-to-stop" check
+	// (it is in daemonNoCheck) or the check passed, so returning nil is correct
+	// in either case.
 	logger.Debugf("deployment %s is ok to be updated.", deployment)
 
 	return nil
@@ -213,7 +199,7 @@ func okToStopDaemon(context *clusterd.Context, clusterInfo *ClusterInfo, deploym
 func okToContinueMDSDaemon(context *clusterd.Context, clusterInfo *ClusterInfo, deployment, daemonType, daemonName string) error {
 	// wait for the MDS to be active again or in standby-replay
 	retries, delay := getRetryConfig(clusterInfo, "mds")
-	err := util.Retry(retries, delay, func() error {
+	err := util.RetryWithContext(clusterInfo.Context, retries, delay, func() error {
 		return MdsActiveOrStandbyReplay(context, clusterInfo, findFSName(deployment))
 	})
 	if err != nil {
@@ -227,13 +213,15 @@ func okToContinueMDSDaemon(context *clusterd.Context, clusterInfo *ClusterInfo, 
 // So if we invoke this method function with "mon", it will look for the least recent version
 // Assume the following:
 //
-// "mon": {
-//     "ceph version 16.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) pacific (stable)": 2,
-//     "ceph version 17.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) quincy (stable)": 1
-// }
+//	"mon": {
+//	    "ceph version 18.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) reef (stable)": 2,
+//	    "ceph version 19.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) squid (stable)": 1
+//	}
 //
-// In the case we will pick: "ceph version 16.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) pacific (stable)": 2,
-// And eventually return 16.2.5
+// In the case we will pick: "ceph version 18.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) reef (stable)": 2,
+// And eventually return 18.2.5
+//
+// If a daemon has no entries, return a zero version and no error.
 func LeastUptodateDaemonVersion(context *clusterd.Context, clusterInfo *ClusterInfo, daemonType string) (cephver.CephVersion, error) {
 	var r map[string]int
 	var vv cephver.CephVersion
@@ -248,15 +236,27 @@ func LeastUptodateDaemonVersion(context *clusterd.Context, clusterInfo *ClusterI
 	if err != nil {
 		return vv, errors.Wrap(err, "failed to find daemon map entry")
 	}
+
+	if len(r) == 0 {
+		return cephver.CephVersion{}, nil // return zero version if no entries
+	}
+
+	maxInt := 65535
+
+	vv = cephver.CephVersion{Major: maxInt, Minor: maxInt, Extra: maxInt, Build: maxInt, CommitID: ""}
 	for v := range r {
 		version, err := cephver.ExtractCephVersion(v)
 		if err != nil {
-			return vv, errors.Wrap(err, "failed to extract ceph version")
+			return cephver.CephVersion{}, errors.Wrap(err, "failed to extract ceph version")
 		}
-		vv = *version
-		// break right after the first iteration
-		// the first one is always the least up-to-date
-		break
+
+		if cephver.IsInferior(*version, vv) {
+			vv = *version
+		}
+	}
+
+	if vv.Major == maxInt {
+		return cephver.CephVersion{}, errors.New("failed to determine least ceph version")
 	}
 
 	return vv, nil
@@ -270,16 +270,8 @@ func daemonMapEntry(versions *cephv1.CephDaemonsVersions, daemonType string) (ma
 	switch daemonType {
 	case "mon":
 		return versions.Mon, nil
-	case "mgr":
-		return versions.Mgr, nil
-	case "mds":
-		return versions.Mds, nil
 	case "osd":
 		return versions.Osd, nil
-	case "rgw":
-		return versions.Rgw, nil
-	case "mirror":
-		return versions.RbdMirror, nil
 	}
 
 	return nil, errors.Errorf("invalid daemonType %s", daemonType)
@@ -306,7 +298,7 @@ func allOSDsSameHost(context *clusterd.Context, clusterInfo *ClusterInfo) (bool,
 		return false, errNoHostInCRUSH
 	}
 
-	// If the number of OSD node is 1, chances are this is simple setup with all OSDs on it
+	// If the number of OSD nodes is 1, chances are this is a simple setup with all OSDs on it
 	if hostOsdNodes == 1 {
 		// number of OSDs on that host
 		hostOsdNum := len(hostOsdTree.Nodes[0].Children)
@@ -358,27 +350,12 @@ func OSDUpdateShouldCheckOkToStop(context *clusterd.Context, clusterInfo *Cluste
 		return false
 	}
 
-	// aio means all in one
-	aio, err := allOSDsSameHost(context, clusterInfo)
-	if err != nil {
-		if errors.Is(err, errNoHostInCRUSH) {
-			logger.Warning("the CRUSH map has no 'host' entries so not performing ok-to-stop checks")
-			return false
-		}
-		logger.Warningf("failed to determine if all osds are running on the same host. will check if OSDs are ok-to-stop. if all OSDs are running on one host %s. %v", userIntervention, err)
-		return true
-	}
-	if aio {
-		logger.Warningf("all OSDs are running on the same host. not performing upgrade check. running in best-effort")
-		return false
-	}
-
 	return true
 }
 
 // osdDoNothing determines whether we should perform upgrade pre-check and post-checks for the OSD daemon
-// it checks for various cluster info like number of OSD and their placement
-// it returns 'true' if we need to do nothing and false and we should pre-check/post-check
+// it checks for various cluster info like the number of OSDs and their placement
+// it returns 'true' if we need to do nothing and false if we should pre-check/post-check
 func osdDoNothing(context *clusterd.Context, clusterInfo *ClusterInfo) bool {
 	osds, err := OsdListNum(context, clusterInfo)
 	if err != nil {
@@ -398,12 +375,12 @@ func osdDoNothing(context *clusterd.Context, clusterInfo *ClusterInfo) bool {
 	aio, err := allOSDsSameHost(context, clusterInfo)
 	if err != nil {
 		// We return true so that we can continue without a retry and subsequently not test if the
-		// osd can be stopped This handles the scenario where the OSDs have been created but not yet
-		// started due to a wrong CR configuration For instance, when OSDs are encrypted and Vault
+		// osd can be stopped. This handles the scenario where the OSDs have been created but not yet
+		// started due to a wrong CR configuration. For instance, when OSDs are encrypted and Vault
 		// is used to store encryption keys, if the KV version is incorrect during the cluster
 		// initialization the OSDs will fail to start and stay in CLBO until the CR is updated again
-		// with the correct KV version so that it can start For this scenario we don't need to go
-		// through the path where the check whether the OSD can be stopped or not, so it will always
+		// with the correct KV version so that it can start. For this scenario we don't need to go
+		// through the path that checks whether the OSD can be stopped, so it will always
 		// fail and make us wait for nothing
 		if errors.Is(err, errNoHostInCRUSH) {
 			logger.Warning("the CRUSH map has no 'host' entries so not performing ok-to-stop checks")

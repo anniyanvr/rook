@@ -23,8 +23,10 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util/log"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -39,8 +41,9 @@ const (
 
 var updateDeploymentAndWait = mon.UpdateCephDeploymentAndWait
 
-// Start begins the process of running filesystem mirroring daemons.
+// start begins the process of running filesystem mirroring daemons.
 func (r *ReconcileFilesystemMirror) start(filesystemMirror *cephv1.CephFilesystemMirror) error {
+	nsName := controller.NsName(filesystemMirror.Namespace, filesystemMirror.Name)
 	// Validate pod's memory if specified
 	err := controller.CheckPodMemory(cephv1.ResourcesKeyFilesystemMirror, filesystemMirror.Spec.Resources, cephFilesystemMirrorPodMinimumMemory)
 	if err != nil {
@@ -54,7 +57,7 @@ func (r *ReconcileFilesystemMirror) start(filesystemMirror *cephv1.CephFilesyste
 		ownerInfo:    ownerInfo,
 	}
 
-	_, err = r.generateKeyring(daemonConf)
+	secretResourceVersion, err := r.generateKeyring(daemonConf)
 	if err != nil {
 		return errors.Wrapf(err, "failed to generate keyring for %q", AppName)
 	}
@@ -64,6 +67,9 @@ func (r *ReconcileFilesystemMirror) start(filesystemMirror *cephv1.CephFilesyste
 	if err != nil {
 		return errors.Wrap(err, "failed to create filesystem-mirror deployment")
 	}
+
+	// apply cephx secret resource version to the deployment to ensure it restarts when keyring updates
+	d.Spec.Template.Annotations[keyring.CephxKeyIdentifierAnnotation] = secretResourceVersion
 
 	// Set owner ref to filesystemMirror object
 	err = controllerutil.SetControllerReference(filesystemMirror, d, r.scheme)
@@ -81,13 +87,13 @@ func (r *ReconcileFilesystemMirror) start(filesystemMirror *cephv1.CephFilesyste
 		if !kerrors.IsAlreadyExists(err) {
 			return errors.Wrapf(err, "failed to create %q deployment", d.Name)
 		}
-		logger.Infof("deployment for filesystem-mirror %q already exists. updating if needed", d.Name)
+		log.NamedInfo(nsName, logger, "deployment for filesystem-mirror already exists. updating if needed")
 
 		if err := updateDeploymentAndWait(r.context, r.clusterInfo, d, config.FilesystemMirrorType, AppName, r.cephClusterSpec.SkipUpgradeChecks, false); err != nil {
 			// fail could be an issue updating label selector (immutable), so try del and recreate
-			logger.Debugf("updateDeploymentAndWait failed for filesystem-mirror %q. Attempting del-and-recreate. %v", d.Name, err)
-			err = r.context.Clientset.AppsV1().Deployments(filesystemMirror.Namespace).Delete(r.opManagerContext, filesystemMirror.Name, metav1.DeleteOptions{})
-			if err != nil {
+			log.NamedDebug(nsName, logger, "updateDeploymentAndWait failed for filesystem-mirror %q. Attempting del-and-recreate. %v", d.Name, err)
+			err = r.context.Clientset.AppsV1().Deployments(filesystemMirror.Namespace).Delete(r.opManagerContext, d.Name, metav1.DeleteOptions{})
+			if err != nil && !kerrors.IsNotFound(err) {
 				return errors.Wrapf(err, "failed to delete filesystem-mirror deployment %q during del-and-recreate update attempt", d.Name)
 			}
 			if _, err := r.context.Clientset.AppsV1().Deployments(filesystemMirror.Namespace).Create(r.opManagerContext, d, metav1.CreateOptions{}); err != nil {
@@ -96,7 +102,7 @@ func (r *ReconcileFilesystemMirror) start(filesystemMirror *cephv1.CephFilesyste
 		}
 	}
 
-	logger.Infof("%q deployment started", AppName)
+	log.NamedInfo(nsName, logger, "%q deployment started", AppName)
 
 	return nil
 }

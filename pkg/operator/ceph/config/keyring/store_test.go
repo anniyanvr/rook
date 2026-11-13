@@ -17,7 +17,6 @@ limitations under the License.
 package keyring
 
 import (
-	"context"
 	"path"
 	"testing"
 
@@ -34,14 +33,16 @@ import (
 
 func TestGenerateKey(t *testing.T) {
 	clientset := testop.New(t, 1)
-	var generateKey = ""
-	var failGenerateKey = false
+	type mockResponse struct {
+		output string
+		err    error
+	}
+	responses := []mockResponse{}
 	executor := &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
-			if failGenerateKey {
-				return "", errors.New("test error")
-			}
-			return "{\"key\": \"" + generateKey + "\"}", nil
+			response := responses[0]
+			responses = responses[1:]
+			return response.output, response.err
 		},
 	}
 	ctx := &clusterd.Context{
@@ -50,29 +51,38 @@ func TestGenerateKey(t *testing.T) {
 	}
 	ns := "rook-ceph"
 	ownerInfo := k8sutil.OwnerInfo{}
-	s := GetSecretStore(ctx, cephclient.AdminClusterInfo(ns), &ownerInfo)
+	s := GetSecretStore(ctx, cephclient.AdminTestClusterInfo(ns), &ownerInfo)
 
-	generateKey = "generatedsecretkey"
-	failGenerateKey = false
-	k, e := s.GenerateKey("testuser", []string{"test", "access"})
+	responses = append(responses, mockResponse{output: `{"key": "generatedsecretkey"}`})
+	k, e := s.GenerateKey("testuser", "", []string{"test", "access"})
 	assert.NoError(t, e)
 	assert.Equal(t, "generatedsecretkey", k)
 
-	generateKey = "differentsecretkey"
-	failGenerateKey = false
-	k, e = s.GenerateKey("testuser", []string{"test", "access"})
+	responses = append(responses, mockResponse{output: `{"key": "differentsecretkey"}`})
+	k, e = s.GenerateKey("testuser", "", []string{"test", "access"})
 	assert.NoError(t, e)
 	assert.Equal(t, "differentsecretkey", k)
 
-	// make sure error on fail
-	generateKey = "failgeneratekey"
-	failGenerateKey = true
-	_, e = s.GenerateKey("newuser", []string{"new", "access"})
-	assert.Error(t, e)
+	responses = append(responses,
+		mockResponse{err: errors.New("get-or-create error")},
+		mockResponse{err: errors.New("update-caps error")},
+	)
+	_, e = s.GenerateKey("newuser", "", []string{"new", "access"})
+	assert.ErrorContains(t, e, "update-caps error")
+	assert.NotContains(t, e.Error(), "get-or-create error")
+
+	responses = append(responses,
+		mockResponse{err: errors.New("get-or-create error")},
+		mockResponse{},
+		mockResponse{err: errors.New("get-key error")},
+	)
+	_, e = s.GenerateKey("existinguser", "", []string{"new", "access"})
+	assert.ErrorContains(t, e, "get-key error")
+	assert.NotContains(t, e.Error(), "get-or-create error")
 }
 
 func TestKeyringStore(t *testing.T) {
-	ctxt := context.TODO()
+	ctxt := t.Context()
 	clientset := testop.New(t, 1)
 	ctx := &clusterd.Context{
 		Clientset: clientset,
@@ -95,21 +105,26 @@ func TestKeyringStore(t *testing.T) {
 	}
 
 	// create first key
-	err := k.CreateOrUpdate("test-resource", "qwertyuiop")
+	_, err := k.CreateOrUpdate("test-resource", "qwertyuiop")
 	assert.NoError(t, err)
 	assertKeyringData("test-resource-keyring", "qwertyuiop")
 
 	// create second key
-	err = k.CreateOrUpdate("second-resource", "asdfghjkl")
+	_, err = k.CreateOrUpdate("second-resource", "asdfghjkl")
 	assert.NoError(t, err)
 	assertKeyringData("test-resource-keyring", "qwertyuiop")
 	assertKeyringData("second-resource-keyring", "asdfghjkl")
 
 	// update a key
-	err = k.CreateOrUpdate("second-resource", "lkjhgfdsa")
+	_, err = k.CreateOrUpdate("second-resource", "lkjhgfdsa")
 	assert.NoError(t, err)
 	assertKeyringData("test-resource-keyring", "qwertyuiop")
 	assertKeyringData("second-resource-keyring", "lkjhgfdsa")
+
+	// get key from secret
+	keyring, err := k.GetKeyringFromSecret("test-resource")
+	assert.NoError(t, err)
+	assert.Equal(t, "qwertyuiop", keyring)
 
 	// delete a key
 	err = k.Delete("test-resource")
@@ -125,9 +140,9 @@ func TestResourceVolumeAndMount(t *testing.T) {
 	}
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
 	k := GetSecretStore(ctx, &cephclient.ClusterInfo{Namespace: "ns"}, ownerInfo)
-	err := k.CreateOrUpdate("test-resource", "qwertyuiop")
+	_, err := k.CreateOrUpdate("test-resource", "qwertyuiop")
 	assert.NoError(t, err)
-	err = k.CreateOrUpdate("second-resource", "asdfgyhujkl")
+	_, err = k.CreateOrUpdate("second-resource", "asdfgyhujkl")
 	assert.NoError(t, err)
 
 	v := Volume().Resource("test-resource")

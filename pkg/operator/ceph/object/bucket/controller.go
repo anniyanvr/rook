@@ -18,8 +18,10 @@ package bucket
 
 import (
 	"context"
+	"os"
 
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/util/log"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -30,12 +32,11 @@ import (
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
-	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/object"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -54,7 +55,11 @@ type ReconcileBucket struct {
 // Add creates a new Ceph CSI Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) error {
-	return add(mgr, newReconciler(mgr, context, opManagerContext, opConfig))
+	if os.Getenv(object.DisableOBCEnvVar) == "true" {
+		logger.Info("skip running Object Bucket controller")
+		return nil
+	}
+	return add(opManagerContext, mgr, newReconciler(mgr, context, opManagerContext, opConfig))
 }
 
 // newReconciler returns a new reconcile.Reconciler
@@ -67,24 +72,36 @@ func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerCont
 	}
 }
 
-func add(mgr manager.Manager, r reconcile.Reconciler) error {
+func add(ctx context.Context, mgr manager.Manager, r reconcile.Reconciler) error {
 	// Create a new controller
 	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: r})
 	if err != nil {
 		return err
 	}
-	logger.Infof("%s successfully started", controllerName)
+	logger.Info("successfully started")
 
 	// Watch for ConfigMap (operator config)
-	err = c.Watch(&source.Kind{
-		Type: &v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}}}, &handler.EnqueueRequestForObject{}, predicateController())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}},
+			&handler.TypedEnqueueRequestForObject[*v1.ConfigMap]{},
+			cmPredicate(),
+		),
+	)
 	if err != nil {
 		return err
 	}
 
 	// Watch for CephCluster
-	err = c.Watch(&source.Kind{
-		Type: &cephv1.CephCluster{TypeMeta: metav1.TypeMeta{Kind: "CephCluster", APIVersion: v1.SchemeGroupVersion.String()}}}, &handler.EnqueueRequestForObject{}, predicateController())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&cephv1.CephCluster{TypeMeta: metav1.TypeMeta{Kind: "CephCluster", APIVersion: v1.SchemeGroupVersion.String()}},
+			&handler.TypedEnqueueRequestForObject[*cephv1.CephCluster]{},
+			cephClusterPredicate(ctx, mgr.GetClient()),
+		),
+	)
 	if err != nil {
 		return err
 	}
@@ -92,14 +109,15 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	return nil
 }
 
-// Reconcile reads that state of the operator config map and makes changes based on the state read
+// Reconcile reads the state of the operator config map and makes changes based on the state read
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileBucket) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	reconcileResponse, err := r.reconcile(request)
 	if err != nil {
-		logger.Errorf("failed to reconcile %v", err)
+		log.NamedError(request.NamespacedName, logger, "failed to reconcile %v", err)
 	}
 
 	return reconcileResponse, err
@@ -111,7 +129,7 @@ func (r *ReconcileBucket) reconcile(request reconcile.Request) (reconcile.Result
 	err := r.client.Get(r.opManagerContext, request.NamespacedName, cephCluster)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			logger.Infof("no ceph cluster found in %+v. not deploying the bucket provisioner", request.NamespacedName)
+			log.NamedInfo(request.NamespacedName, logger, "no ceph cluster found. not deploying the bucket provisioner")
 			return reconcile.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
@@ -119,40 +137,21 @@ func (r *ReconcileBucket) reconcile(request reconcile.Request) (reconcile.Result
 	}
 
 	if !cephCluster.DeletionTimestamp.IsZero() {
-		logger.Debug("ceph cluster is being deleted, no need to reconcile the bucket provisioner")
+		log.NamedDebug(request.NamespacedName, logger, "ceph cluster is being deleted, no need to reconcile the bucket provisioner")
 		return reconcile.Result{}, nil
 	}
 
 	if !cephCluster.Spec.External.Enable && cephCluster.Spec.CleanupPolicy.HasDataDirCleanPolicy() {
-		logger.Debug("ceph cluster has cleanup policy, the cluster will soon go away, no need to reconcile the bucket provisioner")
+		log.NamedDebug(request.NamespacedName, logger, "ceph cluster has cleanup policy, the cluster will soon go away, no need to reconcile the bucket provisioner")
 		return reconcile.Result{}, nil
 	}
 
-	// Fetch the operator's configmap. We force the NamespaceName to the operator since the request
-	// could be a CephCluster. If so the NamespaceName will be the one from the cluster and thus the
-	// CM won't be found
-	opNamespaceName := types.NamespacedName{Name: opcontroller.OperatorSettingConfigMapName, Namespace: r.opConfig.OperatorNamespace}
-	opConfig := &v1.ConfigMap{}
-	err = r.client.Get(r.opManagerContext, opNamespaceName, opConfig)
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debug("operator's configmap resource not found. will use default value or env var.")
-			r.opConfig.Parameters = make(map[string]string)
-		} else {
-			// Error reading the object - requeue the request.
-			return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to get operator's configmap")
-		}
-	} else {
-		// Populate the operator's config
-		r.opConfig.Parameters = opConfig.Data
-	}
-
 	// Populate clusterInfo during each reconcile
-	clusterInfo, _, _, err := mon.LoadClusterInfo(r.context, r.opManagerContext, cephCluster.Namespace)
+	clusterInfo, _, _, err := opcontroller.LoadClusterInfo(r.context, r.opManagerContext, cephCluster.Namespace, &cephCluster.Spec)
 	if err != nil {
 		// This avoids a requeue with exponential backoff and allows the controller to reconcile
 		// more quickly when the cluster is ready.
-		if errors.Is(err, mon.ClusterInfoNoClusterNoSecret) {
+		if errors.Is(err, opcontroller.ClusterInfoNoClusterNoSecret) {
 			return opcontroller.WaitForRequeueIfOperatorNotInitialized, nil
 		}
 		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to populate cluster info")
@@ -165,7 +164,7 @@ func (r *ReconcileBucket) reconcile(request reconcile.Request) (reconcile.Result
 
 	// note: the error return below is ignored and is expected to be removed from the
 	//   bucket library's `NewProvisioner` function
-	bucketController, _ := NewBucketController(r.context.KubeConfig, bucketProvisioner, r.opConfig.Parameters)
+	bucketController, _ := NewBucketController(r.context.KubeConfig, bucketProvisioner)
 
 	// We must run this in a go routine since RunWithContext() blocks and waits for the context to
 	// be Done. However, since it has a context, the go routine will exit on reload with SIGHUP
@@ -173,7 +172,7 @@ func (r *ReconcileBucket) reconcile(request reconcile.Request) (reconcile.Result
 	go func() {
 		err = bucketController.RunWithContext(r.opManagerContext)
 		if err != nil {
-			logger.Errorf("failed to run bucket controller. %v", err)
+			log.NamedError(request.NamespacedName, logger, "failed to run bucket controller. %v", err)
 			errChan <- err
 		}
 	}()
@@ -183,7 +182,7 @@ func (r *ReconcileBucket) reconcile(request reconcile.Request) (reconcile.Result
 	case <-errChan:
 		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to run bucket controller")
 	default:
-		logger.Info("successfully reconciled bucket provisioner")
+		log.NamedInfo(request.NamespacedName, logger, "successfully reconciled bucket provisioner")
 		return reconcile.Result{}, nil
 	}
 }

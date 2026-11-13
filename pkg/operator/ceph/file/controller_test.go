@@ -19,24 +19,33 @@ package file
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/coreos/pkg/capnslog"
+	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
+	"github.com/rook/rook/pkg/operator/ceph/file/mds"
 	"github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	testopk8s "github.com/rook/rook/pkg/operator/k8sutil/test"
 	"github.com/rook/rook/pkg/operator/test"
+	"github.com/rook/rook/pkg/util/dependents"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -138,7 +147,7 @@ const (
 	dummyVersionsRaw          = `
 	{
 		"mon": {
-			"ceph version 15.2.11 (000000000000000000000000000000) octopus (stable)": 3
+			"ceph version 19.2.1 (000000000000000000000000000000) squid (stable)": 3
 		}
 	}`
 )
@@ -149,20 +158,21 @@ var (
 )
 
 func TestCephFilesystemController(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	// Set DEBUG logging
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
 
-	currentAndDesiredCephVersion = func(rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
-		return &version.Pacific, &version.Pacific, nil
+	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
+		return &version.Squid, &version.Squid, nil
 	}
 
 	// A Pool resource with metadata and spec.
 	fs := &cephv1.CephFilesystem{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name:       name,
+			Namespace:  namespace,
+			Finalizers: []string{"cephfilesystem.ceph.rook.io"},
 		},
 		Spec: cephv1.FilesystemSpec{
 			MetadataServer: cephv1.MetadataServerSpec{
@@ -189,13 +199,6 @@ func TestCephFilesystemController(t *testing.T) {
 		},
 	}
 
-	clientset := test.New(t, 3)
-	c := &clusterd.Context{
-		Executor:      executor,
-		RookClientset: rookclient.NewSimpleClientset(),
-		Clientset:     clientset,
-	}
-
 	// Register operator types with the runtime scheme.
 	s := scheme.Scheme
 	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephObjectStore{})
@@ -203,8 +206,23 @@ func TestCephFilesystemController(t *testing.T) {
 
 	// Create a fake client to mock API calls.
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+	clientset := test.New(t, 3)
+	c := &clusterd.Context{
+		Executor:      executor,
+		RookClientset: rookclient.NewSimpleClientset(),
+		Clientset:     clientset,
+		Client:        cl,
+	}
+
 	// Create a ReconcileCephFilesystem object with the scheme and fake client.
-	r := &ReconcileCephFilesystem{client: cl, scheme: s, context: c, fsContexts: make(map[string]*fsHealth), opManagerContext: context.TODO()}
+	r := &ReconcileCephFilesystem{
+		client:           cl,
+		recorder:         events.NewFakeRecorder(50),
+		scheme:           s,
+		context:          c,
+		fsContexts:       make(map[string]*fsHealth),
+		opManagerContext: t.Context(),
+	}
 
 	// Mock request to simulate Reconcile() being called on an event for a
 	// watched resource .
@@ -218,6 +236,13 @@ func TestCephFilesystemController(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      namespace,
 			Namespace: namespace,
+		},
+		Spec: cephv1.ClusterSpec{
+			Security: cephv1.ClusterSecuritySpec{
+				CephX: cephv1.ClusterCephxConfig{
+					Daemon: cephv1.CephxConfig{},
+				},
+			},
 		},
 		Status: cephv1.ClusterStatus{
 			Phase: "",
@@ -238,7 +263,14 @@ func TestCephFilesystemController(t *testing.T) {
 		// Create a fake client to mock API calls.
 		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 		// Create a ReconcileCephFilesystem object with the scheme and fake client.
-		r = &ReconcileCephFilesystem{client: cl, scheme: s, context: c, opManagerContext: context.TODO()}
+		r = &ReconcileCephFilesystem{
+			client:           cl,
+			recorder:         events.NewFakeRecorder(50),
+			scheme:           s,
+			context:          c,
+			fsContexts:       make(map[string]*fsHealth),
+			opManagerContext: t.Context(),
+		}
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.True(t, res.Requeue)
@@ -268,7 +300,7 @@ func TestCephFilesystemController(t *testing.T) {
 		cephCluster.Status.CephStatus.Health = "HEALTH_OK"
 
 		// Create a fake client to mock API calls.
-		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(fs, cephCluster).Build()
 
 		executor = &exectest.MockExecutor{
 			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
@@ -288,15 +320,351 @@ func TestCephFilesystemController(t *testing.T) {
 			},
 		}
 		c.Executor = executor
+		c.Client = cl
 
 		// Create a ReconcileCephFilesystem object with the scheme and fake client.
-		r = &ReconcileCephFilesystem{client: cl, scheme: s, context: c, fsContexts: make(map[string]*fsHealth), opManagerContext: context.TODO()}
+		r = &ReconcileCephFilesystem{
+			client:           cl,
+			recorder:         events.NewFakeRecorder(50),
+			scheme:           s,
+			context:          c,
+			fsContexts:       make(map[string]*fsHealth),
+			opManagerContext: t.Context(),
+		}
 
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.False(t, res.Requeue)
-		err = r.client.Get(context.TODO(), req.NamespacedName, fs)
+		err = r.client.Get(t.Context(), req.NamespacedName, fs)
 		assert.NoError(t, err)
 		assert.Equal(t, cephv1.ConditionType("Ready"), fs.Status.Phase, fs)
+	})
+
+	t.Run("block for dependents", func(t *testing.T) {
+		clientset := test.New(t, 3)
+		c := &clusterd.Context{
+			Executor:      executor,
+			RookClientset: rookclient.NewSimpleClientset(),
+			Clientset:     clientset,
+		}
+
+		// Mock clusterInfo
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err := c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// Add ready status to the CephCluster
+		cephCluster := cephCluster.DeepCopy()
+		cephCluster.Status.Phase = k8sutil.ReadyStatus
+		cephCluster.Status.CephStatus.Health = "HEALTH_OK"
+
+		fs := fs.DeepCopy()
+		fs.DeletionTimestamp = &metav1.Time{Time: time.Now()}
+
+		// Create a fake client to mock API calls.
+		cl = fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(fs, cephCluster).Build()
+
+		executor = &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if args[0] == "status" {
+					return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+				}
+				if args[0] == "fs" && args[1] == "get" {
+					return fsGet, nil
+				}
+				if args[0] == "auth" && args[1] == "get-or-create-key" {
+					return mdsCephAuthGetOrCreateKey, nil
+				}
+				if args[0] == "versions" {
+					return dummyVersionsRaw, nil
+				}
+				panic(fmt.Sprintf("unhandled MockExecuteCommandWithOutput command %q %v", command, args))
+			},
+		}
+		c.Executor = executor
+
+		// subvolume group to act as dependent
+		cephFsSubvolGroup := &cephv1.CephFilesystemSubVolumeGroup{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "group-a",
+				Namespace: namespace,
+			},
+			Spec: cephv1.CephFilesystemSubVolumeGroupSpec{
+				FilesystemName: name,
+			},
+		}
+		_, err = c.RookClientset.CephV1().CephFilesystemSubVolumeGroups(namespace).Create(ctx, cephFsSubvolGroup, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// Create a ReconcileCephFilesystem object with the scheme and fake client.
+		fakeRecorder := events.NewFakeRecorder(50)
+		r = &ReconcileCephFilesystem{
+			client:           cl,
+			recorder:         fakeRecorder,
+			scheme:           s,
+			context:          c,
+			fsContexts:       make(map[string]*fsHealth),
+			opManagerContext: t.Context(),
+		}
+
+		oldCephFSDeps := CephFilesystemDependents
+		defer func() {
+			CephFilesystemDependents = oldCephFSDeps
+		}()
+
+		t.Run("block on dependents", func(t *testing.T) {
+			CephFilesystemDependents = func(
+				clusterdCtx *clusterd.Context, clusterInfo *client.ClusterInfo, filesystem *cephv1.CephFilesystem,
+			) (*dependents.DependentList, error) {
+				deps := dependents.NewDependentList()
+				deps.Add("TestDependent", "fake-dependent")
+				return deps, nil
+			}
+
+			res, err := r.Reconcile(ctx, req)
+			assert.NoError(t, err)
+			assert.False(t, res.IsZero())
+			assert.Len(t, fakeRecorder.Events, 1)
+			event := <-fakeRecorder.Events
+			assert.Contains(t, event, "TestDependent")
+			assert.Contains(t, event, "fake-dependent")
+		})
+	})
+}
+
+func TestMdsKeyRotation(t *testing.T) {
+	keyring.SetAllowCephxKeyRotationForCluster(namespace, true)
+
+	ctx := t.Context()
+	var deploymentsUpdated *[]*apps.Deployment
+	mds.UpdateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
+	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
+		rotateSupportedVer := version.CephVersion{Major: 20, Minor: 2, Extra: 0}
+		return &rotateSupportedVer, &rotateSupportedVer, nil
+	}
+	fs := &cephv1.CephFilesystem{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:       name,
+			Namespace:  namespace,
+			Finalizers: []string{"cephfilesystem.ceph.rook.io"},
+		},
+		Spec: cephv1.FilesystemSpec{
+			MetadataServer: cephv1.MetadataServerSpec{
+				ActiveCount: 1,
+			},
+		},
+		TypeMeta: controllerTypeMeta,
+	}
+
+	cephCluster := &cephv1.CephCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      namespace,
+			Namespace: namespace,
+		},
+		Spec: cephv1.ClusterSpec{
+			Security: cephv1.ClusterSecuritySpec{
+				CephX: cephv1.ClusterCephxConfig{
+					Daemon: cephv1.CephxConfig{},
+				},
+			},
+		},
+		Status: cephv1.ClusterStatus{
+			Phase: "",
+			CephStatus: &cephv1.CephStatus{
+				Health: "HEALTH_OK",
+			},
+		},
+	}
+
+	object := []runtime.Object{
+		fs, cephCluster,
+	}
+
+	s := scheme.Scheme
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephFilesystem{})
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{})
+
+	// Create a fake client to mock API calls.
+	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+	clientset := test.New(t, 3)
+	mdsRotatedKey := `{"key":"AQCvzWBeIV9lFRAAninzm+8XFxbSfTiPwoX50g=="}`
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			if args[0] == "status" {
+				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_OK"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+			}
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return `{"key":"AQCvzWBeIV9lFRAAninzm+8XFxbSfTiPwoX50g=="}`, nil
+			}
+			if args[0] == "auth" && args[1] == "rotate" {
+				t.Logf("rotating key and returning: %s", mdsRotatedKey)
+				return mdsRotatedKey, nil
+			}
+			if args[0] == "osd" && args[1] == "pool" && args[2] == "get" {
+				return "", errors.New("test pool does not exit yet")
+			}
+			if args[0] == "versions" {
+				return dummyVersionsRaw, nil
+			}
+			return "", nil
+		},
+	}
+	c := &clusterd.Context{
+		Executor:      executor,
+		RookClientset: rookclient.NewSimpleClientset(),
+		Clientset:     clientset,
+		Client:        cl,
+	}
+
+	r := &ReconcileCephFilesystem{
+		client:           cl,
+		recorder:         events.NewFakeRecorder(50),
+		scheme:           s,
+		context:          c,
+		fsContexts:       make(map[string]*fsHealth),
+		opManagerContext: t.Context(),
+	}
+
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      name,
+			Namespace: namespace,
+		},
+	}
+
+	t.Run("first reconcile", func(t *testing.T) {
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err := c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
+		_, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		fs := cephv1.CephFilesystem{}
+		err = cl.Get(ctx, req.NamespacedName, &fs)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(1), fs.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", fs.Status.Cephx.Daemon.KeyCephVersion)
+	})
+
+	t.Run("subsequent reconcile - retain cephx status", func(t *testing.T) {
+		_, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		fs := cephv1.CephFilesystem{}
+		err = cl.Get(ctx, req.NamespacedName, &fs)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(1), fs.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", fs.Status.Cephx.Daemon.KeyCephVersion)
+		testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+	})
+
+	t.Run("brownfield reconcile - retain unknown cephx status", func(t *testing.T) {
+		fs := cephv1.CephFilesystem{}
+		err := cl.Get(ctx, req.NamespacedName, &fs)
+		assert.NoError(t, err)
+		fs.Status.Cephx.Daemon = cephv1.CephxStatus{}
+		err = cl.Update(ctx, &fs)
+		assert.NoError(t, err)
+
+		_, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+
+		err = cl.Get(ctx, req.NamespacedName, &fs)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.CephxStatus{}, fs.Status.Cephx.Daemon)
+	})
+	t.Run("rotate key - brownfield unknown status becomes known", func(t *testing.T) {
+		cluster := cephv1.CephCluster{}
+		err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: namespace}, &cluster)
+		assert.NoError(t, err)
+		cluster.Spec.Security.CephX.Daemon = cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     2,
+		}
+		err = cl.Update(ctx, &cluster)
+		assert.NoError(t, err)
+
+		mdsRotatedKey = `[{"key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=="}]`
+
+		_, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+
+		oStore := cephv1.CephFilesystem{}
+		err = cl.Get(ctx, req.NamespacedName, &oStore)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(2), oStore.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", oStore.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-mds-"+name+"-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Contains(t, secret.StringData["keyring"], "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB==")
+	})
+
+	t.Run("brownfield reconcile - no further rotation happens", func(t *testing.T) {
+		// not expecting any rotation. So `ceph auth rotate` should not run and secret should not be updated
+		mdsRotatedKey = `[{"key":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=="}]`
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+
+		fs := cephv1.CephFilesystem{}
+		err = cl.Get(ctx, req.NamespacedName, &fs)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(2), fs.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", fs.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-mds-"+name+"-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.NotContains(t, secret.StringData["keyring"], "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC==")
+		testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+	})
+	t.Run("rotate key - cephx status updated", func(t *testing.T) {
+		cluster := cephv1.CephCluster{}
+		err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: namespace}, &cluster)
+		assert.NoError(t, err)
+		cluster.Spec.Security.CephX.Daemon = cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     3,
+		}
+		err = cl.Update(ctx, &cluster)
+		assert.NoError(t, err)
+
+		mdsRotatedKey = `[{"key":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=="}]`
+
+		_, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+
+		fs := cephv1.CephFilesystem{}
+		err = cl.Get(ctx, req.NamespacedName, &fs)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(3), fs.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", fs.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-mds-"+name+"-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Contains(t, secret.StringData["keyring"], "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC==")
 	})
 }

@@ -17,9 +17,12 @@ limitations under the License.
 package client
 
 import (
+	"encoding/json"
 	"fmt"
 
+	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/clusterd"
 )
 
 const (
@@ -54,9 +57,7 @@ rule %s {
 `
 )
 
-var (
-	stepEmit = &stepSpec{Operation: "emit"}
-)
+var stepEmit = &stepSpec{Operation: "emit"}
 
 func buildTwoStepPlainCrushRule(crushMap CrushMap, ruleName string, pool cephv1.PoolSpec) string {
 	var crushRuleInsert string
@@ -136,7 +137,7 @@ func buildTwoStepCrushSteps(pool cephv1.PoolSpec) []stepSpec {
 	}
 	steps = append(steps, *stepTakeDefault)
 
-	// Steps two
+	// Step two
 	stepTakeFailureDomain := &stepSpec{
 		Operation: "chooseleaf_firstn",
 		Number:    0,
@@ -147,8 +148,9 @@ func buildTwoStepCrushSteps(pool cephv1.PoolSpec) []stepSpec {
 	// Step three
 	stepTakeSubFailureDomain := &stepSpec{
 		Operation: "chooseleaf_firstn",
-		Number:    pool.Replicated.ReplicasPerFailureDomain,
-		Type:      pool.Replicated.SubFailureDomain,
+		// nolint:gosec // G115 - casting uint to int has no overflow
+		Number: int(pool.Replicated.ReplicasPerFailureDomain),
+		Type:   pool.Replicated.SubFailureDomain,
 	}
 	steps = append(steps, *stepTakeSubFailureDomain)
 	steps = append(steps, *stepEmit)
@@ -179,4 +181,20 @@ func checkIfRuleIDExists(rules []ruleSpec, ID int) bool {
 	}
 
 	return false
+}
+
+func getCrushRule(context *clusterd.Context, clusterInfo *ClusterInfo, name string) (ruleSpec, error) {
+	var rule ruleSpec
+	args := []string{"osd", "crush", "rule", "dump", name}
+	buf, err := NewCephCommand(context, clusterInfo, args).Run()
+	if err != nil {
+		return rule, errors.Wrapf(err, "failed to get crush rule %q. %s", name, string(buf))
+	}
+
+	err = json.Unmarshal(buf, &rule)
+	if err != nil {
+		return rule, errors.Wrapf(err, "failed to unmarshal crush rule. %s", string(buf))
+	}
+
+	return rule, nil
 }

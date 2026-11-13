@@ -17,7 +17,6 @@ limitations under the License.
 package v1
 
 import (
-	_ "embed"
 	"fmt"
 
 	secv1 "github.com/openshift/api/security/v1"
@@ -27,22 +26,23 @@ import (
 
 // NewSecurityContextConstraints returns a new SecurityContextConstraints for Rook-Ceph to run on
 // OpenShift.
-func NewSecurityContextConstraints(name, namespace string) *secv1.SecurityContextConstraints {
+func NewSecurityContextConstraints(name string, namespaces ...string) *secv1.SecurityContextConstraints {
 	return &secv1.SecurityContextConstraints{
 		TypeMeta: metav1.TypeMeta{
 			APIVersion: "security.openshift.io/v1",
 			Kind:       "SecurityContextConstraints",
 		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: namespace,
+			Name: name,
 		},
 		AllowPrivilegedContainer: true,
+		AllowHostDirVolumePlugin: true,
 		ReadOnlyRootFilesystem:   false,
 		AllowHostIPC:             true,
 		AllowHostNetwork:         false,
 		AllowHostPorts:           false,
-		RequiredDropCapabilities: []corev1.Capability{},
+		AllowedCapabilities:      []corev1.Capability{"MKNOD", "SYS_ADMIN"},
+		RequiredDropCapabilities: []corev1.Capability{"ALL"},
 		DefaultAddCapabilities:   []corev1.Capability{},
 		RunAsUser: secv1.RunAsUserStrategyOptions{
 			Type: secv1.RunAsUserStrategyRunAsAny,
@@ -65,11 +65,20 @@ func NewSecurityContextConstraints(name, namespace string) *secv1.SecurityContex
 			secv1.FSProjected,
 			secv1.FSTypeSecret,
 		},
-		Users: []string{
-			fmt.Sprintf("system:serviceaccount:%s:rook-ceph-system", namespace),
-			fmt.Sprintf("system:serviceaccount:%s:default", namespace),
-			fmt.Sprintf("system:serviceaccount:%s:rook-ceph-mgr", namespace),
-			fmt.Sprintf("system:serviceaccount:%s:rook-ceph-osd", namespace),
-		},
+		Users: func() (users []string) {
+			for _, ns := range namespaces {
+				users = append(users, []string{
+					fmt.Sprintf("system:serviceaccount:%s:rook-ceph-system", ns),
+					fmt.Sprintf("system:serviceaccount:%s:rook-ceph-default", ns),
+					fmt.Sprintf("system:serviceaccount:%s:rook-ceph-mgr", ns),
+					fmt.Sprintf("system:serviceaccount:%s:rook-ceph-osd", ns),
+					fmt.Sprintf("system:serviceaccount:%s:rook-ceph-rgw", ns),
+					fmt.Sprintf("system:serviceaccount:%s:rook-ceph-nvmeof", ns),
+					fmt.Sprintf("system:serviceaccount:%s:rook-ceph-cmd-reporter", ns),
+					fmt.Sprintf("system:serviceaccount:%s:rook-ceph-purge-osd", ns),
+				}...)
+			}
+			return
+		}(),
 	}
 }

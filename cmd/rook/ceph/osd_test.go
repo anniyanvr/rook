@@ -18,6 +18,7 @@ package ceph
 
 import (
 	"encoding/json"
+	"os"
 	"testing"
 
 	osddaemon "github.com/rook/rook/pkg/daemon/ceph/osd"
@@ -42,7 +43,8 @@ func TestParseDesiredDevices(t *testing.T) {
 		{
 			ID: "nvme01",
 			StoreConfig: osdcfg.StoreConfig{
-				OSDsPerDevice: 5,
+				OSDsPerDevice:   5,
+				EncryptedDevice: true,
 			},
 		},
 	}
@@ -59,6 +61,9 @@ func TestParseDesiredDevices(t *testing.T) {
 	assert.Equal(t, 1, result[0].OSDsPerDevice)
 	assert.Equal(t, 1, result[1].OSDsPerDevice)
 	assert.Equal(t, 5, result[2].OSDsPerDevice)
+	assert.False(t, result[0].EncryptedDevice)
+	assert.False(t, result[1].EncryptedDevice)
+	assert.True(t, result[2].EncryptedDevice)
 	assert.False(t, result[0].IsFilter)
 	assert.False(t, result[1].IsFilter)
 	assert.False(t, result[2].IsFilter)
@@ -172,4 +177,38 @@ func TestParseDesiredDevices(t *testing.T) {
 	result, err = parseDevices("")
 	assert.NoError(t, err)
 	assert.Equal(t, []osddaemon.DesiredDevice{}, result)
+}
+
+func TestReadSecretFile(t *testing.T) {
+	// Fail if the file does not exist
+	badPath := "/tmp/badpath"
+	err := readCephSecret(badPath)
+	assert.Error(t, err)
+
+	// Fall back to the env var if the file is not found
+	assert.NoError(t, os.Setenv(fallbackCephSecretEnvVar, "env-secret"))
+	err = readCephSecret(badPath)
+	assert.NoError(t, err)
+	assert.Equal(t, "env-secret", clusterInfo.CephCred.Secret)
+	os.Unsetenv(fallbackCephSecretEnvVar)
+
+	// Create a temp file, but leave it empty
+	path, err := os.CreateTemp("", "")
+	assert.NoError(t, err)
+	defer os.Remove(path.Name())
+
+	// Fail if the secret file is empty
+	err = readCephSecret(path.Name())
+	assert.Error(t, err)
+	assert.Equal(t, "", clusterInfo.CephCred.Secret)
+
+	// Write a test keyring
+	testSecret := "testkeyring"
+	err = os.WriteFile(path.Name(), []byte(testSecret), 0o600)
+	assert.NoError(t, err)
+
+	// Read the secret from the file
+	err = readCephSecret(path.Name())
+	assert.NoError(t, err)
+	assert.Equal(t, testSecret, clusterInfo.CephCred.Secret)
 }

@@ -28,15 +28,19 @@ import (
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	"github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	testopk8s "github.com/rook/rook/pkg/operator/k8sutil/test"
 	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -46,13 +50,13 @@ const (
 	dummyVersionsRaw       = `
 	{
 		"mon": {
-			"ceph version 15.2.11 (0000000000000000000000000000000000) octopus (stable)": 3
+			"ceph version 19.2.1 (0000000000000000000000000000000000) squid (stable)": 3
 		}
 	}`
 )
 
 func TestCephRBDMirrorController(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	var (
 		name           = "my-mirror"
 		namespace      = "rook-ceph"
@@ -62,8 +66,8 @@ func TestCephRBDMirrorController(t *testing.T) {
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
 
-	currentAndDesiredCephVersion = func(rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
-		return &version.Pacific, &version.Pacific, nil
+	currentAndDesiredCephVersion = func(ctx context.Context, rookImage string, namespace string, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
+		return &version.Squid, &version.Squid, nil
 	}
 
 	// An rbd-mirror resource with metadata and spec.
@@ -96,6 +100,13 @@ func TestCephRBDMirrorController(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      namespace,
 			Namespace: namespace,
+		},
+		Spec: cephv1.ClusterSpec{
+			Security: cephv1.ClusterSecuritySpec{
+				CephX: cephv1.ClusterCephxConfig{
+					Daemon: cephv1.CephxConfig{},
+				},
+			},
 		},
 		Status: cephv1.ClusterStatus{
 			Phase: "",
@@ -143,7 +154,7 @@ func TestCephRBDMirrorController(t *testing.T) {
 		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 		// Create a ReconcileCephRBDMirror object with the scheme and fake client.
-		r := &ReconcileCephRBDMirror{client: cl, scheme: s, context: c, opManagerContext: ctx}
+		r := &ReconcileCephRBDMirror{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.True(t, res.Requeue)
@@ -154,7 +165,7 @@ func TestCephRBDMirrorController(t *testing.T) {
 		// Create a fake client to mock API calls.
 		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 		// Create a ReconcileCephRBDMirror object with the scheme and fake client.
-		r := &ReconcileCephRBDMirror{client: cl, scheme: s, context: c, opManagerContext: ctx}
+		r := &ReconcileCephRBDMirror{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.True(t, res.Requeue)
@@ -192,15 +203,15 @@ func TestCephRBDMirrorController(t *testing.T) {
 			context:          c,
 			peers:            make(map[string]*peerSpec),
 			opManagerContext: ctx,
+			recorder:         events.NewFakeRecorder(50),
 		}
 
 		rbdMirror.Spec.Peers.SecretNames = []string{peerSecretName}
-		err = r.client.Update(context.TODO(), rbdMirror)
+		err = r.client.Update(t.Context(), rbdMirror)
 		assert.NoError(t, err)
 		res, err := r.Reconcile(ctx, req)
-		assert.Error(t, err)
+		assert.NoError(t, err)
 		assert.True(t, res.Requeue)
-
 	})
 
 	t.Run("success - peers are configured", func(t *testing.T) {
@@ -212,6 +223,7 @@ func TestCephRBDMirrorController(t *testing.T) {
 			context:          c,
 			peers:            make(map[string]*peerSpec),
 			opManagerContext: ctx,
+			recorder:         events.NewFakeRecorder(50),
 		}
 		bootstrapPeerToken := `eyJmc2lkIjoiYzZiMDg3ZjItNzgyOS00ZGJiLWJjZmMtNTNkYzM0ZTBiMzVkIiwiY2xpZW50X2lkIjoicmJkLW1pcnJvci1wZWVyIiwia2V5IjoiQVFBV1lsWmZVQ1Q2RGhBQVBtVnAwbGtubDA5YVZWS3lyRVV1NEE9PSIsIm1vbl9ob3N0IjoiW3YyOjE5Mi4xNjguMTExLjEwOjMzMDAsdjE6MTkyLjE2OC4xMTEuMTA6Njc4OV0sW3YyOjE5Mi4xNjguMTExLjEyOjMzMDAsdjE6MTkyLjE2OC4xMTEuMTI6Njc4OV0sW3YyOjE5Mi4xNjguMTExLjExOjMzMDAsdjE6MTkyLjE2OC4xMTEuMTE6Njc4OV0ifQ==` //nolint:gosec // This is just a var name, not a real token
 		peerSecret := &v1.Secret{
@@ -227,8 +239,246 @@ func TestCephRBDMirrorController(t *testing.T) {
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.False(t, res.Requeue)
-		err = r.client.Get(context.TODO(), req.NamespacedName, rbdMirror)
+		err = r.client.Get(t.Context(), req.NamespacedName, rbdMirror)
 		assert.NoError(t, err)
 		assert.Equal(t, "Ready", rbdMirror.Status.Phase, rbdMirror)
+	})
+}
+
+func TestMirrorKeyRotation(t *testing.T) {
+	ctx := t.Context()
+	var (
+		name      = "my-mirror"
+		namespace = "rook-ceph"
+	)
+	// Set DEBUG logging
+	t.Setenv("ROOK_LOG_LEVEL", "DEBUG")
+	keyring.SetAllowCephxKeyRotationForCluster(namespace, true)
+
+	currentAndDesiredCephVersion = func(ctx context.Context, rookImage, namespace, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *client.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
+		rotationSupportedVer := version.CephVersion{Major: 20, Minor: 2, Extra: 0}
+		return &rotationSupportedVer, &rotationSupportedVer, nil
+	}
+
+	var deploymentsUpdated *[]*apps.Deployment
+	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
+
+	// An rbd-mirror resource with metadata and spec.
+	rbdMirror := &cephv1.CephRBDMirror{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: cephv1.RBDMirroringSpec{
+			Count: 1,
+		},
+		TypeMeta: controllerTypeMeta,
+	}
+
+	// Mock request to simulate Reconcile() being called on an event for a
+	// watched resource .
+	req := reconcile.Request{
+		NamespacedName: types.NamespacedName{
+			Name:      name,
+			Namespace: namespace,
+		},
+	}
+
+	cephCluster := &cephv1.CephCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      namespace,
+			Namespace: namespace,
+		},
+		Spec: cephv1.ClusterSpec{
+			Security: cephv1.ClusterSecuritySpec{
+				CephX: cephv1.ClusterCephxConfig{
+					Daemon: cephv1.CephxConfig{},
+				},
+			},
+		},
+		Status: cephv1.ClusterStatus{
+			Phase: k8sutil.ReadyStatus,
+			CephStatus: &cephv1.CephStatus{
+				Health: "HEALTH_OK",
+			},
+		},
+	}
+
+	// Objects to track in the fake client.
+	object := []runtime.Object{
+		rbdMirror,
+		cephCluster,
+	}
+
+	s := scheme.Scheme
+
+	mirrorDaemonRotatedKey := `{"key":"AQCvzWBeIV9lFRAAninzm+8XFxbSfTiPwoX50g=="}`
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			if args[0] == "status" {
+				return `{"fsid":"c47cac40-9bee-4d52-823b-ccd803ba5bfe","health":{"checks":{},"status":"HEALTH_ERR"},"pgmap":{"num_pgs":100,"pgs_by_state":[{"state_name":"active+clean","count":100}]}}`, nil
+			}
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return cephAuthGetOrCreateKey, nil
+			}
+			if args[0] == "auth" && args[1] == "rotate" {
+				t.Logf("rotating key and returning: %s", mirrorDaemonRotatedKey)
+				return mirrorDaemonRotatedKey, nil
+			}
+			if args[0] == "versions" {
+				return dummyVersionsRaw, nil
+			}
+			if args[0] == "mirror" && args[1] == "pool" && args[2] == "info" {
+				return `{"mode":"image","site_name":"39074576-5884-4ef3-8a4d-8a0c5ed33031","peers":[{"uuid":"4a6983c0-3c9d-40f5-b2a9-2334a4659827","direction":"rx-tx","site_name":"ocs","mirror_uuid":"","client_name":"client.rbd-mirror-peer"}]}`, nil
+			}
+			if args[0] == "mirror" && args[1] == "pool" && args[2] == "status" {
+				return `{"summary":{"health":"WARNING","daemon_health":"OK","image_health":"WARNING","states":{"unknown":1}}}`, nil
+			}
+			return "", nil
+		},
+	}
+	clientset := test.New(t, 3)
+	c := &clusterd.Context{
+		Executor:      executor,
+		RookClientset: rookclient.NewSimpleClientset(),
+		Clientset:     clientset,
+	}
+
+	// Register operator types with the runtime scheme.
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephRBDMirror{})
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{})
+
+	// Create a fake client to mock API calls.
+	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+	r := &ReconcileCephRBDMirror{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+
+	t.Run("first reconcile", func(t *testing.T) {
+		// Mock clusterInfo
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err := c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		_, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+
+		mirror := cephv1.CephRBDMirror{}
+		err = cl.Get(ctx, req.NamespacedName, &mirror)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(1), mirror.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", mirror.Status.Cephx.Daemon.KeyCephVersion)
+	})
+
+	t.Run("subsequent reconcile - retain cephx status", func(t *testing.T) {
+		r := &ReconcileCephRBDMirror{client: cl, scheme: s, context: c, opManagerContext: ctx, recorder: events.NewFakeRecorder(50)}
+		_, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		mirror := cephv1.CephRBDMirror{}
+		err = cl.Get(ctx, req.NamespacedName, &mirror)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(1), mirror.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", mirror.Status.Cephx.Daemon.KeyCephVersion)
+		testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+	})
+
+	t.Run("brownfield reconcile - retain unknown cephx status", func(t *testing.T) {
+		mirror := cephv1.CephRBDMirror{}
+		err := cl.Get(ctx, req.NamespacedName, &mirror)
+		assert.NoError(t, err)
+		mirror.Status.Cephx.Daemon = cephv1.CephxStatus{}
+		err = cl.Update(ctx, &mirror)
+		assert.NoError(t, err)
+
+		_, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+
+		err = cl.Get(ctx, req.NamespacedName, &mirror)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.CephxStatus{}, mirror.Status.Cephx.Daemon)
+	})
+
+	t.Run("rotate key - brownfield unknown status becomes known", func(t *testing.T) {
+		cluster := cephv1.CephCluster{}
+		err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: namespace}, &cluster)
+		assert.NoError(t, err)
+		cluster.Spec.Security.CephX.Daemon = cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     2,
+		}
+		err = cl.Update(ctx, &cluster)
+		assert.NoError(t, err)
+
+		mirrorDaemonRotatedKey = `[{"key":"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB=="}]`
+
+		_, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+
+		mirror := cephv1.CephRBDMirror{}
+		err = cl.Get(ctx, req.NamespacedName, &mirror)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(2), mirror.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", mirror.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-rbd-mirror-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Contains(t, secret.StringData["keyring"], "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB==")
+	})
+
+	t.Run("brownfield reconcile - no further rotation happens", func(t *testing.T) {
+		// not expecting any rotation. So `ceph auth rotate` should not run and secret should not be updated
+		mirrorDaemonRotatedKey = `[{"key":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=="}]`
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+
+		mirror := cephv1.CephRBDMirror{}
+		err = cl.Get(ctx, req.NamespacedName, &mirror)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(2), mirror.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", mirror.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-rbd-mirror-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.NotContains(t, secret.StringData["keyring"], "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC==")
+		testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+	})
+
+	t.Run("rotate key - cephx status updated", func(t *testing.T) {
+		cluster := cephv1.CephCluster{}
+		err := cl.Get(ctx, types.NamespacedName{Namespace: namespace, Name: namespace}, &cluster)
+		assert.NoError(t, err)
+		cluster.Spec.Security.CephX.Daemon = cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     3,
+		}
+		err = cl.Update(ctx, &cluster)
+		assert.NoError(t, err)
+
+		mirrorDaemonRotatedKey = `[{"key":"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC=="}]`
+
+		_, err = r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+
+		mirror := cephv1.CephRBDMirror{}
+		err = cl.Get(ctx, req.NamespacedName, &mirror)
+		assert.NoError(t, err)
+		assert.Equal(t, uint32(3), mirror.Status.Cephx.Daemon.KeyGeneration)
+		assert.Equal(t, "20.2.0-0", mirror.Status.Cephx.Daemon.KeyCephVersion)
+
+		secret, err := clientset.CoreV1().Secrets(namespace).Get(ctx, "rook-ceph-rbd-mirror-a-keyring", metav1.GetOptions{})
+		assert.NoError(t, err)
+		assert.Contains(t, secret.StringData["keyring"], "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC==")
 	})
 }

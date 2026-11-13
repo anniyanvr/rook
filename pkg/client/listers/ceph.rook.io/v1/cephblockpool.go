@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,10 +19,10 @@ limitations under the License.
 package v1
 
 import (
-	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
+	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	labels "k8s.io/apimachinery/pkg/labels"
+	listers "k8s.io/client-go/listers"
+	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephBlockPoolLister helps list CephBlockPools.
@@ -30,7 +30,7 @@ import (
 type CephBlockPoolLister interface {
 	// List lists all CephBlockPools in the indexer.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CephBlockPool, err error)
+	List(selector labels.Selector) (ret []*cephrookiov1.CephBlockPool, err error)
 	// CephBlockPools returns an object that can list and get CephBlockPools.
 	CephBlockPools(namespace string) CephBlockPoolNamespaceLister
 	CephBlockPoolListerExpansion
@@ -38,25 +38,17 @@ type CephBlockPoolLister interface {
 
 // cephBlockPoolLister implements the CephBlockPoolLister interface.
 type cephBlockPoolLister struct {
-	indexer cache.Indexer
+	listers.ResourceIndexer[*cephrookiov1.CephBlockPool]
 }
 
 // NewCephBlockPoolLister returns a new CephBlockPoolLister.
 func NewCephBlockPoolLister(indexer cache.Indexer) CephBlockPoolLister {
-	return &cephBlockPoolLister{indexer: indexer}
-}
-
-// List lists all CephBlockPools in the indexer.
-func (s *cephBlockPoolLister) List(selector labels.Selector) (ret []*v1.CephBlockPool, err error) {
-	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CephBlockPool))
-	})
-	return ret, err
+	return &cephBlockPoolLister{listers.New[*cephrookiov1.CephBlockPool](indexer, cephrookiov1.Resource("cephblockpool"))}
 }
 
 // CephBlockPools returns an object that can list and get CephBlockPools.
 func (s *cephBlockPoolLister) CephBlockPools(namespace string) CephBlockPoolNamespaceLister {
-	return cephBlockPoolNamespaceLister{indexer: s.indexer, namespace: namespace}
+	return cephBlockPoolNamespaceLister{listers.NewNamespaced[*cephrookiov1.CephBlockPool](s.ResourceIndexer, namespace)}
 }
 
 // CephBlockPoolNamespaceLister helps list and get CephBlockPools.
@@ -64,36 +56,15 @@ func (s *cephBlockPoolLister) CephBlockPools(namespace string) CephBlockPoolName
 type CephBlockPoolNamespaceLister interface {
 	// List lists all CephBlockPools in the indexer for a given namespace.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CephBlockPool, err error)
+	List(selector labels.Selector) (ret []*cephrookiov1.CephBlockPool, err error)
 	// Get retrieves the CephBlockPool from the indexer for a given namespace and name.
 	// Objects returned here must be treated as read-only.
-	Get(name string) (*v1.CephBlockPool, error)
+	Get(name string) (*cephrookiov1.CephBlockPool, error)
 	CephBlockPoolNamespaceListerExpansion
 }
 
 // cephBlockPoolNamespaceLister implements the CephBlockPoolNamespaceLister
 // interface.
 type cephBlockPoolNamespaceLister struct {
-	indexer   cache.Indexer
-	namespace string
-}
-
-// List lists all CephBlockPools in the indexer for a given namespace.
-func (s cephBlockPoolNamespaceLister) List(selector labels.Selector) (ret []*v1.CephBlockPool, err error) {
-	err = cache.ListAllByNamespace(s.indexer, s.namespace, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CephBlockPool))
-	})
-	return ret, err
-}
-
-// Get retrieves the CephBlockPool from the indexer for a given namespace and name.
-func (s cephBlockPoolNamespaceLister) Get(name string) (*v1.CephBlockPool, error) {
-	obj, exists, err := s.indexer.GetByKey(s.namespace + "/" + name)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, errors.NewNotFound(v1.Resource("cephblockpool"), name)
-	}
-	return obj.(*v1.CephBlockPool), nil
+	listers.ResourceIndexer[*cephrookiov1.CephBlockPool]
 }

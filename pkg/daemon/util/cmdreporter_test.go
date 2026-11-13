@@ -17,7 +17,6 @@ limitations under the License.
 package util
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -44,15 +43,20 @@ func TestCommandMarshallingUnmarshalling(t *testing.T) {
 	}{
 		{name: "one command only", args: args{cmd: []string{"one"}, args: []string{}}},
 		{name: "no command or args", args: args{
-			cmd: []string{}, args: []string{}}},
+			cmd: []string{}, args: []string{},
+		}},
 		{name: "no command w/ args", args: args{
-			cmd: []string{}, args: []string{"arg1", "arg2"}}},
+			cmd: []string{}, args: []string{"arg1", "arg2"},
+		}},
 		{name: "one command w/ args", args: args{
-			cmd: []string{"one"}, args: []string{"arg1", "arg2"}}},
+			cmd: []string{"one"}, args: []string{"arg1", "arg2"},
+		}},
 		{name: "multi command only", args: args{
-			cmd: []string{"one", "two", "three"}, args: []string{}}},
+			cmd: []string{"one", "two", "three"}, args: []string{},
+		}},
 		{name: "multi command and arg", args: args{
-			cmd: []string{"one", "two", "three"}, args: []string{"arg1", "arg2", "--", "arg3"}}},
+			cmd: []string{"one", "two", "three"}, args: []string{"arg1", "arg2", "--", "arg3"},
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -74,8 +78,8 @@ func TestCommandMarshallingUnmarshalling(t *testing.T) {
 }
 
 func TestNew(t *testing.T) {
-	ctx := context.TODO()
-	client := fake.NewSimpleClientset
+	ctx := t.Context()
+	client := fake.NewClientset
 	type fields struct {
 		clientset     kubernetes.Interface
 		cmd           []string
@@ -125,12 +129,12 @@ func TestNew(t *testing.T) {
 }
 
 func TestRunner_Run(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	origExecCommand := execCommand
 	execCommand = mockExecCommand
 	defer func() { execCommand = origExecCommand }()
 
-	newClient := fake.NewSimpleClientset
+	newClient := fake.NewClientset
 
 	verifyConfigMap := func(client kubernetes.Interface, stdout, stderr, retval, cmName, namespace string) {
 		cm, err := client.CoreV1().ConfigMaps(namespace).Get(ctx, cmName, metav1.GetOptions{})
@@ -237,7 +241,7 @@ func mockExecCommand(command string, args ...string) *exec.Cmd {
 	return cmd
 }
 
-// TestHelperProcess isn't a real test. It's used as a helper process
+// TestCmdReporterHelperProcess isn't a real test. It's used as a helper process
 // for TestParameterRun.
 // Inspired by: https://github.com/golang/go/blob/master/src/os/exec/exec_test.go
 func TestCmdReporterHelperProcess(*testing.T) {

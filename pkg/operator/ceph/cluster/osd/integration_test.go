@@ -18,10 +18,8 @@ package osd
 
 import (
 	"context"
-	contextStandard "context"
 	"encoding/json"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,6 +28,7 @@ import (
 	"github.com/coreos/pkg/capnslog"
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclientfake "github.com/rook/rook/pkg/daemon/ceph/client/fake"
@@ -47,12 +46,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
+	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-var (
-	// global to allow creating helper functions that are not inline with test functions
-	testIDGenerator osdIDGenerator
-)
+// global to allow creating helper functions that are not inline with test functions
+var testIDGenerator osdIDGenerator
 
 // TODO: look into: failed to calculate diff between current deployment and newly generated one.
 //   Failed to generate strategic merge patch: map: map[] does not contain declared merge key: uid
@@ -96,8 +94,8 @@ func TestOSDIntegration(t *testing.T) {
 
 // This is the actual test. If it hangs, we should consider that an error.
 func testOSDIntegration(t *testing.T) {
-	ctx := contextStandard.TODO()
-	contextCancel, cancel := contextStandard.WithCancel(ctx)
+	ctx := t.Context()
+	contextCancel, cancel := context.WithCancel(ctx)
 	namespace := "osd-integration"
 	clusterName := "my-cluster"
 
@@ -110,7 +108,7 @@ func testOSDIntegration(t *testing.T) {
 	}()
 	// stub out the conditionExportFunc to do nothing. we do not have a fake Rook interface that
 	// allows us to interact with a CephCluster resource like the fake K8s clientset.
-	updateConditionFunc = func(ctx context.Context, c *clusterd.Context, namespaceName types.NamespacedName, conditionType cephv1.ConditionType, status corev1.ConditionStatus, reason cephv1.ConditionReason, message string) {
+	updateConditionFunc = func(ctx context.Context, c *clusterd.Context, namespaceName types.NamespacedName, observedGeneration int64, conditionType cephv1.ConditionType, status corev1.ConditionStatus, reason cephv1.ConditionReason, message string) {
 		// do nothing
 	}
 
@@ -121,8 +119,7 @@ func testOSDIntegration(t *testing.T) {
 	test.PrependComplexJobReactor(t, clientset, assignPodToNode)
 	test.SetFakeKubernetesVersion(clientset, "v1.13.2") // v1.13 or higher is required for OSDs on PVC
 
-	os.Setenv(k8sutil.PodNamespaceEnvVar, namespace)
-	defer os.Unsetenv(k8sutil.PodNamespaceEnvVar)
+	t.Setenv(k8sutil.PodNamespaceEnvVar, namespace)
 
 	statusMapWatcher := watch.NewRaceFreeFake()
 	clientset.PrependWatchReactor("configmaps", k8stesting.DefaultWatchReactor(statusMapWatcher, nil))
@@ -189,22 +186,38 @@ func testOSDIntegration(t *testing.T) {
 	clientset.PrependReactor("*", "deployments", deploymentReactor)
 
 	clusterInfo := cephclient.NewClusterInfo(namespace, clusterName)
-	clusterInfo.CephVersion = cephver.Pacific
+	clusterInfo.CephVersion = cephver.Squid
 	clusterInfo.SetName("mycluster")
 	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 	clusterInfo.Context = ctx
 	executor := osdIntegrationTestExecutor(t, clientset, namespace)
 
-	context := &clusterd.Context{
+	cephCluster := &cephv1.CephCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName,
+			Namespace: namespace,
+		},
+		Spec: cephv1.ClusterSpec{},
+	}
+	// Objects to track in the fake client.
+	object := []runtime.Object{
+		cephCluster,
+	}
+	s := scheme.Scheme
+	// Create a fake client to mock API calls.
+	client := clientfake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+
+	rootCtx := &clusterd.Context{
 		Clientset: clientset,
 		ConfigDir: "/var/lib/rook",
 		Executor:  executor,
+		Client:    client,
 	}
-	spec := cephv1.ClusterSpec{
+	cephCluster.Spec = cephv1.ClusterSpec{
 		CephVersion: cephv1.CephVersionSpec{
 			Image: "quay.io/ceph/ceph:v16.2.0",
 		},
-		DataDirHostPath: context.ConfigDir,
+		DataDirHostPath: rootCtx.ConfigDir,
 		// This storage spec should... (see inline)
 		Storage: cephv1.StorageScopeSpec{
 			UseAllNodes: true,
@@ -222,13 +235,13 @@ func testOSDIntegration(t *testing.T) {
 	}
 	osdsPerNode := 2 // vda and vdb
 
-	c := New(context, clusterInfo, spec, "myversion")
+	c := New(rootCtx, clusterInfo, cephCluster.Spec, "myversion")
 
 	var startErr error
 	var done bool
-	runReconcile := func(ctx contextStandard.Context) {
+	runReconcile := func(ctx context.Context) {
 		// reset environment
-		c = New(context, clusterInfo, spec, "myversion")
+		c = New(rootCtx, clusterInfo, cephCluster.Spec, "myversion")
 		clusterInfo.Context = ctx
 		statusMapWatcher.Reset()
 
@@ -283,10 +296,10 @@ func testOSDIntegration(t *testing.T) {
 	})
 
 	t.Run("increase number of OSDs", func(t *testing.T) {
-		spec.Storage.Selection.DeviceFilter = "/dev/vd[abc]" // 3 more (1 more per node)
-		spec.Storage.StorageClassDeviceSets[0].Count = 8     // 2 more portable
-		spec.Storage.StorageClassDeviceSets[1].Count = 6     // 3 more (1 more per node)
-		osdsPerNode = 3                                      // vda, vdb, vdc
+		cephCluster.Spec.Storage.Selection.DeviceFilter = "/dev/vd[abc]" // 3 more (1 more per node)
+		cephCluster.Spec.Storage.StorageClassDeviceSets[0].Count = 8     // 2 more portable
+		cephCluster.Spec.Storage.StorageClassDeviceSets[1].Count = 6     // 3 more (1 more per node)
+		osdsPerNode = 3                                                  // vda, vdb, vdc
 
 		go runReconcile(contextCancel)
 
@@ -304,9 +317,9 @@ func testOSDIntegration(t *testing.T) {
 	})
 
 	t.Run("mixed create and update, cancel reconcile, and continue reconcile", func(t *testing.T) {
-		spec.Storage.Selection.DeviceFilter = "/dev/vd[abcd]" // 3 more (1 more per node)
-		spec.Storage.StorageClassDeviceSets[0].Count = 10     // 2 more portable
-		osdsPerNode = 4                                       // vd[a-d]
+		cephCluster.Spec.Storage.Selection.DeviceFilter = "/dev/vd[abcd]" // 3 more (1 more per node)
+		cephCluster.Spec.Storage.StorageClassDeviceSets[0].Count = 10     // 2 more portable
+		osdsPerNode = 4                                                   // vd[a-d]
 
 		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 5) // 3 nodes + 2 new PVCs
@@ -322,12 +335,12 @@ func testOSDIntegration(t *testing.T) {
 			updateStatusConfigmap(clientset, statusMapWatcher, cpy)
 			if i == 2 {
 				t.Log("canceling orchestration")
-				time.Sleep(10 * time.Millisecond)
+				time.Sleep(100 * time.Millisecond)
 				// after the second status map is made ready, cancel the orchestration. wait a short
 				// while to make sure the watcher picks up the updated change
 				cancel()
 				// refresh the context so the rest of the test can continue
-				contextCancel = contextStandard.TODO()
+				contextCancel = ctx
 				break
 			}
 			i++
@@ -355,8 +368,8 @@ func testOSDIntegration(t *testing.T) {
 	})
 
 	t.Run("failures reported in status configmaps", func(t *testing.T) {
-		spec.Storage.Selection.DeviceFilter = "/dev/vd[abcde]" // 3 more (1 more per node)
-		osdsPerNode = 5                                        // vd[a-e]
+		cephCluster.Spec.Storage.Selection.DeviceFilter = "/dev/vd[abcde]" // 3 more (1 more per node)
+		osdsPerNode = 5                                                    // vd[a-e]
 
 		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
@@ -419,8 +432,8 @@ func testOSDIntegration(t *testing.T) {
 	})
 
 	t.Run("failures during deployment creation", func(t *testing.T) {
-		spec.Storage.Selection.DeviceFilter = "/dev/vd[abcdef]" // 3 more (1 more per node)
-		osdsPerNode = 6                                         // vd[a-f]
+		cephCluster.Spec.Storage.Selection.DeviceFilter = "/dev/vd[abcdef]" // 3 more (1 more per node)
+		osdsPerNode = 6                                                     // vd[a-f]
 
 		failCreatingDeployments = []string{"osd-31", "osd-33"}
 		go runReconcile(contextCancel)
@@ -455,9 +468,9 @@ func testOSDIntegration(t *testing.T) {
 			Name:                 "new",
 			Count:                3,
 			Portable:             true,
-			VolumeClaimTemplates: []corev1.PersistentVolumeClaim{},
+			VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{},
 		}
-		spec.Storage.StorageClassDeviceSets = append(spec.Storage.StorageClassDeviceSets, newSCDS)
+		cephCluster.Spec.Storage.StorageClassDeviceSets = append(cephCluster.Spec.Storage.StorageClassDeviceSets, newSCDS)
 
 		go runReconcile(contextCancel)
 		cms := waitForNumConfigMaps(clientset, namespace, 3) // 3 nodes
@@ -472,7 +485,7 @@ func testOSDIntegration(t *testing.T) {
 		assert.Len(t, deploymentsCreated, 0)
 		assert.Len(t, deploymentsUpdated, 34)
 
-		spec.Storage.StorageClassDeviceSets[2].VolumeClaimTemplates = []corev1.PersistentVolumeClaim{
+		cephCluster.Spec.Storage.StorageClassDeviceSets[2].VolumeClaimTemplates = []cephv1.VolumeClaimTemplate{
 			newDummyPVC("data", namespace, "100Gi", "ec2"),
 			newDummyPVC("metadata", namespace, "10Gi", "uncle-rogers-secret-stuff"),
 		}
@@ -546,13 +559,13 @@ func osdIntegrationTestExecutor(t *testing.T, clientset *fake.Clientset, namespa
 						panic(err)
 					}
 					t.Logf("returning ok for OSD %d", id)
-					return cephclientfake.OsdOkToStopOutput(id, []int{id}, true), nil
+					return cephclientfake.OsdOkToStopOutput(id, []int{id}), nil
 				}
 				if args[1] == "ls" {
 					// ceph osd ls returns an array of osd IDs like [0,1,2]
 					// build this based on the number of deployments since they should be equal
 					// for this test
-					l, err := clientset.AppsV1().Deployments(namespace).List(contextStandard.TODO(), metav1.ListOptions{})
+					l, err := clientset.AppsV1().Deployments(namespace).List(t.Context(), metav1.ListOptions{})
 					if err != nil {
 						panic(fmt.Sprintf("failed to build 'ceph osd ls' output. %v", err))
 					}
@@ -565,11 +578,18 @@ func osdIntegrationTestExecutor(t *testing.T, clientset *fake.Clientset, namespa
 					if args[2] == "get-device-class" {
 						return cephclientfake.OSDDeviceClassOutput(args[3]), nil
 					}
+					if args[2] == "class" && args[3] == "ls" {
+						// Mock executor for OSD crush class list command, returning ssd as available device class
+						return `["ssd"]`, nil
+					}
+				}
+				if args[1] == "df" {
+					return osdDFResults, nil
 				}
 			}
 			if args[0] == "versions" {
 				// the update deploy code only cares about the mons from the ceph version command results
-				v := `{"mon":{"ceph version 16.2.2 (somehash) octopus (stable)":3}}`
+				v := `{"mon":{"ceph version 19.2.1 (somehash) squid (stable)":3}}`
 				return v, nil
 			}
 			return "", errors.Errorf("unexpected ceph command %q", args)
@@ -612,7 +632,7 @@ func newDummyStorageClassDeviceSet(
 		Name:     name,
 		Count:    count,
 		Portable: portable,
-		VolumeClaimTemplates: []corev1.PersistentVolumeClaim{
+		VolumeClaimTemplates: []cephv1.VolumeClaimTemplate{
 			newDummyPVC("data", namespace, "10Gi", storageClassName),
 		},
 	}
@@ -620,7 +640,7 @@ func newDummyStorageClassDeviceSet(
 
 func waitForNumConfigMaps(clientset kubernetes.Interface, namespace string, count int) []corev1.ConfigMap {
 	for {
-		cms, err := clientset.CoreV1().ConfigMaps(namespace).List(contextStandard.TODO(), metav1.ListOptions{})
+		cms, err := clientset.CoreV1().ConfigMaps(namespace).List(context.TODO(), metav1.ListOptions{})
 		if err != nil {
 			panic(err)
 		}
@@ -646,21 +666,21 @@ func setStatusConfigMapToCompleted(t *testing.T, cm *corev1.ConfigMap, numOSDsIf
 		status.OSDs = []OSDInfo{
 			{
 				ID:        osdID,
-				UUID:      fmt.Sprintf("%032d", osdID),
+				UUID:      fmt.Sprintf("00000000-0000-0000-0000-%012d", osdID),
 				BlockPath: "/dev/path/to/block",
 				CVMode:    "raw",
 			},
 		}
 	} else {
 		status.OSDs = []OSDInfo{}
-		for i := 0; i < numOSDsIfOnNode; i++ {
+		for i := range numOSDsIfOnNode {
 			// in order to generate multiple OSDs on a node, pretend they have different configmap
 			// names (simply append the index). this is still deterministic.
 			osdID := testIDGenerator.osdID(t, fmt.Sprintf("%s-%d", cm.Name, i))
 			disk := k8sutil.IndexToName(i)
 			status.OSDs = append(status.OSDs, OSDInfo{
 				ID:        osdID,
-				UUID:      fmt.Sprintf("%032d", osdID),
+				UUID:      fmt.Sprintf("00000000-0000-0000-0000-%012d", osdID),
 				BlockPath: fmt.Sprintf("/dev/vd%s", disk),
 				CVMode:    "raw",
 			})

@@ -1,5 +1,4 @@
-/*
-Copyright 2016 The Rook Authors. All rights reserved.
+/* Copyright 2016 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -17,9 +16,10 @@ limitations under the License.
 package object
 
 import (
-	"context"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -30,15 +30,19 @@ import (
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util/exec"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
+	kexec "k8s.io/utils/exec"
 )
 
 const (
+	//nolint:gosec // only test values, not a real secret
 	dashboardAdminCreateJSON = `{
     "user_id": "dashboard-admin",
     "display_name": "dashboard-admin",
@@ -68,7 +72,155 @@ const (
 		"max_objects": -1
 	}
 }`
+	objectZoneJson = `{
+		"id": "c1a20ed9-6370-4abd-b78c-bdf0da2a8dbb",
+		"name": "store-a",
+		"domain_root": "rgw-meta-pool:store-a.meta.root",
+		"control_pool": "rgw-meta-pool:store-a.control",
+		"gc_pool": "rgw-meta-pool:store-a.log.gc",
+		"lc_pool": "rgw-meta-pool:store-a.log.lc",
+		"log_pool": "rgw-meta-pool:store-a.log",
+		"intent_log_pool": "rgw-meta-pool:store-a.log.intent",
+		"usage_log_pool": "rgw-meta-pool:store-a.log.usage",
+		"roles_pool": "rgw-meta-pool:store-a.meta.roles",
+		"reshard_pool": "rgw-meta-pool:store-a.log.reshard",
+		"user_keys_pool": "rgw-meta-pool:store-a.meta.users.keys",
+		"user_email_pool": "rgw-meta-pool:store-a.meta.users.email",
+		"user_swift_pool": "rgw-meta-pool:store-a.meta.users.swift",
+		"user_uid_pool": "rgw-meta-pool:store-a.meta.users.uid",
+		"otp_pool": "rgw-meta-pool:store-a.otp",
+		"system_key": {
+			"access_key": "",
+			"secret_key": ""
+		},
+		"placement_pools": [
+			{
+				"key": "default-placement",
+				"val": {
+					"index_pool": "rgw-meta-pool:store-a.buckets.index",
+					"storage_classes": {
+						"STANDARD": {
+							"data_pool": "rgw-data-pool:store-a.buckets.data"
+						}
+					},
+					"data_extra_pool": "rgw-meta-pool:store-a.buckets.non-ec",
+					"index_type": 0,
+					"inline_data": true
+				}
+			}
+		],
+		"realm_id": "e7f176c6-d207-459c-aa04-c3334300ddc6",
+		"notif_pool": "rgw-meta-pool:store-a.log.notif"
+	}`
+	objectZoneSharedPoolsJsonTempl = `{
+  "id": "c1a20ed9-6370-4abd-b78c-bdf0da2a8dbb",
+  "name": "store-a",
+  "domain_root": "%[1]s:store-a.meta.root",
+  "control_pool": "%[1]s:store-a.control",
+  "gc_pool": "%[1]s:store-a.log.gc",
+  "lc_pool": "%[1]s:store-a.log.lc",
+  "log_pool": "%[1]s:store-a.log",
+  "intent_log_pool": "%[1]s:store-a.log.intent",
+  "usage_log_pool": "%[1]s:store-a.log.usage",
+  "roles_pool": "%[1]s:store-a.meta.roles",
+  "reshard_pool": "%[1]s:store-a.log.reshard",
+  "user_keys_pool": "%[1]s:store-a.meta.users.keys",
+  "user_email_pool": "%[1]s:store-a.meta.users.email",
+  "user_swift_pool": "%[1]s:store-a.meta.users.swift",
+  "user_uid_pool": "%[1]s:store-a.meta.users.uid",
+  "otp_pool": "%[1]s:store-a.otp",
+  "system_key": {
+    "access_key": "",
+    "secret_key": ""
+  },
+  "placement_pools": [
+    {
+      "key": "default-placement",
+      "val": {
+        "data_extra_pool": "%[1]s:store-a.buckets.non-ec",
+        "index_pool": "%[1]s:store-a.buckets.index",
+        "index_type": 0,
+        "inline_data": true,
+        "storage_classes": {
+          "STANDARD": {
+            "data_pool": "%[2]s:store-a.buckets.data"
+          }
+        }
+      }
+    }
+  ],
+  "realm_id": "e7f176c6-d207-459c-aa04-c3334300ddc6",
+  "notif_pool": "%[1]s:store-a.log.notif"
+}`
+
+	objectZonegroupJson = `{
+    "id": "610c9e3d-19e7-40b0-9f88-03319c4bc65a",
+    "name": "store-a",
+    "api_name": "test",
+    "is_master": true,
+    "endpoints": [
+        "https://rook-ceph-rgw-test.rook-ceph.svc:443"
+    ],
+    "hostnames": [],
+    "hostnames_s3website": [],
+    "master_zone": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+    "zones": [
+        {
+            "id": "f539c2c0-e1ed-4c42-9294-41742352eeae",
+            "name": "test",
+            "endpoints": [
+                "https://rook-ceph-rgw-test.rook-ceph.svc:443"
+            ]
+        }
+    ],
+    "placement_targets": [
+        {
+            "name": "default-placement",
+            "tags": [],
+            "storage_classes": [
+                "STANDARD"
+            ]
+        }
+    ],
+    "default_placement": "default-placement",
+    "realm_id": "29e28253-be54-4581-90dd-206020d2fcdd",
+    "sync_policy": {
+        "groups": []
+    },
+    "enabled_features": [
+        "resharding"
+    ]
+}`
+
+	//#nosec G101 -- The credentials are just for the unit tests
 	access_key = "VFKF8SSU9L3L2UR03Z8C"
+	//#nosec G101 -- The credentials are just for the unit tests
+	secret_key = "5U4e2MkXHgXstfWkxGZOI6AXDfVUkDDHM7Dwc3mY"
+
+	// What `ceph dashboard get-rgw-api-{access,secret}-key` prints once the dashboard has
+	// configured credentials itself: a Python dict repr mapping each realm to a key of the
+	// dashboard's own user, rather than a single key.
+	//#nosec G101 -- The credentials are just for the unit tests
+	accessKeyRealmMap = `{'store-a': 'VFKF8SSU9L3L2UR03Z8C'}`
+	//#nosec G101 -- The credentials are just for the unit tests
+	secretKeyRealmMap = `{'store-a': '5U4e2MkXHgXstfWkxGZOI6AXDfVUkDDHM7Dwc3mY'}`
+
+	// A dashboard-admin user left behind by an operator that stored the realm map as its keys.
+	//#nosec G101 -- The credentials are just for the unit tests
+	dashboardAdminRealmMapJSON = `{
+    "user_id": "dashboard-admin",
+    "display_name": "dashboard-admin",
+    "email": "",
+    "keys": [
+        {
+            "user": "dashboard-admin",
+            "access_key": "{'store-a': 'VFKF8SSU9L3L2UR03Z8C'}",
+            "secret_key": "{'store-a': '5U4e2MkXHgXstfWkxGZOI6AXDfVUkDDHM7Dwc3mY'}"
+        }
+    ],
+    "system": "true",
+    "type": "rgw"
+}`
 )
 
 func TestReconcileRealm(t *testing.T) {
@@ -93,12 +245,273 @@ func TestReconcileRealm(t *testing.T) {
 	objContext := NewContext(context, &client.ClusterInfo{Namespace: "mycluster"}, storeName)
 	// create the first realm, marked as default
 	store := cephv1.CephObjectStore{}
-	err := setMultisite(objContext, &store, "1.2.3.4")
+	err := configureObjectStore(objContext, &store, nil)
 	assert.Nil(t, err)
 
 	// create the second realm, not marked as default
-	err = setMultisite(objContext, &store, "2.3.4.5")
+	err = configureObjectStore(objContext, &store, nil)
 	assert.Nil(t, err)
+}
+
+func TestConfigureObjectStoreWithCustomEndpoints(t *testing.T) {
+	// zonegroup get returns master zonegroup with master zone
+	zoneGroupJSON := `{
+		"id": "fg8ff110-d3fd-49b4-b24f-f6cd3dddfedf",
+		"name": "zonegroup-a",
+		"api_name": "zonegroup-a",
+		"is_master": true,
+		"endpoints": ["https://custom.endpoint:443"],
+		"master_zone": "6cb39d2c-3005-49da-9be3-c1a92a97d28a",
+		"zones": [
+			{
+				"id": "6cb39d2c-3005-49da-9be3-c1a92a97d28a",
+				"name": "zone-a",
+				"endpoints": ["https://custom.endpoint:443"]
+			}
+		],
+		"realm_id": "237e6250-5f7d-4b85-9359-8cb2b1848507"
+	}`
+	// zone get returns zone whose ID matches master_zone above (so it is master)
+	zoneJSON := `{"id": "6cb39d2c-3005-49da-9be3-c1a92a97d28a", "name": "zone-a"}`
+
+	calledUserInfo := false
+	calledUserCreate := false
+
+	ns := "rook-ceph"
+	realmName := "realm-a"
+
+	ctx := t.Context()
+	secret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: ns,
+			Name:      realmName + "-keys",
+		},
+		//nolint:gosec // only test values
+		Data: map[string][]byte{
+			"access-key": []byte("testAccessKey"),
+			"secret-key": []byte("testSecretKey"),
+		},
+	}
+	clientset := k8sfake.NewClientset(secret)
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			logger.Infof("TestConfigureObjectStoreWithCustomEndpoints: %s %v", command, args)
+			switch args[0] {
+			case "zonegroup":
+				if args[1] == "get" {
+					return zoneGroupJSON, nil
+				}
+			case "zone":
+				if args[1] == "get" {
+					return zoneJSON, nil
+				}
+			case "user":
+				if args[1] == "info" {
+					calledUserInfo = true
+					// EINVAL signals user not found → triggers user create
+					return "", exectest.MockExecCommandReturns(t, "", "", int(syscall.EINVAL))
+				}
+				if args[1] == "create" {
+					calledUserCreate = true
+					return `{"user_id": "realm-a-system-user"}`, nil
+				}
+			}
+			return "", nil
+		},
+	}
+
+	clusterCtx := &clusterd.Context{Executor: executor, Clientset: clientset}
+	clusterInfo := &client.ClusterInfo{Namespace: ns, Context: ctx}
+	objContext := NewContext(clusterCtx, clusterInfo, "my-store")
+	objContext.Realm = realmName
+	objContext.ZoneGroup = "zonegroup-a"
+	objContext.Zone = "zone-a"
+
+	store := &cephv1.CephObjectStore{
+		ObjectMeta: metav1.ObjectMeta{Namespace: ns, Name: "my-store"},
+		Spec: cephv1.ObjectStoreSpec{
+			Zone: cephv1.ZoneSpec{Name: "zone-a"},
+		},
+	}
+	zone := &cephv1.CephObjectZone{
+		Spec: cephv1.ObjectZoneSpec{
+			CustomEndpoints: []string{"https://custom.endpoint:443"},
+		},
+	}
+
+	err := configureObjectStore(objContext, store, zone)
+	assert.NoError(t, err)
+	assert.True(t, calledUserInfo, "expected user info to be called for system user")
+	assert.True(t, calledUserCreate, "expected user create to be called for system user")
+}
+
+func TestConfigureStoreWithSharedPools(t *testing.T) {
+	sharedMetaPoolAlreadySet, sharedDataPoolAlreadySet := "", ""
+	zoneGetCalled := false
+	zoneSetCalled := false
+	zoneGroupGetCalled := false
+	zoneGroupSetCalled := false
+	placementModifyCalled := false
+	mockExecutorFuncOutput := func(command string, args ...string) (string, error) {
+		logger.Infof("Command: %s %v", command, args)
+		if args[0] == "osd" && args[1] == "lspools" {
+			return `[{"poolnum":14,"poolname":"test-meta"},{"poolnum":15,"poolname":"test-data"},{"poolnum":16,"poolname":"fast-meta"},{"poolnum":17,"poolname":"fast-data"}]`, nil
+		}
+		return "", errors.Errorf("unexpected ceph command %q", args)
+	}
+
+	executorFuncTimeout := func(timeout time.Duration, command string, args ...string) (string, error) {
+		logger.Infof("CommandTimeout: %s %v", command, args)
+		if args[0] == "zone" {
+			if args[1] == "get" {
+				zoneGetCalled = true
+				if sharedDataPoolAlreadySet == "" && sharedMetaPoolAlreadySet == "" {
+					replaceDataPool := "rgw-data-pool:store-a.buckets.data"
+					return strings.ReplaceAll(objectZoneJson, replaceDataPool, "datapool:store-a.buckets.data"), nil
+				}
+				return fmt.Sprintf(objectZoneSharedPoolsJsonTempl, sharedMetaPoolAlreadySet, sharedDataPoolAlreadySet), nil
+			} else if args[1] == "set" {
+				zoneSetCalled = true
+				for _, arg := range args {
+					if !strings.HasPrefix(arg, "--infile=") {
+						continue
+					}
+					file := strings.TrimPrefix(arg, "--infile=")
+					inBytes, err := os.ReadFile(file)
+					if err != nil {
+						panic(err)
+					}
+					return string(inBytes), nil
+				}
+				return objectZoneJson, nil
+			} else if args[1] == "placement" && args[2] == "modify" {
+				placementModifyCalled = true
+				return objectZoneJson, nil
+			}
+		} else if args[0] == "zonegroup" {
+			if args[1] == "get" {
+				zoneGroupGetCalled = true
+				return objectZonegroupJson, nil
+			} else if args[1] == "set" {
+				zoneGroupSetCalled = true
+				for _, arg := range args {
+					if !strings.HasPrefix(arg, "--infile=") {
+						continue
+					}
+					file := strings.TrimPrefix(arg, "--infile=")
+					inBytes, err := os.ReadFile(file)
+					if err != nil {
+						panic(err)
+					}
+					return string(inBytes), nil
+				}
+				return objectZonegroupJson, nil
+			}
+		}
+		return "", errors.Errorf("unexpected ceph command %q", args)
+	}
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput:         mockExecutorFuncOutput,
+		MockExecuteCommandWithCombinedOutput: mockExecutorFuncOutput,
+		MockExecuteCommandWithTimeout:        executorFuncTimeout,
+	}
+	context := &Context{
+		Context:     &clusterd.Context{Executor: executor},
+		Name:        "myobj",
+		Realm:       "myobj",
+		ZoneGroup:   "myobj",
+		Zone:        "myobj",
+		clusterInfo: client.AdminTestClusterInfo("mycluster"),
+	}
+
+	t.Run("no shared pools", func(t *testing.T) {
+		// No shared pools specified, so skip the config
+		sharedPools := cephv1.ObjectSharedPoolsSpec{}
+		err := ConfigureSharedPoolsForZone(context, sharedPools)
+		assert.NoError(t, err)
+		assert.False(t, zoneGetCalled)
+		assert.False(t, zoneSetCalled)
+		assert.False(t, placementModifyCalled)
+		assert.False(t, zoneGroupGetCalled)
+		assert.False(t, zoneGroupSetCalled)
+	})
+	t.Run("configure the zone", func(t *testing.T) {
+		sharedPools := cephv1.ObjectSharedPoolsSpec{
+			MetadataPoolName: "test-meta",
+			DataPoolName:     "test-data",
+		}
+		err := ConfigureSharedPoolsForZone(context, sharedPools)
+		assert.NoError(t, err)
+		assert.True(t, zoneGetCalled)
+		assert.True(t, zoneSetCalled)
+		assert.False(t, placementModifyCalled) // mock returns applied namespaces, no workaround needed
+		assert.True(t, zoneGroupGetCalled)
+		assert.False(t, zoneGroupSetCalled) // zone group is set only if extra pool placements specified
+	})
+	t.Run("configure with new default placement", func(t *testing.T) {
+		sharedPools := cephv1.ObjectSharedPoolsSpec{
+			PoolPlacements: []cephv1.PoolPlacementSpec{
+				{
+					Name:             "default",
+					Default:          true,
+					MetadataPoolName: "test-meta",
+					DataPoolName:     "test-data",
+				},
+			},
+		}
+		err := ConfigureSharedPoolsForZone(context, sharedPools)
+		assert.NoError(t, err)
+		assert.True(t, zoneGetCalled)
+		assert.True(t, zoneSetCalled)
+		assert.False(t, placementModifyCalled) // mock returns applied namespaces, no workaround needed
+		assert.True(t, zoneGroupGetCalled)
+		assert.True(t, zoneGroupSetCalled)
+	})
+	t.Run("data pool already set", func(t *testing.T) {
+		// reset
+		zoneGroupSetCalled = false
+		// Simulate that the data pool has already been set and the zone update can be skipped
+		sharedPools := cephv1.ObjectSharedPoolsSpec{
+			MetadataPoolName: "test-meta",
+			DataPoolName:     "test-data",
+		}
+		sharedMetaPoolAlreadySet, sharedDataPoolAlreadySet = "test-meta", "test-data"
+		zoneGetCalled = false
+		zoneSetCalled = false
+		placementModifyCalled = false
+		err := ConfigureSharedPoolsForZone(context, sharedPools)
+		assert.True(t, zoneGetCalled)
+		assert.False(t, zoneSetCalled)
+		assert.False(t, placementModifyCalled) // mock returns applied namespaces, no workaround needed
+		assert.NoError(t, err)
+		assert.True(t, zoneGroupGetCalled)
+		assert.False(t, zoneGroupSetCalled)
+	})
+	t.Run("configure with extra placement", func(t *testing.T) {
+		sharedPools := cephv1.ObjectSharedPoolsSpec{
+			PoolPlacements: []cephv1.PoolPlacementSpec{
+				{
+					Name:             "default",
+					Default:          true,
+					MetadataPoolName: "test-meta",
+					DataPoolName:     "test-data",
+				},
+				{
+					Name:             "fast",
+					MetadataPoolName: "fast-meta",
+					DataPoolName:     "fast-data",
+				},
+			},
+		}
+		err := ConfigureSharedPoolsForZone(context, sharedPools)
+		assert.NoError(t, err)
+		assert.True(t, zoneGetCalled)
+		assert.True(t, zoneSetCalled)
+		assert.False(t, placementModifyCalled) // mock returns applied namespaces, no workaround needed
+		assert.True(t, zoneGroupGetCalled)
+		assert.True(t, zoneGroupSetCalled)
+	})
 }
 
 func TestDeleteStore(t *testing.T) {
@@ -137,20 +550,20 @@ func deleteStore(t *testing.T, name string, existingStores string, expectedDelet
 			}
 			if args[1] == "erasure-code-profile" {
 				if args[2] == "ls" {
-					return `["default","myobj_ecprofile"]`, nil
+					return `["default","myobj.rgw.buckets.data_ecprofile"]`, nil
 				}
 				if args[2] == "rm" {
-					if args[3] == "myobj_ecprofile" {
+					if args[3] == "myobj.rgw.buckets.data_ecprofile" {
 						deletedErasureCodeProfile = true
 					} else {
-						assert.Fail(t, fmt.Sprintf("the erasure code profile to be deleted should be myobj_ecprofile. Actual: %s ", args[3]))
+						assert.Fail(t, fmt.Sprintf("the erasure code profile to be deleted should be myobj.rgw.buckets.data_ecprofile. Actual: %s ", args[3]))
 					}
 					return "", nil
 				}
 			}
 		}
 		if args[0] == "realm" {
-			if args[1] == "delete" {
+			if args[1] == "rm" {
 				realmDeleted = true
 				return "", nil
 			}
@@ -188,7 +601,7 @@ func deleteStore(t *testing.T, name string, existingStores string, expectedDelet
 	executor.MockExecuteCommandWithTimeout = executorFuncWithTimeout
 	executor.MockExecuteCommandWithOutput = executorFunc
 	executor.MockExecuteCommandWithCombinedOutput = executorFunc
-	context := &Context{Context: &clusterd.Context{Executor: executor}, Name: "myobj", clusterInfo: client.AdminClusterInfo("mycluster")}
+	context := &Context{Context: &clusterd.Context{Executor: executor}, Name: "myobj", clusterInfo: client.AdminTestClusterInfo("mycluster")}
 
 	// Delete an object store without deleting the pools
 	spec := cephv1.ObjectStoreSpec{}
@@ -209,7 +622,7 @@ func deleteStore(t *testing.T, name string, existingStores string, expectedDelet
 	}
 	err = deleteRealmAndPools(context, spec)
 	assert.Nil(t, err)
-	expectedPoolsDeleted = 6
+	expectedPoolsDeleted = 7
 	if expectedDeleteRootPool {
 		expectedPoolsDeleted++
 	}
@@ -220,19 +633,150 @@ func deleteStore(t *testing.T, name string, existingStores string, expectedDelet
 
 func TestGetObjectBucketProvisioner(t *testing.T) {
 	testNamespace := "test-namespace"
-	os.Setenv(k8sutil.PodNamespaceEnvVar, testNamespace)
+	t.Setenv(k8sutil.PodNamespaceEnvVar, testNamespace)
 
-	t.Run("watch single namespace", func(t *testing.T) {
-		data := map[string]string{"ROOK_OBC_WATCH_OPERATOR_NAMESPACE": "true"}
-		bktprovisioner := GetObjectBucketProvisioner(data, testNamespace)
+	t.Run("watch ceph cluster namespace", func(t *testing.T) {
+		os.Setenv("ROOK_OBC_WATCH_OPERATOR_NAMESPACE", "true")
+		defer os.Unsetenv("ROOK_OBC_WATCH_OPERATOR_NAMESPACE")
+		bktprovisioner, err := GetObjectBucketProvisioner(testNamespace)
 		assert.Equal(t, fmt.Sprintf("%s.%s", testNamespace, bucketProvisionerName), bktprovisioner)
+		assert.NoError(t, err)
 	})
 
 	t.Run("watch all namespaces", func(t *testing.T) {
-		data := map[string]string{"ROOK_OBC_WATCH_OPERATOR_NAMESPACE": "false"}
-		bktprovisioner := GetObjectBucketProvisioner(data, testNamespace)
+		os.Setenv("ROOK_OBC_WATCH_OPERATOR_NAMESPACE", "false")
+		defer os.Unsetenv("ROOK_OBC_WATCH_OPERATOR_NAMESPACE")
+		bktprovisioner, err := GetObjectBucketProvisioner(testNamespace)
 		assert.Equal(t, bucketProvisionerName, bktprovisioner)
+		assert.NoError(t, err)
 	})
+
+	t.Run("prefix object provisioner", func(t *testing.T) {
+		os.Setenv("ROOK_OBC_PROVISIONER_NAME_PREFIX", "my-prefix")
+		defer os.Unsetenv("ROOK_OBC_PROVISIONER_NAME_PREFIX")
+		bktprovisioner, err := GetObjectBucketProvisioner(testNamespace)
+		assert.Equal(t, "my-prefix."+bucketProvisionerName, bktprovisioner)
+		assert.NoError(t, err)
+	})
+
+	t.Run("watch ceph cluster namespace and prefix object provisioner", func(t *testing.T) {
+		os.Setenv("ROOK_OBC_WATCH_OPERATOR_NAMESPACE", "true")
+		os.Setenv("ROOK_OBC_PROVISIONER_NAME_PREFIX", "my-prefix")
+		defer os.Unsetenv("ROOK_OBC_WATCH_OPERATOR_NAMESPACE")
+		defer os.Unsetenv("ROOK_OBC_PROVISIONER_NAME_PREFIX")
+		bktprovisioner, err := GetObjectBucketProvisioner(testNamespace)
+		assert.Equal(t, "my-prefix."+bucketProvisionerName, bktprovisioner)
+		assert.NoError(t, err)
+	})
+
+	t.Run("invalid prefix value for object provisioner", func(t *testing.T) {
+		os.Setenv("ROOK_OBC_PROVISIONER_NAME_PREFIX", "my-prefix.")
+		defer os.Unsetenv("ROOK_OBC_PROVISIONER_NAME_PREFIX")
+		_, err := GetObjectBucketProvisioner(testNamespace)
+		assert.Error(t, err)
+	})
+}
+
+func TestCheckDashboardUser(t *testing.T) {
+	storeName := "myobject"
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			if args[0] == "user" {
+				if args[1] == "info" {
+					return "no user info saved", nil
+				}
+			}
+			return "", nil
+		},
+	}
+	objContext := NewContext(&clusterd.Context{Executor: executor}, &client.ClusterInfo{
+		Namespace:   "mycluster",
+		CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9},
+		Context:     t.Context(),
+	},
+		storeName)
+
+	// Scenario 1: No user exists yet
+	user, credentialsPublished, err := getDashboardUser(objContext)
+	assert.NoError(t, err)
+	assert.NotNil(t, user)
+	assert.False(t, credentialsPublished)
+	assert.Nil(t, user.AccessKey)
+	assert.Nil(t, user.SecretKey)
+	checkdashboard, err := checkDashboardUser(objContext, user)
+	assert.NoError(t, err)
+	assert.False(t, checkdashboard)
+
+	// Scenario 2: User exists and the current dashboard credentials are the same
+	objContext.Context.Executor = &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			if args[0] == "dashboard" {
+				switch args[1] {
+				case "get-rgw-api-access-key":
+					return access_key, nil
+				case "get-rgw-api-secret-key":
+					return secret_key, nil
+				}
+			}
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			if args[0] == "user" {
+				if args[1] == "info" {
+					return dashboardAdminCreateJSON, nil
+				}
+			}
+			return "", nil
+		},
+	}
+
+	user, credentialsPublished, err = getDashboardUser(objContext)
+	assert.NoError(t, err)
+	assert.NotNil(t, user)
+	assert.True(t, credentialsPublished)
+	assert.NotNil(t, user.AccessKey)
+	assert.NotNil(t, user.SecretKey)
+
+	checkdashboard, err = checkDashboardUser(objContext, user)
+	assert.NoError(t, err)
+	assert.True(t, checkdashboard)
+
+	// Scenario 3: User exists but dashboard credentials differ from radosgw-admin user info credentials
+	objContext.Context.Executor = &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			if args[0] == "dashboard" {
+				switch args[1] {
+				case "get-rgw-api-access-key":
+					return "incorrect", nil
+				case "get-rgw-api-secret-key":
+					return "incorrect", nil
+				}
+			}
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			if args[0] == "user" {
+				if args[1] == "info" {
+					return dashboardAdminCreateJSON, nil
+				}
+			}
+			return "", nil
+		},
+	}
+
+	user, credentialsPublished, err = getDashboardUser(objContext)
+	assert.NoError(t, err)
+	assert.NotNil(t, user)
+	assert.True(t, credentialsPublished)
+	assert.NotNil(t, user.AccessKey)
+	assert.NotNil(t, user.SecretKey)
+
+	checkdashboard, err = checkDashboardUser(objContext, user)
+	assert.NoError(t, err)
+	assert.False(t, checkdashboard)
 }
 
 func TestDashboard(t *testing.T) {
@@ -243,7 +787,12 @@ func TestDashboard(t *testing.T) {
 		},
 		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
 			if args[0] == "user" {
-				return dashboardAdminCreateJSON, nil
+				switch args[1] {
+				case "info":
+					return "no user info saved", nil
+				case "create":
+					return dashboardAdminCreateJSON, nil
+				}
 			}
 			return "", nil
 		},
@@ -251,25 +800,36 @@ func TestDashboard(t *testing.T) {
 	objContext := NewContext(&clusterd.Context{Executor: executor}, &client.ClusterInfo{
 		Namespace:   "mycluster",
 		CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9},
-		Context:     context.TODO(),
+		Context:     t.Context(),
 	},
 		storeName)
 
-	checkdashboard, err := checkDashboardUser(objContext)
+	user, _, err := getDashboardUser(objContext)
+	assert.NoError(t, err)
+	assert.NotNil(t, user)
+	checkdashboard, err := checkDashboardUser(objContext, user)
 	assert.NoError(t, err)
 	assert.False(t, checkdashboard)
 	err = enableRGWDashboard(objContext)
-	assert.Nil(t, err)
+	assert.NoError(t, err)
+
 	executor = &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
-			if args[0] == "dashboard" && args[1] == "get-rgw-api-access-key" {
-				return access_key, nil
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			if args[0] == "user" && args[1] == "info" {
+				return dashboardAdminCreateJSON, nil
 			}
 			return "", nil
 		},
 	}
 	objContext.Context.Executor = executor
-	checkdashboard, err = checkDashboardUser(objContext)
+
+	user, _, err = getDashboardUser(objContext)
+	assert.NoError(t, err)
+	assert.NotNil(t, user)
+	checkdashboard, err = checkDashboardUser(objContext, user)
 	assert.NoError(t, err)
 	assert.True(t, checkdashboard)
 	disableRGWDashboard(objContext)
@@ -277,24 +837,269 @@ func TestDashboard(t *testing.T) {
 	objContext = NewContext(&clusterd.Context{Executor: executor}, &client.ClusterInfo{
 		Namespace:   "mycluster",
 		CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 10},
-		Context:     context.TODO(),
+		Context:     t.Context(),
 	},
 		storeName)
 	err = enableRGWDashboard(objContext)
-	assert.Nil(t, err)
-	executor = &exectest.MockExecutor{
+	assert.NoError(t, err)
+	checkdashboard, err = checkDashboardUser(objContext, user)
+	assert.NoError(t, err)
+	assert.True(t, checkdashboard)
+	disableRGWDashboard(objContext)
+}
+
+func Test_isUsableDashboardCredential(t *testing.T) {
+	tests := []struct {
+		name  string
+		value string
+		want  bool
+	}{
+		{"access key", access_key, true},
+		{"secret key", secret_key, true},
+		{"empty", "", false},
+		{"realm map", accessKeyRealmMap, false},
+		{"realm map secret", secretKeyRealmMap, false},
+		{"realm map as json", `{"store-a": "VFKF8SSU9L3L2UR03Z8C"}`, false},
+		{"multi realm map", `{'store-a': 'VFKF8SSU9L3L2UR03Z8C', 'store-b': 'ZBOXZZR6C3QKOTX1IY4W'}`, false},
+		{"empty map", "{}", false},
+		{"whitespace only", "   ", false},
+		{"embedded whitespace", "VFKF8SSU9L3L 2UR03Z8C", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, isUsableDashboardCredential(tt.value))
+		})
+	}
+}
+
+// The dashboard replaces RGW_API_ACCESS_KEY with a per-realm map of its own credentials as soon
+// as it configures them itself. Reading that map back must not be mistaken for a key, otherwise
+// the dashboard user of every object store reconciled afterwards is created with the map as its
+// access and secret key and RGW answers 403 InvalidAccessKeyId. See rook/rook#17553.
+func TestGetDashboardUserWithRealmMap(t *testing.T) {
+	executor := &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
-			if args[0] == "dashboard" && args[1] == "get-rgw-api-access-key" {
-				return access_key, nil
+			if args[0] == "dashboard" {
+				switch args[1] {
+				case "get-rgw-api-access-key":
+					return accessKeyRealmMap, nil
+				case "get-rgw-api-secret-key":
+					return secretKeyRealmMap, nil
+				}
 			}
 			return "", nil
 		},
 	}
-	objContext.Context.Executor = executor
-	checkdashboard, err = checkDashboardUser(objContext)
+	objContext := newDashboardTestContext(t, executor)
+
+	user, credentialsPublished, err := getDashboardUser(objContext)
 	assert.NoError(t, err)
-	assert.True(t, checkdashboard)
-	disableRGWDashboard(objContext)
+	assert.False(t, credentialsPublished)
+	assert.Nil(t, user.AccessKey)
+	assert.Nil(t, user.SecretKey)
+}
+
+// A dashboard user already holding the realm map has to be recreated, otherwise the object
+// stores broken by earlier operators would stay broken across every future reconcile.
+func TestCheckDashboardUserWithRealmMapKeys(t *testing.T) {
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			if args[0] == "user" && args[1] == "info" {
+				return dashboardAdminRealmMapJSON, nil
+			}
+			return "", nil
+		},
+	}
+	objContext := newDashboardTestContext(t, executor)
+
+	user, credentialsPublished, err := getDashboardUser(objContext)
+	assert.NoError(t, err)
+	assert.False(t, credentialsPublished)
+
+	checkdashboard, err := checkDashboardUser(objContext, user)
+	assert.NoError(t, err)
+	assert.False(t, checkdashboard)
+}
+
+// End to end cover for rook/rook#17553: with the realm map published and no dashboard user in
+// this store's realm yet, the user must be created with keys RGW generates and the dashboard
+// must be given one of those keys rather than the map it started with.
+func TestEnableRGWDashboardWithRealmMap(t *testing.T) {
+	var mu sync.Mutex
+	var createArgs []string
+	var publishedAccessKey string
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if args[0] == "dashboard" {
+				switch args[1] {
+				case "get-rgw-api-access-key":
+					return accessKeyRealmMap, nil
+				case "get-rgw-api-secret-key":
+					return secretKeyRealmMap, nil
+				case "set-rgw-api-access-key":
+					publishedAccessKey = readInputFileArg(args)
+				}
+			}
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if args[0] == "user" {
+				switch args[1] {
+				case "info":
+					return "no user info saved", nil
+				case "create":
+					createArgs = append([]string(nil), args...)
+					return dashboardAdminCreateJSON, nil
+				}
+			}
+			return "", nil
+		},
+	}
+	objContext := newDashboardTestContext(t, executor)
+
+	err := enableRGWDashboard(objContext)
+	assert.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	// RGW generates the pair, so no key is handed to `radosgw-admin user create` at all.
+	assert.NotContains(t, createArgs, "--access-key")
+	assert.NotContains(t, createArgs, "--secret")
+	assert.NotContains(t, createArgs, accessKeyRealmMap)
+	assert.NotContains(t, createArgs, secretKeyRealmMap)
+
+	// The dashboard ends up with the generated key instead of the map it published.
+	assert.Equal(t, access_key, publishedAccessKey)
+}
+
+// An existing dashboard user is reused rather than rolled when the dashboard has no usable pair
+// of its own, since recreating it would invalidate every other object store sharing that pair.
+func TestEnableRGWDashboardRepublishesExistingUser(t *testing.T) {
+	var mu sync.Mutex
+	userCreated := false
+	var publishedAccessKey string
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if args[0] == "dashboard" && args[1] == "set-rgw-api-access-key" {
+				publishedAccessKey = readInputFileArg(args)
+			}
+			// Every `dashboard get-*` returns empty, as it does after a reset.
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if args[0] == "user" {
+				switch args[1] {
+				case "info":
+					return dashboardAdminCreateJSON, nil
+				case "create":
+					userCreated = true
+					return dashboardAdminCreateJSON, nil
+				}
+			}
+			return "", nil
+		},
+	}
+	objContext := newDashboardTestContext(t, executor)
+
+	err := enableRGWDashboard(objContext)
+	assert.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.False(t, userCreated)
+	assert.Equal(t, access_key, publishedAccessKey)
+}
+
+// A dashboard user that already holds the realm map is deleted and created again, since
+// `radosgw-admin user create` fails with EEXIST for a user that exists.
+func TestEnableRGWDashboardRecreatesUserHoldingRealmMap(t *testing.T) {
+	var mu sync.Mutex
+	var userCommands []string
+	var publishedAccessKey string
+	userExists := true
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if args[0] == "dashboard" {
+				switch args[1] {
+				case "get-rgw-api-access-key":
+					return accessKeyRealmMap, nil
+				case "get-rgw-api-secret-key":
+					return secretKeyRealmMap, nil
+				case "set-rgw-api-access-key":
+					publishedAccessKey = readInputFileArg(args)
+				}
+			}
+			return "", nil
+		},
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			if args[0] == "user" {
+				userCommands = append(userCommands, args[1])
+				switch args[1] {
+				case "info":
+					return dashboardAdminRealmMapJSON, nil
+				case "create":
+					if userExists {
+						return "", &kexec.CodeExitError{Err: errors.New("user exists"), Code: int(syscall.EEXIST)}
+					}
+					return dashboardAdminCreateJSON, nil
+				case "rm":
+					userExists = false
+				}
+			}
+			return "", nil
+		},
+	}
+	objContext := newDashboardTestContext(t, executor)
+
+	err := enableRGWDashboard(objContext)
+	assert.NoError(t, err)
+
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []string{"info", "create", "rm", "create"}, userCommands)
+	assert.Equal(t, access_key, publishedAccessKey)
+}
+
+func newDashboardTestContext(t *testing.T, executor *exectest.MockExecutor) *Context {
+	return NewContext(&clusterd.Context{Executor: executor}, &client.ClusterInfo{
+		Namespace:   "mycluster",
+		CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9},
+		Context:     t.Context(),
+	},
+		"myobject")
+}
+
+// readInputFileArg returns the contents of the file passed to a ceph command via `-i`.
+func readInputFileArg(args []string) string {
+	for i, arg := range args {
+		if arg == "-i" && i+1 < len(args) {
+			content, err := os.ReadFile(args[i+1])
+			if err != nil {
+				return ""
+			}
+			return string(content)
+		}
+	}
+	return ""
 }
 
 // import TestMockExecHelperProcess
@@ -419,7 +1224,8 @@ func Test_createMultisite(t *testing.T) {
 		expectCommands expectCommands
 		wantErr        bool
 	}{
-		{"create realm, zonegroup, and zone; commit config",
+		{
+			"create realm, zonegroup, and zone; commit config",
 			commandReturns{
 				// nothing exists, and all should succeed
 			},
@@ -432,8 +1238,10 @@ func Test_createMultisite(t *testing.T) {
 				createZone:          true,
 				commitConfigChanges: true,
 			},
-			expectNoErr},
-		{"fail creating realm",
+			expectNoErr,
+		},
+		{
+			"fail creating realm",
 			commandReturns{
 				failCreateRealm: true,
 			},
@@ -442,8 +1250,10 @@ func Test_createMultisite(t *testing.T) {
 				createRealm: true,
 				// when we fail to create realm, we should not continue
 			},
-			expectErr},
-		{"fail creating zonegroup",
+			expectErr,
+		},
+		{
+			"fail creating zonegroup",
 			commandReturns{
 				failCreateZoneGroup: true,
 			},
@@ -454,8 +1264,10 @@ func Test_createMultisite(t *testing.T) {
 				createZoneGroup: true,
 				// when we fail to create zonegroup, we should not continue
 			},
-			expectErr},
-		{"fail creating zone",
+			expectErr,
+		},
+		{
+			"fail creating zone",
 			commandReturns{
 				failCreateZone: true,
 			},
@@ -468,8 +1280,10 @@ func Test_createMultisite(t *testing.T) {
 				createZone:      true,
 				// when we fail to create zone, we should not continue
 			},
-			expectErr},
-		{"fail commit config",
+			expectErr,
+		},
+		{
+			"fail commit config",
 			commandReturns{
 				failCommitConfigChanges: true,
 			},
@@ -482,8 +1296,10 @@ func Test_createMultisite(t *testing.T) {
 				createZone:          true,
 				commitConfigChanges: true,
 			},
-			expectErr},
-		{"realm exists; create zonegroup and zone; commit config",
+			expectErr,
+		},
+		{
+			"realm exists; create zonegroup and zone; commit config",
 			commandReturns{
 				realmExists: true,
 			},
@@ -496,8 +1312,10 @@ func Test_createMultisite(t *testing.T) {
 				createZone:          true,
 				commitConfigChanges: true,
 			},
-			expectNoErr},
-		{"realm and zonegroup exist; create zone; commit config",
+			expectNoErr,
+		},
+		{
+			"realm and zonegroup exist; create zone; commit config",
 			commandReturns{
 				realmExists:     true,
 				zoneGroupExists: true,
@@ -511,8 +1329,10 @@ func Test_createMultisite(t *testing.T) {
 				createZone:          true,
 				commitConfigChanges: true,
 			},
-			expectNoErr},
-		{"realm, zonegroup, and zone exist; commit config",
+			expectNoErr,
+		},
+		{
+			"realm, zonegroup, and zone exist; commit config",
 			commandReturns{
 				realmExists:     true,
 				zoneGroupExists: true,
@@ -527,7 +1347,8 @@ func Test_createMultisite(t *testing.T) {
 				createZone:          false,
 				commitConfigChanges: true,
 			},
-			expectNoErr},
+			expectNoErr,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -538,7 +1359,8 @@ func Test_createMultisite(t *testing.T) {
 			objContext := NewContext(ctx, &client.ClusterInfo{Namespace: "my-cluster"}, "my-store")
 
 			// assumption: endpointArg is sufficiently tested by integration tests
-			err := createMultisite(objContext, "")
+			store := &cephv1.CephObjectStore{}
+			err := createNonMultisiteStore(objContext, "", store)
 			assert.Equal(t, tt.expectCommands.getRealm, calledGetRealm)
 			assert.Equal(t, tt.expectCommands.createRealm, calledCreateRealm)
 			assert.Equal(t, tt.expectCommands.getZoneGroup, calledGetZoneGroup)
@@ -555,9 +1377,83 @@ func Test_createMultisite(t *testing.T) {
 	}
 }
 
+func getExecutor() []exec.Executor {
+	executor := []exec.Executor{
+		&exectest.MockExecutor{
+			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+				if args[0] == "realm" {
+					return `{
+	"id": "237e6250-5f7d-4b85-9359-8cb2b1848507",
+	"name": "realm-a",
+	"current_period": "df665ecb-1762-47a9-9c66-f938d251c02a",
+	"epoch": 2
+}`, nil
+				}
+				return "", nil
+			},
+		},
+		&exectest.MockExecutor{
+			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+				if args[0] == "realm" {
+					return `{}`, errors.Errorf("Error from server (NotFound): pods  not found")
+				}
+				return "", nil
+			},
+		},
+		&exectest.MockExecutor{
+			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+				if args[0] == "realm" {
+					return `{}`, &kexec.CodeExitError{Err: errors.New("some error"), Code: 4}
+				}
+				return "", nil
+			},
+		},
+		&exectest.MockExecutor{
+			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+				if args[0] == "realm" {
+					return `{}`, &kexec.CodeExitError{Err: errors.New("some other error"), Code: 2}
+				}
+				return "", nil
+			},
+		},
+	}
+	return executor
+}
+
+func getreturnErrString() []string {
+	returnErr := []string{
+		"",
+		"'radosgw-admin [\"realm\" \"-1\" \"{}. \" \"\"] get' failed with code %!q(MISSING), for reason %!q(MISSING), error: (%!v(MISSING)): Error from server (NotFound): pods  not found",
+		"'radosgw-admin \"realm\" get' failed with code \"4\", for reason \"{}. \": some error",
+		"failed to create ceph [\"realm\" \"--rgw-realm=\" \"{}. \"] %!q(MISSING), for reason %!q(MISSING): some other error",
+	}
+	return returnErr
+}
+
+func Test_createMultisiteConfigurations(t *testing.T) {
+	executor := getExecutor()
+	returnErrString := getreturnErrString()
+	store := &cephv1.CephObjectStore{}
+	for i := range 4 {
+		ctx := &clusterd.Context{
+			Executor: executor[i],
+		}
+		objContext := NewContext(ctx, &client.ClusterInfo{Namespace: "my-cluster"}, "my-store")
+		realmArg := fmt.Sprintf("--rgw-realm=%s", objContext.Realm)
+
+		err := createMultisiteConfigurations(objContext, store, "realm", realmArg, "create")
+		if i == 0 {
+			assert.NoError(t, err)
+		} else {
+			assert.Contains(t, err.Error(), returnErrString[i])
+		}
+	}
+}
+
 func TestGetRealmKeySecret(t *testing.T) {
 	ns := "my-ns"
 	realmName := "my-realm"
+	ctx := t.Context()
 
 	t.Run("secret exists", func(t *testing.T) {
 		secret := &v1.Secret{
@@ -573,20 +1469,20 @@ func TestGetRealmKeySecret(t *testing.T) {
 		}
 
 		c := &clusterd.Context{
-			Clientset: k8sfake.NewSimpleClientset(secret),
+			Clientset: k8sfake.NewClientset(secret),
 		}
 
-		secret, err := GetRealmKeySecret(c, types.NamespacedName{Namespace: ns, Name: realmName})
+		secret, err := GetRealmKeySecret(ctx, c, types.NamespacedName{Namespace: ns, Name: realmName})
 		assert.NoError(t, err)
 		assert.NotNil(t, secret)
 	})
 
 	t.Run("secret doesn't exist", func(t *testing.T) {
 		c := &clusterd.Context{
-			Clientset: k8sfake.NewSimpleClientset(),
+			Clientset: k8sfake.NewClientset(),
 		}
 
-		secret, err := GetRealmKeySecret(c, types.NamespacedName{Namespace: ns, Name: realmName})
+		secret, err := GetRealmKeySecret(ctx, c, types.NamespacedName{Namespace: ns, Name: realmName})
 		assert.Error(t, err)
 		assert.Nil(t, secret)
 	})
@@ -648,6 +1544,7 @@ func TestGetRealmKeyArgsFromSecret(t *testing.T) {
 func TestGetRealmKeyArgs(t *testing.T) {
 	ns := "my-ns"
 	realmName := "my-realm"
+	ctx := t.Context()
 
 	baseSecret := &v1.Secret{
 		TypeMeta: metav1.TypeMeta{
@@ -671,10 +1568,10 @@ func TestGetRealmKeyArgs(t *testing.T) {
 		s.Data["secret-key"] = []byte("my-secret-key")
 
 		c := &clusterd.Context{
-			Clientset: k8sfake.NewSimpleClientset(s),
+			Clientset: k8sfake.NewClientset(s),
 		}
 
-		access, secret, err := GetRealmKeyArgs(c, realmName, ns)
+		access, secret, err := GetRealmKeyArgs(ctx, c, realmName, ns)
 		assert.NoError(t, err)
 		assert.Equal(t, "--access-key=my-access-key", access)
 		assert.Equal(t, "--secret-key=my-secret-key", secret)
@@ -682,10 +1579,10 @@ func TestGetRealmKeyArgs(t *testing.T) {
 
 	t.Run("secret doesn't exist", func(t *testing.T) {
 		c := &clusterd.Context{
-			Clientset: k8sfake.NewSimpleClientset(),
+			Clientset: k8sfake.NewClientset(),
 		}
 
-		access, secret, err := GetRealmKeyArgs(c, realmName, ns)
+		access, secret, err := GetRealmKeyArgs(ctx, c, realmName, ns)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to get CephObjectRealm \"my-ns/my-realm\" keys secret")
 		assert.Equal(t, "", access)
@@ -697,13 +1594,803 @@ func TestGetRealmKeyArgs(t *testing.T) {
 		// missing all data
 
 		c := &clusterd.Context{
-			Clientset: k8sfake.NewSimpleClientset(s),
+			Clientset: k8sfake.NewClientset(s),
 		}
 
-		access, secret, err := GetRealmKeyArgs(c, realmName, ns)
+		access, secret, err := GetRealmKeyArgs(ctx, c, realmName, ns)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "failed to decode CephObjectRealm \"my-ns/my-realm\"")
 		assert.Equal(t, "", access)
 		assert.Equal(t, "", secret)
 	})
+}
+
+func TestUpdateZoneEndpointList(t *testing.T) {
+	type args struct {
+		zones            []zoneType
+		zoneEndpointList []string
+		zoneName         string
+	}
+	tests := []struct {
+		name    string
+		args    args
+		want    bool
+		wantErr bool
+	}{
+		{
+			"all the fields are empty",
+			args{zones: []zoneType{}, zoneEndpointList: []string{}, zoneName: ""},
+			false, true,
+		},
+		{
+			"zoneName is empty",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint"},
+				zoneName:         "",
+			},
+			false, true,
+		},
+		{
+			"new endpoint list is same existing containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-1"},
+				zoneName:         "zone-1",
+			},
+			false, false,
+		},
+		{
+			"new endpoint list to existing list is empty containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-1"},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"deleting endpoints from existing list containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1"}}},
+				zoneEndpointList: []string{},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"zone not listed in zonegroup containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-2"},
+				zoneName:         "zone-2",
+			},
+			false, false,
+		},
+		{
+			"new endpoint list is different from existing list containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-2"},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"new endpoint list  has multiple entries is different from existing listed containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-1", "http://rgw-endpoint-2"},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"new endpoint list removed one endpoint from existing list containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1", "http://rgw-endpoint-2"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-1"},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"new endpoint list is different from existing listed containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1", "http://rgw-endpoint-2"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-3"},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"new endpoint list is different from existing list but contains one similar endpoint containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1", "http://rgw-endpoint-2"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-2", "http://rgw-endpoint-3"},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"new endpoint list contains multiple different endpoints from existing list containing single zone",
+			args{
+				zones:            []zoneType{{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-1", "http://rgw-endpoint-2"}}},
+				zoneEndpointList: []string{"http://rgw-endpoint-3", "http://rgw-endpoint-4"},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"deleting endpoint list containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-12"}},
+					{Name: "zone-2", Endpoints: []string{"http://rgw-endpoint-21"}},
+				},
+				zoneEndpointList: []string{},
+				zoneName:         "zone-2",
+			},
+			true, false,
+		},
+		{
+			"adding new endpoint list to empty containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-11"}},
+					{Name: "zone-2", Endpoints: []string{}},
+				},
+				zoneEndpointList: []string{"http://rgw-endpoint-21", "http://rgw-endpoint-22"},
+				zoneName:         "zone-2",
+			},
+			true, false,
+		},
+		{
+			"zone not listed containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-11", "http://rgw-endpoint-22"}},
+					{Name: "zone-2", Endpoints: []string{"http://rgw-endpoint-21"}},
+				},
+				zoneEndpointList: []string{"http://rgw-endpoint-11"},
+				zoneName:         "zone-3",
+			},
+			false, false,
+		},
+		{
+			"new endpoint list have one new entry than existing list containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-11", "http://rgw-endpoint-12"}},
+					{Name: "zone-2", Endpoints: []string{"http://rgw-endpoint-21"}},
+				},
+				zoneEndpointList: []string{"http://rgw-endpoint-11", "http://rgw-endpoint-12", "http://rgw-endpoint-13"},
+				zoneName:         "zone-1",
+			},
+			true, false,
+		},
+		{
+			"new endpoint list same as existing list containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-11", "http://rgw-endpoint-12"}},
+					{Name: "zone-2", Endpoints: []string{"http://rgw-endpoint-21"}},
+				},
+				zoneEndpointList: []string{"http://rgw-endpoint-12", "http://rgw-endpoint-11"},
+				zoneName:         "zone-1",
+			},
+			false, false,
+		},
+		{
+			"new endpoint list is different from existing list containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-11", "http://rgw-endpoint-12"}},
+					{Name: "zone-2", Endpoints: []string{"http://rgw-endpoint-21", "http://rgw-endpoint-22"}},
+				},
+				zoneEndpointList: []string{"http://rgw-endpoint-3", "http://rgw-endpoint-4"},
+				zoneName:         "zone-2",
+			},
+			true, false,
+		},
+		{
+			"new endpoint list have duplicate entries, containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-11", "http://rgw-endpoint-12"}},
+					{Name: "zone-2", Endpoints: []string{"http://rgw-endpoint-21", "http://rgw-endpoint-22"}},
+				},
+				zoneEndpointList: []string{"http://rgw-endpoint-21", "http://rgw-endpoint-21"},
+				zoneName:         "zone-2",
+			},
+			true, false,
+		},
+		{
+			"existing endpoint list have duplicate entries, containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-11", "http://rgw-endpoint-12"}},
+					{Name: "zone-2", Endpoints: []string{"http://rgw-endpoint-21", "http://rgw-endpoint-21"}},
+				},
+				zoneEndpointList: []string{"http://rgw-endpoint-3", "http://rgw-endpoint-4"},
+				zoneName:         "zone-2",
+			},
+			true, false,
+		},
+		{
+			"both list have duplicate entries, containing multiple zone",
+			args{
+				zones: []zoneType{
+					{Name: "zone-1", Endpoints: []string{"http://rgw-endpoint-11", "http://rgw-endpoint-12"}},
+					{Name: "zone-2", Endpoints: []string{"http://rgw-endpoint-21", "http://rgw-endpoint-21"}},
+				},
+				zoneEndpointList: []string{"http://rgw-endpoint-22", "http://rgw-endpoint-22"},
+				zoneName:         "zone-2",
+			},
+			true, false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ShouldUpdateZoneEndpointList(tt.args.zones, tt.args.zoneEndpointList, tt.args.zoneName)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("maxSizeToInt64() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("UpdateZoneEndpointList() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestListsAreEqual(t *testing.T) {
+	type args struct {
+		listA []string
+		listB []string
+	}
+	tests := []struct {
+		name string
+		args args
+		want bool
+	}{
+		{
+			"lists are empty",
+			args{listA: []string{}, listB: []string{}},
+			true,
+		},
+		{
+			"first list is empty",
+			args{listA: []string{"a"}, listB: []string{}},
+			false,
+		},
+		{
+			"second list is empty",
+			args{listA: []string{}, listB: []string{"a"}},
+			false,
+		},
+		{
+			"lists are equal with single entry",
+			args{listA: []string{"a"}, listB: []string{"a"}},
+			true,
+		},
+		{
+			"lists are equal with multiple entries",
+			args{listA: []string{"a", "b"}, listB: []string{"a", "b"}},
+			true,
+		},
+		{
+			"lists have different entries with same length",
+			args{listA: []string{"a", "b"}, listB: []string{"c", "d"}},
+			false,
+		},
+		{
+			"lists have similar entries with different length",
+			args{listA: []string{"a", "b"}, listB: []string{"a"}},
+			false,
+		},
+		{
+			"lists have some similar entries with same length",
+			args{listA: []string{"a", "b"}, listB: []string{"c", "a"}},
+			false,
+		},
+		{
+			"lists have similar entries with same length but order different",
+			args{listA: []string{"a", "b"}, listB: []string{"b", "a"}},
+			true,
+		},
+		{
+			"lists have similar entries but contains duplicate",
+			args{listA: []string{"a", "b", "b"}, listB: []string{"b", "a", "b"}},
+			true,
+		},
+		{
+			"lists have similar entries but contains duplicate in first",
+			args{listA: []string{"a", "b", "b"}, listB: []string{"a", "b"}},
+			false,
+		},
+		{
+			"lists have all similar entries but length is different",
+			args{listA: []string{"b", "b", "b"}, listB: []string{"b", "b"}},
+			false,
+		},
+		{
+			"lists have different entries but contains duplicate in first",
+			args{listA: []string{"a", "b", "b"}, listB: []string{"c", "d"}},
+			false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := listsAreEqual(tt.args.listA, tt.args.listB); got != tt.want {
+				t.Errorf("UpdateZoneEndpointList() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestValidateObjectStorePoolsConfig(t *testing.T) {
+	type args struct {
+		metadataPool cephv1.PoolSpec
+		dataPool     cephv1.PoolSpec
+		sharedPools  cephv1.ObjectSharedPoolsSpec
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{
+			name: "valid: nothing is set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{},
+				dataPool:     cephv1.PoolSpec{},
+				sharedPools:  cephv1.ObjectSharedPoolsSpec{},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid: only metadata pool set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{
+					FailureDomain: "host",
+					Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				},
+				dataPool:    cephv1.PoolSpec{},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid: only data pool set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{},
+				dataPool: cephv1.PoolSpec{
+					FailureDomain: "host",
+					Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid: only metadata and data pools set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{
+					FailureDomain: "host",
+					Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				},
+				dataPool: cephv1.PoolSpec{
+					FailureDomain: "host",
+					Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid: only shared metadata pool set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{},
+				dataPool:     cephv1.PoolSpec{},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName: "test",
+					DataPoolName:     "",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid: only shared data pool set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{},
+				dataPool:     cephv1.PoolSpec{},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName: "",
+					DataPoolName:     "test",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid: only shared data and metaData pools set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{},
+				dataPool:     cephv1.PoolSpec{},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName: "test",
+					DataPoolName:     "test",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid: shared meta and non-shared data",
+			args: args{
+				metadataPool: cephv1.PoolSpec{},
+				dataPool: cephv1.PoolSpec{
+					FailureDomain: "host",
+					Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName: "test",
+					DataPoolName:     "",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "valid: shared data and non-shared meta",
+			args: args{
+				metadataPool: cephv1.PoolSpec{
+					FailureDomain: "host",
+					Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				},
+				dataPool: cephv1.PoolSpec{},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName: "",
+					DataPoolName:     "test",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "invalid: shared and non-shared meta set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{
+					FailureDomain: "host",
+					Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				},
+				dataPool: cephv1.PoolSpec{},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName: "test",
+					DataPoolName:     "",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid: shared and non-shared data set",
+			args: args{
+				metadataPool: cephv1.PoolSpec{},
+				dataPool: cephv1.PoolSpec{
+					FailureDomain: "host",
+					Replicated:    cephv1.ReplicatedSpec{Size: 3},
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName: "",
+					DataPoolName:     "test",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "invalid: placements invalid",
+			args: args{
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "same_name",
+							MetadataPoolName:  "",
+							DataPoolName:      "",
+							DataNonECPoolName: "",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+						{
+							Name:              "same_name",
+							MetadataPoolName:  "",
+							DataPoolName:      "",
+							DataNonECPoolName: "",
+							StorageClasses:    []cephv1.PlacementStorageClassSpec{},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := ValidateObjectStorePoolsConfig(tt.args.metadataPool, tt.args.dataPool, tt.args.sharedPools); (err != nil) != tt.wantErr {
+				t.Errorf("ValidateObjectStorePoolsConfig() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func Test_sharedPoolsExist(t *testing.T) {
+	type args struct {
+		existsInCluster []string
+		sharedPools     cephv1.ObjectSharedPoolsSpec
+	}
+	tests := []struct {
+		name    string
+		args    args
+		wantErr bool
+	}{
+		{
+			name: "all pool exists",
+			args: args{
+				existsInCluster: []string{
+					"meta",
+					"data",
+					"placement-meta",
+					"placement-data",
+					"placement-data-non-ec",
+					"placement-sc-data",
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "placement-meta",
+							DataPoolName:      "placement-data",
+							DataNonECPoolName: "placement-data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "sc",
+									DataPoolName: "placement-sc-data",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name: "meta pool not exists",
+			args: args{
+				existsInCluster: []string{
+					// "meta",
+					"data",
+					"placement-meta",
+					"placement-data",
+					"placement-data-non-ec",
+					"placement-sc-data",
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "placement-meta",
+							DataPoolName:      "placement-data",
+							DataNonECPoolName: "placement-data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "sc",
+									DataPoolName: "placement-sc-data",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "data pool not exists",
+			args: args{
+				existsInCluster: []string{
+					"meta",
+					// "data",
+					"placement-meta",
+					"placement-data",
+					"placement-data-non-ec",
+					"placement-sc-data",
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "placement-meta",
+							DataPoolName:      "placement-data",
+							DataNonECPoolName: "placement-data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "sc",
+									DataPoolName: "placement-sc-data",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "placement meta pool not exists",
+			args: args{
+				existsInCluster: []string{
+					"meta",
+					"data",
+					// "placement-meta",
+					"placement-data",
+					"placement-data-non-ec",
+					"placement-sc-data",
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "placement-meta",
+							DataPoolName:      "placement-data",
+							DataNonECPoolName: "placement-data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "sc",
+									DataPoolName: "placement-sc-data",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "placement data pool not exists",
+			args: args{
+				existsInCluster: []string{
+					"meta",
+					"data",
+					"placement-meta",
+					// "placement-data",
+					"placement-data-non-ec",
+					"placement-sc-data",
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "placement-meta",
+							DataPoolName:      "placement-data",
+							DataNonECPoolName: "placement-data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "sc",
+									DataPoolName: "placement-sc-data",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "placement data non ec pool not exists",
+			args: args{
+				existsInCluster: []string{
+					"meta",
+					"data",
+					"placement-meta",
+					"placement-data",
+					// "placement-data-non-ec",
+					"placement-sc-data",
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "placement-meta",
+							DataPoolName:      "placement-data",
+							DataNonECPoolName: "placement-data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "sc",
+									DataPoolName: "placement-sc-data",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "placement storage class pool not exists",
+			args: args{
+				existsInCluster: []string{
+					"meta",
+					"data",
+					"placement-meta",
+					"placement-data",
+					"placement-data-non-ec",
+					// "placement-sc-data",
+				},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "meta",
+					DataPoolName:                       "data",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "placement-meta",
+							DataPoolName:      "placement-data",
+							DataNonECPoolName: "placement-data-non-ec",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "sc",
+									DataPoolName: "placement-sc-data",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "empty pool names ignored",
+			args: args{
+				existsInCluster: []string{},
+				sharedPools: cephv1.ObjectSharedPoolsSpec{
+					MetadataPoolName:                   "",
+					DataPoolName:                       "",
+					PreserveRadosNamespaceDataOnDelete: false,
+					PoolPlacements: []cephv1.PoolPlacementSpec{
+						{
+							Name:              "placement",
+							MetadataPoolName:  "",
+							DataPoolName:      "",
+							DataNonECPoolName: "",
+							StorageClasses: []cephv1.PlacementStorageClassSpec{
+								{
+									Name:         "sc",
+									DataPoolName: "",
+								},
+							},
+						},
+					},
+				},
+			},
+			wantErr: false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if err := sharedPoolsExist(sets.New(tt.args.existsInCluster...), tt.args.sharedPools); (err != nil) != tt.wantErr {
+				t.Errorf("sharedPoolsExist() error = %v, wantErr %v", err, tt.wantErr)
+			}
+		})
+	}
 }

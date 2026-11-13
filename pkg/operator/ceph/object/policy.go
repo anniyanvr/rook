@@ -17,9 +17,10 @@ limitations under the License.
 package object
 
 import (
+	"context"
 	"fmt"
 
-	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"k8s.io/apimachinery/pkg/util/json"
 )
 
@@ -103,7 +104,6 @@ var AllowedActions = []action{
 	PutBucketTagging,
 	PutBucketVersioning,
 	PutBucketWebsite,
-	PutBucketVersioning,
 	PutLifecycleConfiguration,
 	PutObject,
 	PutObjectAcl,
@@ -120,14 +120,14 @@ const (
 	effectDeny  effect = "Deny"
 )
 
-// PolicyStatment is the Go representation of a PolicyStatement json struct
-// it defines what Actions that a Principle can or cannot perform on a Resource
+// PolicyStatement is the Go representation of a PolicyStatement json struct
+// it defines what Actions a Principal can or cannot perform on a Resource
 type PolicyStatement struct {
-	// Sid (optional) is the PolicyStatement's unique  identifier
+	// Sid (optional) is the PolicyStatement's unique identifier
 	Sid string `json:"Sid"`
 	// Effect determines whether the Action(s) are 'Allow'ed or 'Deny'ed.
 	Effect effect `json:"Effect"`
-	// Principle is/are the Ceph user names affected by this PolicyStatement
+	// Principal is/are the Ceph user names affected by this PolicyStatement
 	// Must be in the format of 'arn:aws:iam:::user/<ceph-user>'
 	Principal map[string][]string `json:"Principal"`
 	// Action is a list of s3:* actions
@@ -161,8 +161,7 @@ func NewBucketPolicy(ps ...PolicyStatement) *BucketPolicy {
 }
 
 // PutBucketPolicy applies the policy to the bucket
-func (s *S3Agent) PutBucketPolicy(bucket string, policy BucketPolicy) (*s3.PutBucketPolicyOutput, error) {
-
+func (s *S3Agent) PutBucketPolicy(ctx context.Context, bucket string, policy BucketPolicy) (*s3.PutBucketPolicyOutput, error) {
 	confirmRemoveSelfBucketAccess := false
 	serializedPolicy, _ := json.Marshal(policy)
 	consumablePolicy := string(serializedPolicy)
@@ -172,15 +171,15 @@ func (s *S3Agent) PutBucketPolicy(bucket string, policy BucketPolicy) (*s3.PutBu
 		ConfirmRemoveSelfBucketAccess: &confirmRemoveSelfBucketAccess,
 		Policy:                        &consumablePolicy,
 	}
-	out, err := s.Client.PutBucketPolicy(p)
+	out, err := s.Client.PutBucketPolicy(ctx, p)
 	if err != nil {
 		return out, err
 	}
 	return out, nil
 }
 
-func (s *S3Agent) GetBucketPolicy(bucket string) (*BucketPolicy, error) {
-	out, err := s.Client.GetBucketPolicy(&s3.GetBucketPolicyInput{
+func (s *S3Agent) GetBucketPolicy(ctx context.Context, bucket string) (*BucketPolicy, error) {
+	out, err := s.Client.GetBucketPolicy(ctx, &s3.GetBucketPolicyInput{
 		Bucket: &bucket,
 	})
 	if err != nil {
@@ -195,21 +194,10 @@ func (s *S3Agent) GetBucketPolicy(bucket string) (*BucketPolicy, error) {
 	return policy, nil
 }
 
-// ModifyBucketPolicy new and old statement SIDs and overwrites on a match.
-// This allows users to Get, modify, and Replace existing statements as well as
-// add new ones.
+// ModifyBucketPolicy replaces the policy's statements with the given ones,
+// rather than merging them into the existing statements by SID.
 func (bp *BucketPolicy) ModifyBucketPolicy(ps ...PolicyStatement) *BucketPolicy {
-	for _, newP := range ps {
-		var match bool
-		for j, oldP := range bp.Statement {
-			if newP.Sid == oldP.Sid {
-				bp.Statement[j] = newP
-			}
-		}
-		if !match {
-			bp.Statement = append(bp.Statement, newP)
-		}
-	}
+	bp.Statement = append([]PolicyStatement{}, ps...)
 	return bp
 }
 
@@ -225,16 +213,7 @@ func (bp *BucketPolicy) DropPolicyStatements(sid ...string) *BucketPolicy {
 	return bp
 }
 
-func (bp *BucketPolicy) EjectPrincipals(users ...string) *BucketPolicy {
-	statements := bp.Statement
-	for _, s := range statements {
-		s.EjectPrincipals(users...)
-	}
-	bp.Statement = statements
-	return bp
-}
-
-// NewPolicyStatement generates a new PolicyStatement. PolicyStatment methods are designed to
+// NewPolicyStatement generates a new PolicyStatement. PolicyStatement methods are designed to
 // be chain called with dot notation to allow for easy configuration at creation.  This is preferable
 // to a long parameter list.
 func NewPolicyStatement() *PolicyStatement {
@@ -252,9 +231,11 @@ func (ps *PolicyStatement) WithSID(sid string) *PolicyStatement {
 	return ps
 }
 
-const awsPrinciple = "AWS"
-const arnPrefixPrinciple = "arn:aws:iam:::user/%s"
-const arnPrefixResource = "arn:aws:s3:::%s"
+const (
+	awsPrinciple       = "AWS"
+	arnPrefixPrinciple = "arn:aws:iam:::user/%s"
+	arnPrefixResource  = "arn:aws:s3:::%s"
+)
 
 // ForPrincipals adds users to the PolicyStatement
 func (ps *PolicyStatement) ForPrincipals(users ...string) *PolicyStatement {
@@ -274,7 +255,7 @@ func (ps *PolicyStatement) ForResources(resources ...string) *PolicyStatement {
 	return ps
 }
 
-// ForSubResources add contents inside the bucket to the PolicyStatement with the appropriate ARN prefix
+// ForSubResources adds contents inside the bucket to the PolicyStatement with the appropriate ARN prefix
 func (ps *PolicyStatement) ForSubResources(resources ...string) *PolicyStatement {
 	var subresource string
 	for _, v := range resources {
@@ -302,22 +283,10 @@ func (ps *PolicyStatement) Denies() *PolicyStatement {
 	return ps
 }
 
-// Actions is the set of "s3:*" actions for the PolicyStatement is concerned
+// Actions is the set of "s3:*" actions the PolicyStatement is concerned with
 func (ps *PolicyStatement) Actions(actions ...action) *PolicyStatement {
 	ps.Action = actions
 	return ps
-}
-
-func (ps *PolicyStatement) EjectPrincipals(users ...string) {
-	principals := ps.Principal[awsPrinciple]
-	for _, u := range users {
-		for j, v := range principals {
-			if u == v {
-				principals = append(principals[:j], principals[:j+1]...)
-			}
-		}
-	}
-	ps.Principal[awsPrinciple] = principals
 }
 
 // //////////////

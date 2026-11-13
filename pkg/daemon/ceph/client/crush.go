@@ -19,7 +19,7 @@ package client
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 	"strconv"
 	"strings"
 
@@ -75,13 +75,13 @@ type ruleSpec struct {
 
 type stepSpec struct {
 	Operation string `json:"op"`
-	Number    uint   `json:"num"`
+	Number    int    `json:"num"`
 	Item      int    `json:"item"`
 	ItemName  string `json:"item_name"`
 	Type      string `json:"type"`
 }
 
-// CrushFindResult is go representation of the Ceph osd find command output
+// CrushFindResult is a go representation of the Ceph osd find command output
 type CrushFindResult struct {
 	ID       int               `json:"osd"`
 	IP       string            `json:"ip"`
@@ -108,7 +108,7 @@ func GetCrushMap(context *clusterd.Context, clusterInfo *ClusterInfo) (CrushMap,
 
 // GetCompiledCrushMap fetches the Ceph compiled version of the CRUSH map
 func GetCompiledCrushMap(context *clusterd.Context, clusterInfo *ClusterInfo) (string, error) {
-	compiledCrushMapFile, err := ioutil.TempFile("", "")
+	compiledCrushMapFile, err := os.CreateTemp("", "")
 	if err != nil {
 		return "", errors.Wrap(err, "failed to generate temporarily file")
 	}
@@ -140,7 +140,7 @@ func FindOSDInCrushMap(context *clusterd.Context, clusterInfo *ClusterInfo, osdI
 	return &result, nil
 }
 
-// GetCrushHostName gets the hostname where an OSD is running on
+// GetCrushHostName gets the hostname where an OSD is running
 func GetCrushHostName(context *clusterd.Context, clusterInfo *ClusterInfo, osdID int) (string, error) {
 	result, err := FindOSDInCrushMap(context, clusterInfo, osdID)
 	if err != nil {
@@ -152,7 +152,7 @@ func GetCrushHostName(context *clusterd.Context, clusterInfo *ClusterInfo, osdID
 
 // NormalizeCrushName replaces . with -
 func NormalizeCrushName(name string) string {
-	return strings.Replace(name, ".", "-", -1)
+	return strings.ReplaceAll(name, ".", "-")
 }
 
 // Obtain the cluster-wide default crush root from the cluster spec

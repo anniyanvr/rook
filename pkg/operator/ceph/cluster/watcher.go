@@ -27,13 +27,14 @@ import (
 	discoverDaemon "github.com/rook/rook/pkg/daemon/discover"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
-	v1 "k8s.io/api/core/v1"
+
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-// clientCluster struct contains a client to interact with Kubernetes object
+// clientCluster struct contains a client to interact with Kubernetes objects
 // as well as the NamespacedName (used in requests)
 type clientCluster struct {
 	client    client.Client
@@ -41,7 +42,7 @@ type clientCluster struct {
 	context   *clusterd.Context
 }
 
-var nodesCheckedForReconcile = sets.NewString()
+var nodesCheckedForReconcile = sets.New[string]()
 
 func newClientCluster(client client.Client, namespace string, context *clusterd.Context) *clientCluster {
 	return &clientCluster{
@@ -59,21 +60,23 @@ func checkStorageForNode(cluster *cephv1.CephCluster) bool {
 	return true
 }
 
-// onK8sNodeAdd is triggered when a node is added in the Kubernetes cluster
-func (c *clientCluster) onK8sNode(object runtime.Object) bool {
-	node, ok := object.(*v1.Node)
+// onK8sNode is triggered when a node is added in the Kubernetes cluster
+func (c *clientCluster) onK8sNode(ctx context.Context, object runtime.Object, opNamespace string) bool {
+	node, ok := object.(*corev1.Node)
 	if !ok {
 		return false
 	}
+
+	// Get CephCluster
+	cluster := c.getCephCluster()
+
 	// skip reconcile if node is already checked in a previous reconcile
 	if nodesCheckedForReconcile.Has(node.Name) {
 		return false
 	}
-	// Get CephCluster
-	cluster := c.getCephCluster()
 
-	if !k8sutil.GetNodeSchedulable(*node) {
-		logger.Debugf("node watcher: skipping cluster update. added node %q is unschedulable", node.Labels[v1.LabelHostname])
+	if !k8sutil.GetNodeSchedulable(*node, false) {
+		logger.Debugf("node watcher: skipping cluster update. added node %q is unschedulable", node.Labels[k8sutil.LabelHostname()])
 		return false
 	}
 
@@ -95,10 +98,10 @@ func (c *clientCluster) onK8sNode(object runtime.Object) bool {
 
 	logger.Debugf("node %q is ready, checking if it can run OSDs", node.Name)
 	nodesCheckedForReconcile.Insert(node.Name)
-	valid, _ := k8sutil.ValidNode(*node, cephv1.GetOSDPlacement(cluster.Spec.Placement))
-	if valid {
+	err := k8sutil.ValidNode(*node, cephv1.GetOSDPlacement(cluster.Spec.Placement), cluster.Spec.Storage.ScheduleAlways)
+	if err == nil {
 		nodeName := node.Name
-		hostname, ok := node.Labels[v1.LabelHostname]
+		hostname, ok := node.Labels[k8sutil.LabelHostname()]
 		if ok && hostname != "" {
 			nodeName = hostname
 		}
@@ -106,21 +109,21 @@ func (c *clientCluster) onK8sNode(object runtime.Object) bool {
 		// Is the node in the CRUSH map already?
 		// If so we don't need to reconcile, this is done to avoid double reconcile on operator restart
 		// Assume the admin key since we are watching for node status to create OSDs
-		clusterInfo := cephclient.AdminClusterInfo(cluster.Namespace)
+		clusterInfo := cephclient.AdminClusterInfo(ctx, cluster.Namespace, cluster.Name)
 		osds, err := cephclient.GetOSDOnHost(c.context, clusterInfo, nodeName)
 		if err != nil {
 			if strings.Contains(err.Error(), opcontroller.UninitializedCephConfigError) {
 				logger.Debug(opcontroller.OperatorNotInitializedMessage)
 				return false
 			}
-			// If it fails, this might be due to the the operator just starting and catching an add event for that node
+			// If it fails, this might be due to the operator just starting and catching an add event for that node
 			logger.Debugf("failed to get osds on node %q, assume reconcile is necessary", nodeName)
 			return true
 		}
 
 		// Reconcile if there are no OSDs in the CRUSH map and if the host does not exist in the CRUSH map.
 		if osds == "" {
-			logger.Infof("node watcher: adding node %q to cluster %q", node.Labels[v1.LabelHostname], cluster.Namespace)
+			logger.Infof("node watcher: adding node %q to cluster %q", node.Labels[k8sutil.LabelHostname()], cluster.Namespace)
 			return true
 		}
 
@@ -130,15 +133,15 @@ func (c *clientCluster) onK8sNode(object runtime.Object) bool {
 	return false
 }
 
-// onDeviceCMUpdate is trigger when the hot plug config map is updated
+// onDeviceCMUpdate is triggered when the hot plug config map is updated
 func (c *clientCluster) onDeviceCMUpdate(oldObj, newObj runtime.Object) bool {
-	oldCm, ok := oldObj.(*v1.ConfigMap)
+	oldCm, ok := oldObj.(*corev1.ConfigMap)
 	if !ok {
 		return false
 	}
 	logger.Debugf("hot-plug cm watcher: onDeviceCMUpdate old device cm: %+v", oldCm)
 
-	newCm, ok := newObj.(*v1.ConfigMap)
+	newCm, ok := newObj.(*corev1.ConfigMap)
 	if !ok {
 		return false
 	}
@@ -189,11 +192,11 @@ func (c *clientCluster) getCephCluster() *cephv1.CephCluster {
 
 	err := c.client.List(context.TODO(), clusterList, client.InNamespace(c.namespace))
 	if err != nil {
-		logger.Debugf("%q: failed to fetch CephCluster %v", controllerName, err)
+		logger.Debugf("failed to fetch CephCluster %v", err)
 		return &cephv1.CephCluster{}
 	}
 	if len(clusterList.Items) == 0 {
-		logger.Debugf("%q: no CephCluster resource found in namespace %q", controllerName, c.namespace)
+		logger.Debugf("no CephCluster resource found in namespace %q", c.namespace)
 		return &cephv1.CephCluster{}
 	}
 

@@ -26,7 +26,7 @@ import (
 // the mon's central KV store, and that is (and should be) by intent.
 func DefaultFlags(fsid, mountedKeyringPath string) []string {
 	flags := []string{
-		// fsid unnecessary but is a safety to make sure daemons can only connect to their cluster
+		// fsid is unnecessary but is a safety to make sure daemons can only connect to their cluster
 		NewFlag("fsid", fsid),
 		NewFlag("keyring", mountedKeyringPath),
 	}
@@ -37,19 +37,14 @@ func DefaultFlags(fsid, mountedKeyringPath string) []string {
 	return flags
 }
 
-// makes it possible to be slightly less verbose to create a ConfigOverride here
-func configOverride(who, option, value string) Option {
-	return Option{Who: who, Option: option, Value: value}
-}
-
 func LoggingFlags() []string {
 	return []string{
 		// For containers, we're expected to log everything to stderr
-		NewFlag("log-to-stderr", "true"),
-		NewFlag("err-to-stderr", "true"),
-		NewFlag("mon-cluster-log-to-stderr", "true"),
+		NewFlag("default-log-to-stderr", "true"),
+		NewFlag("default-err-to-stderr", "true"),
+		NewFlag("default-mon-cluster-log-to-stderr", "true"),
 		// differentiate debug text from audit text, and the space after 'debug' is critical
-		NewFlag("log-stderr-prefix", "debug "),
+		NewFlag("default-log-stderr-prefix", "debug "),
 		NewFlag("default-log-to-file", "false"),
 		NewFlag("default-mon-cluster-log-to-file", "false"),
 	}
@@ -57,40 +52,17 @@ func LoggingFlags() []string {
 
 // DefaultCentralizedConfigs returns the default configuration options Rook will set in Ceph's
 // centralized config store.
-func DefaultCentralizedConfigs(cephVersion version.CephVersion) []Option {
-	overrides := []Option{
-		configOverride("global", "mon allow pool delete", "true"),
-		configOverride("global", "mon cluster log file", ""),
-	}
-
-	// For Pacific
-	if cephVersion.IsAtLeastPacific() {
-		overrides = append(overrides, []Option{
-			configOverride("global", "mon allow pool size one", "true"),
-		}...)
-	}
-
-	// Every release before Quincy will enable PG auto repair on Bluestore OSDs
-	if !cephVersion.IsAtLeastQuincy() {
-		overrides = append(overrides, []Option{
-			configOverride("global", "osd scrub auto repair", "true"),
-		}...)
+func DefaultCentralizedConfigs(cephVersion version.CephVersion) map[string]string {
+	overrides := map[string]string{
+		"mon allow pool delete":   "true",
+		"mon cluster log file":    "",
+		"mon allow pool size one": "true",
 	}
 
 	return overrides
 }
 
-// DefaultLegacyConfigs need to be added to the Ceph config file until the integration tests can be
-// made to override these options for the Ceph clusters it creates.
-func DefaultLegacyConfigs() []Option {
-	overrides := []Option{
-		// TODO: move this under LegacyConfigs() when FlexVolume is no longer supported
-		configOverride("global", "rbd_default_features", "3"),
-	}
-	return overrides
-}
-
-// LegacyConfigs represents old configuration that were applied to a cluster and not needed anymore
+// LegacyConfigs represents old configurations that were applied to a cluster and not needed anymore
 func LegacyConfigs() []Option {
 	return []Option{
 		{Who: "global", Option: "log file"},

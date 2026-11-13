@@ -23,8 +23,8 @@ import (
 
 // WellKnownTaints is a list of well-known taint keys in the Kubernetes code base. Kubernetes may
 // automatically apply these taints to nodes during runtime. Most will be added with the
-// `NoSchedule` affect, but some are created with `NoExecute`. Rook may wish to ignore these taints
-// when decided whether to modify resources it creates based on whether taints are likely to have
+// `NoSchedule` effect, but some are created with `NoExecute`. Rook may wish to ignore these taints
+// when deciding whether to modify resources it creates based on whether taints are likely to have
 // been added by Kubernetes or by the user.
 // see: https://github.com/kubernetes/kubernetes/blob/master/pkg/scheduler/api/well_known_labels.go
 // and: https://kubernetes.io/docs/concepts/configuration/taint-and-toleration/#taint-based-evictions
@@ -38,15 +38,4 @@ var WellKnownTaints = []string{
 	v1.TaintNodePIDPressure,
 	cloudproviderapi.TaintExternalCloudProvider,
 	cloudproviderapi.TaintNodeShutdown,
-}
-
-// TaintIsWellKnown returns true if the taint's key is in the WellKnownTaints list. False otherwise.
-// See WellKnownTaints for more information.
-func TaintIsWellKnown(t v1.Taint) bool {
-	for _, w := range WellKnownTaints {
-		if t.Key == w {
-			return true
-		}
-	}
-	return false
 }

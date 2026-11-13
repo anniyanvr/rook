@@ -11,7 +11,7 @@ If the user deletes a rook-ceph cluster and wants to start a new cluster on the 
 - Delete the dataDirHostPath on each host. Otherwise, stale keys and other configs will remain from the previous cluster and the new mons will fail to start.
 - Clean the OSD disks from the previous cluster before starting a new one.
 
-Read more about the manual clean up steps [here](https://github.com/rook/rook/blob/master/Documentation/ceph-teardown.md#delete-the-data-on-hosts)
+Read more about the manual clean up steps [here](https://github.com/rook/rook/blob/master/Documentation/Storage-Configuration/ceph-teardown.md#delete-the-data-on-hosts)
 
 This implementation aims to automate both of these manual steps.
 
@@ -34,7 +34,7 @@ metadata:
   namespace: rook-ceph
 spec:
   cephVersion:
-    image: quay.io/ceph/ceph:v16.2.6
+    image: quay.io/ceph/ceph:v20.2.4
   dataDirHostPath: /var/lib/rook
   mon:
     count: 3
@@ -67,7 +67,8 @@ spec:
 - Local disk sanitization can be further configured by the admin with following options:
   - `method`: use `complete` to sanitize the entire disk and `quick` (default) to sanitize only ceph's metadata.
   - `dataSource`: indicate where to get random bytes from to write on the disk. Possible choices are `zero` (default) or `random`.
-  Using random sources will consume entropy from the system and will take much more time then the zero source.
+  The `random` source only works with the `complete` method. The `quick` method will use the `zero` source.
+  Using random sources will consume entropy from the system and will take much more time than the zero source.
   - `iteration`: overwrite N times instead of the default (1). Takes an integer value.
 - If `allowUninstallWithVolumes` is `false` (default), then operator would wait for the PVCs to be deleted before finally deleting the cluster.
 

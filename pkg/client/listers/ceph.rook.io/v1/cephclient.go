@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,10 +19,10 @@ limitations under the License.
 package v1
 
 import (
-	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
+	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	labels "k8s.io/apimachinery/pkg/labels"
+	listers "k8s.io/client-go/listers"
+	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephClientLister helps list CephClients.
@@ -30,7 +30,7 @@ import (
 type CephClientLister interface {
 	// List lists all CephClients in the indexer.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CephClient, err error)
+	List(selector labels.Selector) (ret []*cephrookiov1.CephClient, err error)
 	// CephClients returns an object that can list and get CephClients.
 	CephClients(namespace string) CephClientNamespaceLister
 	CephClientListerExpansion
@@ -38,25 +38,17 @@ type CephClientLister interface {
 
 // cephClientLister implements the CephClientLister interface.
 type cephClientLister struct {
-	indexer cache.Indexer
+	listers.ResourceIndexer[*cephrookiov1.CephClient]
 }
 
 // NewCephClientLister returns a new CephClientLister.
 func NewCephClientLister(indexer cache.Indexer) CephClientLister {
-	return &cephClientLister{indexer: indexer}
-}
-
-// List lists all CephClients in the indexer.
-func (s *cephClientLister) List(selector labels.Selector) (ret []*v1.CephClient, err error) {
-	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CephClient))
-	})
-	return ret, err
+	return &cephClientLister{listers.New[*cephrookiov1.CephClient](indexer, cephrookiov1.Resource("cephclient"))}
 }
 
 // CephClients returns an object that can list and get CephClients.
 func (s *cephClientLister) CephClients(namespace string) CephClientNamespaceLister {
-	return cephClientNamespaceLister{indexer: s.indexer, namespace: namespace}
+	return cephClientNamespaceLister{listers.NewNamespaced[*cephrookiov1.CephClient](s.ResourceIndexer, namespace)}
 }
 
 // CephClientNamespaceLister helps list and get CephClients.
@@ -64,36 +56,15 @@ func (s *cephClientLister) CephClients(namespace string) CephClientNamespaceList
 type CephClientNamespaceLister interface {
 	// List lists all CephClients in the indexer for a given namespace.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CephClient, err error)
+	List(selector labels.Selector) (ret []*cephrookiov1.CephClient, err error)
 	// Get retrieves the CephClient from the indexer for a given namespace and name.
 	// Objects returned here must be treated as read-only.
-	Get(name string) (*v1.CephClient, error)
+	Get(name string) (*cephrookiov1.CephClient, error)
 	CephClientNamespaceListerExpansion
 }
 
 // cephClientNamespaceLister implements the CephClientNamespaceLister
 // interface.
 type cephClientNamespaceLister struct {
-	indexer   cache.Indexer
-	namespace string
-}
-
-// List lists all CephClients in the indexer for a given namespace.
-func (s cephClientNamespaceLister) List(selector labels.Selector) (ret []*v1.CephClient, err error) {
-	err = cache.ListAllByNamespace(s.indexer, s.namespace, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CephClient))
-	})
-	return ret, err
-}
-
-// Get retrieves the CephClient from the indexer for a given namespace and name.
-func (s cephClientNamespaceLister) Get(name string) (*v1.CephClient, error) {
-	obj, exists, err := s.indexer.GetByKey(s.namespace + "/" + name)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, errors.NewNotFound(v1.Resource("cephclient"), name)
-	}
-	return obj.(*v1.CephClient), nil
+	listers.ResourceIndexer[*cephrookiov1.CephClient]
 }

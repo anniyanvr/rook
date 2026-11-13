@@ -11,18 +11,19 @@ on:
       - master
       - release-*
 
+# cancel the in-progress workflow when PR is refreshed.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
 jobs:
   shellcheck:
     name: Shellcheck
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-    - uses: actions/checkout@v2
-    - name: Run ShellCheck
-      uses: ludeeus/action-shellcheck@master
-      with:
-        severity: warning
-        check_together: 'yes'
-        disable_matcher: false
-        additional_files: build/run build/reset build/sed-in-place
-        ignore: olm
-        format: gcc
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Lint shell scripts
+        run: make lint.shell

@@ -20,11 +20,9 @@ package k8sutil
 import (
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"strconv"
-	"strings"
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
@@ -44,27 +42,14 @@ const (
 	// PrivateIPEnvVar pod IP env var
 	PrivateIPEnvVar = "ROOK_PRIVATE_IP"
 
-	// DefaultRepoPrefix repo prefix
-	DefaultRepoPrefix = "rook"
 	// ConfigOverrideName config override name
 	ConfigOverrideName = "rook-config-override"
 	// ConfigOverrideVal config override value
-	ConfigOverrideVal = "config"
-	configMountDir    = "/etc/rook/config"
-	overrideFilename  = "override.conf"
+	ConfigOverrideVal                    = "config"
+	configMountDir                       = "/etc/rook/config"
+	overrideFilename                     = "override.conf"
+	ObservedGenerationNotAvailable int64 = -1
 )
-
-// ConfigOverrideMount is an override mount
-func ConfigOverrideMount() v1.VolumeMount {
-	return v1.VolumeMount{Name: ConfigOverrideName, MountPath: configMountDir}
-}
-
-// ConfigOverrideVolume is an override volume
-func ConfigOverrideVolume() v1.Volume {
-	cmSource := &v1.ConfigMapVolumeSource{Items: []v1.KeyToPath{{Key: ConfigOverrideVal, Path: overrideFilename}}}
-	cmSource.Name = ConfigOverrideName
-	return v1.Volume{Name: ConfigOverrideName, VolumeSource: v1.VolumeSource{ConfigMap: cmSource}}
-}
 
 // ConfigOverrideEnvVar config override env var
 func ConfigOverrideEnvVar() v1.EnvVar {
@@ -97,39 +82,33 @@ func ConfigDirEnvVar(dataDir string) v1.EnvVar {
 	return v1.EnvVar{Name: "ROOK_CONFIG_DIR", Value: dataDir}
 }
 
-// GetContainerImage returns the container image
-// matching the given name for a pod. If the pod
-// only has a single container, the name argument
-// is ignored.
+// GetContainerImage returns the container image matching the given name for a pod.
 func GetContainerImage(pod *v1.Pod, name string) (string, error) {
 	return GetSpecContainerImage(pod.Spec, name, false)
 }
 
-// GetSpecContainerImage returns the container image
-// for a podspec, given a container name. The name is
-// ignored if the podspec has a single container, in
-// which case the image for that container is returned.
+// GetSpecContainerImage returns the container image for a podspec, given a container name.
 func GetSpecContainerImage(spec v1.PodSpec, name string, initContainer bool) (string, error) {
 	containers := spec.Containers
 	if initContainer {
 		containers = spec.InitContainers
 	}
-	image, err := GetMatchingContainer(containers, name)
+	container, err := GetContainerByName(containers, name)
 	if err != nil {
 		return "", err
 	}
-	return image.Image, nil
+	return container.Image, nil
 }
 
 // Replaces the pod default toleration of 300s used when the node controller
-// detect a not ready node (node.kubernetes.io/unreachable)
+// detects a not ready node (node.kubernetes.io/unreachable)
 func AddUnreachableNodeToleration(podSpec *v1.PodSpec) {
 	// The amount of time for this pod toleration can be modified by users
 	// changing the value of <ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS> Rook operator
 	// variable.
-	// Node controller will wait 40 seconds by default before mark a node as
+	// Node controller will wait 40 seconds by default before marking a node as
 	// unreachable. After 40s + ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS the pod
-	// will be scheduled in other node
+	// will be scheduled in another node
 	// Only one <toleration> to <unreachable> nodes can be added
 	var tolerationSeconds int64 = 5
 	urTolerationSeconds := os.Getenv("ROOK_UNREACHABLE_NODE_TOLERATION_SECONDS")
@@ -140,10 +119,12 @@ func AddUnreachableNodeToleration(podSpec *v1.PodSpec) {
 			tolerationSeconds = duration
 		}
 	}
-	urToleration := v1.Toleration{Key: "node.kubernetes.io/unreachable",
+	urToleration := v1.Toleration{
+		Key:               "node.kubernetes.io/unreachable",
 		Operator:          "Exists",
 		Effect:            "NoExecute",
-		TolerationSeconds: &tolerationSeconds}
+		TolerationSeconds: &tolerationSeconds,
+	}
 
 	for index, item := range podSpec.Tolerations {
 		if item.Key == "node.kubernetes.io/unreachable" {
@@ -156,14 +137,13 @@ func AddUnreachableNodeToleration(podSpec *v1.PodSpec) {
 
 // GetRunningPod reads the name and namespace of a pod from the
 // environment, and returns the pod (if it exists).
-func GetRunningPod(clientset kubernetes.Interface) (*v1.Pod, error) {
-	ctx := context.TODO()
+func GetRunningPod(ctx context.Context, clientset kubernetes.Interface) (*v1.Pod, error) {
 	podName := os.Getenv(PodNameEnvVar)
 	if podName == "" {
 		return nil, fmt.Errorf("cannot detect the pod name. Please provide it using the downward API in the manifest file")
 	}
 	podNamespace := os.Getenv(PodNamespaceEnvVar)
-	if podName == "" {
+	if podNamespace == "" {
 		return nil, fmt.Errorf("cannot detect the pod namespace. Please provide it using the downward API in the manifest file")
 	}
 
@@ -174,42 +154,28 @@ func GetRunningPod(clientset kubernetes.Interface) (*v1.Pod, error) {
 	return pod, nil
 }
 
-// GetMatchingContainer takes a list of containers and a name,
-// and returns the first container in the list matching the
-// name. If the list contains a single container it is always
-// returned, even if the name does not match.
-func GetMatchingContainer(containers []v1.Container, name string) (v1.Container, error) {
-	var result *v1.Container
-	if len(containers) == 1 {
-		// if there is only one pod, use its image rather than require a set container name
-		result = &containers[0]
-	} else {
-		// if there are multiple pods, we require the container to have the expected name
-		for _, container := range containers {
-			if container.Name == name {
-				localcontainer := container
-				result = &localcontainer
-				break
-			}
+// GetContainerByName returns a pointer to the container in the slice whose
+// Name matches the given name. The returned pointer references the slice
+// element, so callers may mutate the container in place. Returns an error
+// if no container matches.
+func GetContainerByName(containers []v1.Container, name string) (*v1.Container, error) {
+	for i := range containers {
+		if containers[i].Name == name {
+			return &containers[i], nil
 		}
 	}
-
-	if result == nil {
-		return v1.Container{}, fmt.Errorf("failed to find image for container %s", name)
-	}
-
-	return *result, nil
+	return nil, fmt.Errorf("container %q not found", name)
 }
 
 // PodsRunningWithLabel returns the number of running pods with the given label
-func PodsRunningWithLabel(clientset kubernetes.Interface, namespace, label string) (int, error) {
-	running, _, err := podStatusWithLabel(clientset, namespace, label)
+func PodsRunningWithLabel(ctx context.Context, clientset kubernetes.Interface, namespace, label string) (int, error) {
+	running, _, err := podStatusWithLabel(ctx, clientset, namespace, label)
 	return running, err
 }
 
 // PodsWithLabelAreAllRunning returns whether all pods with the label are in running state
-func PodsWithLabelAreAllRunning(clientset kubernetes.Interface, namespace, label string) (bool, error) {
-	running, notRunning, err := podStatusWithLabel(clientset, namespace, label)
+func PodsWithLabelAreAllRunning(ctx context.Context, clientset kubernetes.Interface, namespace, label string) (bool, error) {
+	running, notRunning, err := podStatusWithLabel(ctx, clientset, namespace, label)
 	if err != nil {
 		return false, err
 	}
@@ -217,8 +183,7 @@ func PodsWithLabelAreAllRunning(clientset kubernetes.Interface, namespace, label
 	return running > 0 && notRunning == 0, err
 }
 
-func podStatusWithLabel(clientset kubernetes.Interface, namespace, label string) (int, int, error) {
-	ctx := context.TODO()
+func podStatusWithLabel(ctx context.Context, clientset kubernetes.Interface, namespace, label string) (int, int, error) {
 	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: label})
 	if err != nil {
 		return 0, 0, err
@@ -254,37 +219,7 @@ func GetPodPhaseMap(pods *v1.PodList) map[v1.PodPhase][]string {
 	return podPhaseMap
 }
 
-// GetJobLog gets the logs for the pod. If there is more than one pod with the label selector, the logs from
-// the first pod will be returned.
-func GetPodLog(clientset kubernetes.Interface, namespace string, labelSelector string) (string, error) {
-	ctx := context.TODO()
-	opts := metav1.ListOptions{
-		LabelSelector: labelSelector,
-	}
-	pods, err := clientset.CoreV1().Pods(namespace).List(ctx, opts)
-	if err != nil {
-		return "", fmt.Errorf("failed to get version pod. %+v", err)
-	}
-	for _, pod := range pods.Items {
-		req := clientset.CoreV1().Pods(namespace).GetLogs(pod.Name, &v1.PodLogOptions{})
-		readCloser, err := req.Stream(ctx)
-		if err != nil {
-			return "", fmt.Errorf("failed to read from stream. %+v", err)
-		}
-
-		builder := &strings.Builder{}
-		defer readCloser.Close()
-		_, err = io.Copy(builder, readCloser)
-		if err != nil {
-			return "", errors.Wrapf(err, "error copying file from %s to %s", builder, readCloser)
-		}
-		return builder.String(), err //nolint // no else statement needed
-	}
-
-	return "", fmt.Errorf("did not find any pods with label %s", labelSelector)
-}
-
-// ClusterDaemonEnvVars Environment variables used by storage cluster daemon
+// ClusterDaemonEnvVars returns the environment variables used by storage cluster daemons
 func ClusterDaemonEnvVars(image string) []v1.EnvVar {
 	return []v1.EnvVar{
 		{Name: "CONTAINER_IMAGE", Value: image},
@@ -296,7 +231,7 @@ func ClusterDaemonEnvVars(image string) []v1.EnvVar {
 		// If a user sets 0, all available memory on the host will be used
 		{Name: "POD_MEMORY_LIMIT", ValueFrom: &v1.EnvVarSource{ResourceFieldRef: &v1.ResourceFieldSelector{Resource: "limits.memory"}}}, // Bytes
 
-		// If requests.memory is not set in the pod definition, Kubernetes will use the formula "requests.memory = limits.memory" during pods's scheduling
+		// If requests.memory is not set in the pod definition, Kubernetes will use the formula "requests.memory = limits.memory" during pod's scheduling
 		// Kubernetes will set this variable to 0 or equal to limits.memory if set
 		{Name: "POD_MEMORY_REQUEST", ValueFrom: &v1.EnvVarSource{ResourceFieldRef: &v1.ResourceFieldSelector{Resource: "requests.memory"}}}, // Bytes
 
@@ -304,13 +239,16 @@ func ClusterDaemonEnvVars(image string) []v1.EnvVar {
 		// If a user sets 0, all CPUs will be used
 		{Name: "POD_CPU_LIMIT", ValueFrom: &v1.EnvVarSource{ResourceFieldRef: &v1.ResourceFieldSelector{Resource: "limits.cpu", Divisor: resource.MustParse("1")}}},
 
-		// If request.cpu is not set in the pod definition, Kubernetes will use the formula "requests.cpu = limits.cpu" during pods's scheduling
+		// If request.cpu is not set in the pod definition, Kubernetes will use the formula "requests.cpu = limits.cpu" during pod's scheduling
 		// Kubernetes will set this variable to 0 or equal to limits.cpu if set
 		{Name: "POD_CPU_REQUEST", ValueFrom: &v1.EnvVarSource{ResourceFieldRef: &v1.ResourceFieldSelector{Resource: "requests.cpu"}}},
+
+		// All ceph daemons using msgr in a containerized environment expect to set a random nonce at startup
+		{Name: "CEPH_USE_RANDOM_NONCE", Value: "true"},
 	}
 }
 
-// SetNodeAntiAffinityForPod assign pod anti-affinity when pod should not be co-located
+// SetNodeAntiAffinityForPod assigns pod anti-affinity when the pod should not be co-located
 func SetNodeAntiAffinityForPod(pod *v1.PodSpec, requiredDuringScheduling bool, topologyKey string, labels, nodeSelector map[string]string) {
 	pod.NodeSelector = nodeSelector
 
@@ -336,19 +274,16 @@ func SetNodeAntiAffinityForPod(pod *v1.PodSpec, requiredDuringScheduling bool, t
 	// Set pod anti-affinity rules when pod should never be
 	// co-located (e.g. HostNetworking, not AllowMultiplePerHost)
 	if requiredDuringScheduling {
-		paa.RequiredDuringSchedulingIgnoredDuringExecution =
-			append(paa.RequiredDuringSchedulingIgnoredDuringExecution, podAntiAffinity)
+		paa.RequiredDuringSchedulingIgnoredDuringExecution = append(paa.RequiredDuringSchedulingIgnoredDuringExecution, podAntiAffinity)
 	} else {
-		paa.PreferredDuringSchedulingIgnoredDuringExecution =
-			append(paa.PreferredDuringSchedulingIgnoredDuringExecution, v1.WeightedPodAffinityTerm{
-				Weight:          50,
-				PodAffinityTerm: podAntiAffinity,
-			})
+		paa.PreferredDuringSchedulingIgnoredDuringExecution = append(paa.PreferredDuringSchedulingIgnoredDuringExecution, v1.WeightedPodAffinityTerm{
+			Weight:          50,
+			PodAffinityTerm: podAntiAffinity,
+		})
 	}
 }
 
-func ForceDeletePodIfStuck(clusterdContext *clusterd.Context, pod v1.Pod) error {
-	ctx := context.TODO()
+func ForceDeletePodIfStuck(ctx context.Context, clusterdContext *clusterd.Context, pod v1.Pod) error {
 	logger.Debugf("checking if pod %q is stuck and should be force deleted", pod.Name)
 	if pod.DeletionTimestamp.IsZero() {
 		logger.Debugf("skipping pod %q restart since the pod is not deleted", pod.Name)
@@ -398,9 +333,9 @@ func removeDuplicateEnvVarsFromContainer(container *v1.Container) {
 	container.Env = vars
 }
 
-func IsPodScheduled(clientSet kubernetes.Interface, namespace, selector string) (bool, error) {
+func IsPodScheduled(ctx context.Context, clientSet kubernetes.Interface, namespace, selector string) (bool, error) {
 	listOpts := metav1.ListOptions{LabelSelector: selector}
-	podList, err := clientSet.CoreV1().Pods(namespace).List(context.TODO(), listOpts)
+	podList, err := clientSet.CoreV1().Pods(namespace).List(ctx, listOpts)
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to list pods with label selector %q in namespace %q", selector, namespace)
 	}

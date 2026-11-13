@@ -17,16 +17,15 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"fmt"
 	"time"
 
 	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/config"
-	"github.com/rook/rook/pkg/operator/ceph/version"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/operator/k8sutil/cmdreporter"
@@ -36,10 +35,10 @@ import (
 const detectCephVersionTimeout = 15 * time.Minute
 
 // ValidateCephVersionsBetweenLocalAndExternalClusters makes sure an external cluster can be connected
-// by checking the external ceph versions available and comparing it with the local image provided
-func ValidateCephVersionsBetweenLocalAndExternalClusters(context *clusterd.Context, clusterInfo *client.ClusterInfo) (cephver.CephVersion, error) {
+// by checking the external ceph version available and comparing it with the local image provided
+func ValidateCephVersionsBetweenLocalAndExternalClusters(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo) (cephver.CephVersion, error) {
 	// health check should tell us if the external cluster has been upgraded and display a message
-	externalVersion, err := client.GetCephMonVersion(context, clusterInfo)
+	externalVersion, err := cephclient.GetCephMonVersion(context, clusterInfo)
 	if err != nil {
 		return cephver.CephVersion{}, errors.Wrap(err, "failed to get ceph mon version")
 	}
@@ -61,7 +60,7 @@ func GetImageVersion(cephCluster cephv1.CephCluster) (*cephver.CephVersion, erro
 
 // DetectCephVersion loads the ceph version from the image and checks that it meets the version requirements to
 // run in the cluster
-func DetectCephVersion(rookImage, namespace, jobName string, ownerInfo *k8sutil.OwnerInfo, clientset kubernetes.Interface, cephClusterSpec *cephv1.ClusterSpec) (*version.CephVersion, error) {
+func DetectCephVersion(ctx context.Context, rookImage, namespace, jobName string, ownerInfo *k8sutil.OwnerInfo, clientset kubernetes.Interface, cephClusterSpec *cephv1.ClusterSpec) (*cephver.CephVersion, error) {
 	cephImage := cephClusterSpec.CephVersion.Image
 	logger.Infof("detecting the ceph image version for image %s...", cephImage)
 	versionReporter, err := cmdreporter.New(
@@ -74,6 +73,8 @@ func DetectCephVersion(rookImage, namespace, jobName string, ownerInfo *k8sutil.
 		[]string{"--version"},
 		rookImage,
 		cephImage,
+		cephClusterSpec.CephVersion.ImagePullPolicy,
+		cephClusterSpec.Resources,
 	)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to set up ceph version job")
@@ -85,8 +86,12 @@ func DetectCephVersion(rookImage, namespace, jobName string, ownerInfo *k8sutil.
 	// Apply the same placement for the ceph version detection as the mon daemons except for PodAntiAffinity
 	cephv1.GetMonPlacement(cephClusterSpec.Placement).ApplyToPodSpec(&job.Spec.Template.Spec)
 	job.Spec.Template.Spec.Affinity.PodAntiAffinity = nil
+	job.Spec.Template.Spec.PriorityClassName = cephv1.GetMonPriorityClassName(cephClusterSpec.PriorityClassNames)
 
-	stdout, stderr, retcode, err := versionReporter.Run(detectCephVersionTimeout)
+	cephv1.GetCmdReporterAnnotations(cephClusterSpec.Annotations).ApplyToObjectMeta(&job.Spec.Template.ObjectMeta)
+	cephv1.GetCmdReporterLabels(cephClusterSpec.Labels).ApplyToObjectMeta(&job.Spec.Template.ObjectMeta)
+
+	stdout, stderr, retcode, err := versionReporter.Run(ctx, detectCephVersionTimeout)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to complete ceph version job")
 	}
@@ -108,15 +113,15 @@ func DetectCephVersion(rookImage, namespace, jobName string, ownerInfo *k8sutil.
 	return version, nil
 }
 
-func CurrentAndDesiredCephVersion(rookImage, namespace, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *cephclient.ClusterInfo) (*version.CephVersion, *version.CephVersion, error) {
+func CurrentAndDesiredCephVersion(ctx context.Context, rookImage, namespace, jobName string, ownerInfo *k8sutil.OwnerInfo, context *clusterd.Context, cephClusterSpec *cephv1.ClusterSpec, clusterInfo *cephclient.ClusterInfo) (*cephver.CephVersion, *cephver.CephVersion, error) {
 	// Detect desired CephCluster version
-	desiredCephVersion, err := DetectCephVersion(rookImage, namespace, fmt.Sprintf("%s-detect-version", jobName), ownerInfo, context.Clientset, cephClusterSpec)
+	desiredCephVersion, err := DetectCephVersion(ctx, rookImage, namespace, fmt.Sprintf("%s-detect-version", jobName), ownerInfo, context.Clientset, cephClusterSpec)
 	if err != nil {
 		return nil, nil, errors.Wrap(err, "failed to detect ceph image version")
 	}
 
 	// Check the ceph version of the running monitors
-	runningMonDaemonVersion, err := client.LeastUptodateDaemonVersion(context, clusterInfo, config.MonType)
+	runningMonDaemonVersion, err := cephclient.LeastUptodateDaemonVersion(context, clusterInfo, config.MonType)
 	if err != nil {
 		return nil, nil, errors.Wrapf(err, "failed to retrieve current ceph %q version", config.MonType)
 	}
@@ -124,8 +129,8 @@ func CurrentAndDesiredCephVersion(rookImage, namespace, jobName string, ownerInf
 	return desiredCephVersion, &runningMonDaemonVersion, nil
 }
 
-func ErrorCephUpgradingRequeue(runningCephVersion, desiredCephVersion *version.CephVersion) error {
-	return errors.Errorf(`waiting for ceph monitors upgrade to finish. `+
+func ErrorCephUpgradingRequeue(runningCephVersion, desiredCephVersion *cephver.CephVersion) error {
+	return errors.Errorf(`waiting for ceph upgrade to finish. `+
 		`current version: %s. `+
 		`expected version: %s. `+
 		`will reconcile again in %s`,

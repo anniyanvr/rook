@@ -17,32 +17,32 @@ limitations under the License.
 package cluster
 
 import (
-	"context"
+	"strings"
 	"testing"
 	"time"
 
+	addonsv1alpha1 "github.com/csi-addons/kubernetes-csi-addons/api/csiaddons/v1alpha1"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	apifake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	clientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 func TestReconcileDeleteCephCluster(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	cephNs := "rook-ceph"
 	clusterName := "my-cluster"
 	nsName := types.NamespacedName{
@@ -51,10 +51,15 @@ func TestReconcileDeleteCephCluster(t *testing.T) {
 	}
 
 	fakeCluster := &cephv1.CephCluster{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "CephCluster",
+			APIVersion: "ceph.rook.io/v1",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              clusterName,
 			Namespace:         cephNs,
 			DeletionTimestamp: &metav1.Time{Time: time.Now()},
+			Finalizers:        []string{"cephcluster.ceph.rook.io"},
 		},
 	}
 
@@ -72,17 +77,20 @@ func TestReconcileDeleteCephCluster(t *testing.T) {
 	// create a Rook-Ceph scheme to use for our tests
 	scheme := runtime.NewScheme()
 	assert.NoError(t, cephv1.AddToScheme(scheme))
+	assert.NoError(t, addonsv1alpha1.AddToScheme(scheme))
 
 	t.Run("deletion blocked while dependencies exist", func(t *testing.T) {
 		// set up clusterd.Context
 		clusterdCtx := &clusterd.Context{
-			Clientset: k8sfake.NewSimpleClientset(),
+			Clientset:           k8sfake.NewClientset(),
+			RookClientset:       rookclient.NewSimpleClientset(),
+			ApiExtensionsClient: apifake.NewClientset(),
 		}
 
 		// create the cluster controller and tell it that the cluster has been deleted
 		controller := NewClusterController(clusterdCtx, "")
-		fakeRecorder := record.NewFakeRecorder(5)
-		controller.recorder = k8sutil.NewEventReporter(fakeRecorder)
+		fakeRecorder := events.NewFakeRecorder(50)
+		controller.recorder = fakeRecorder
 
 		// Create a fake client to mock API calls
 		// Make sure it has the fake CephCluster that is to be deleted in it
@@ -96,7 +104,7 @@ func TestReconcileDeleteCephCluster(t *testing.T) {
 			scheme:            scheme,
 			context:           clusterdCtx,
 			clusterController: controller,
-			opManagerContext:  context.TODO(),
+			opManagerContext:  t.Context(),
 		}
 
 		req := reconcile.Request{NamespacedName: nsName}
@@ -129,14 +137,21 @@ func TestReconcileDeleteCephCluster(t *testing.T) {
 
 		unblockedCluster := &cephv1.CephCluster{}
 		err = client.Get(ctx, nsName, unblockedCluster)
-		assert.Error(t, err)
-		assert.True(t, kerrors.IsNotFound(err))
+		assert.NoError(t, err)
+		assert.Equal(t, 2, len(unblockedCluster.Status.Conditions))
+		condition := unblockedCluster.Status.Conditions[0]
+		if condition.Type != cephv1.ConditionDeletionIsBlocked {
+			condition = unblockedCluster.Status.Conditions[1]
+		}
+		assert.Equal(t, cephv1.ConditionDeletionIsBlocked, condition.Type)
+		assert.True(t, strings.Contains(condition.Message, "has no dependent custom resources blocking deletion"))
+		logger.Infof("condition: %+v", condition)
 	})
 }
 
 func TestRemoveFinalizers(t *testing.T) {
 	reconcileCephCluster := &ReconcileCephCluster{
-		opManagerContext: context.TODO(),
+		opManagerContext: t.Context(),
 	}
 	s := scheme.Scheme
 	fakeObject1 := &cephv1.CephCluster{
@@ -184,7 +199,7 @@ func TestRemoveFinalizers(t *testing.T) {
 				tt.object,
 			}
 			s.AddKnownTypes(tt.schema, tt.object)
-			cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+			cl := clientfake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 
 			assert.NotEmpty(t, fakeObject.GetFinalizers())
 			name := types.NamespacedName{Name: fakeObject.GetName(), Namespace: fakeObject.GetNamespace()}
@@ -193,4 +208,78 @@ func TestRemoveFinalizers(t *testing.T) {
 			assert.Empty(t, fakeObject.GetFinalizers())
 		})
 	}
+}
+
+func TestIsSecretRefFromCluster(t *testing.T) {
+	clusterSpec := cephv1.ClusterSpec{
+		Dashboard: cephv1.DashboardSpec{SSLCertificateRef: "dashboard-tls"},
+		CephConfigFromSecret: map[string]map[string]corev1.SecretKeySelector{
+			"global": {
+				"debug_mgr": {
+					LocalObjectReference: corev1.LocalObjectReference{Name: "ceph-config"},
+					Key:                  "debug_mgr",
+				},
+			},
+		},
+	}
+
+	assert.True(t, isSecretRefFromCluster("dashboard-tls", clusterSpec))
+	assert.True(t, isSecretRefFromCluster("ceph-config", clusterSpec))
+	assert.False(t, isSecretRefFromCluster("other-secret", clusterSpec))
+}
+
+func TestReconcileSkipsWhenSkipReconcileLabelSet(t *testing.T) {
+	cephNs := "rook-ceph"
+	clusterName := "my-cluster"
+	nsName := types.NamespacedName{
+		Name:      clusterName,
+		Namespace: cephNs,
+	}
+
+	// create a Rook-Ceph scheme to use for our tests
+	s := runtime.NewScheme()
+	assert.NoError(t, cephv1.AddToScheme(s))
+	assert.NoError(t, corev1.AddToScheme(s))
+
+	fakeCluster := &cephv1.CephCluster{
+		TypeMeta: metav1.TypeMeta{
+			Kind:       "CephCluster",
+			APIVersion: "ceph.rook.io/v1",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      clusterName,
+			Namespace: cephNs,
+			Finalizers: []string{
+				"cephcluster.ceph.rook.io",
+			},
+			Labels: map[string]string{
+				cephv1.SkipReconcileLabelKey: "true",
+			},
+		},
+	}
+
+	clusterdCtx := &clusterd.Context{}
+	controller := NewClusterController(clusterdCtx, "")
+	fakeRecorder := events.NewFakeRecorder(50)
+	controller.recorder = fakeRecorder
+
+	// Create a fake client to mock API calls
+	client := clientfake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(fakeCluster).Build()
+
+	reconcileCephCluster := &ReconcileCephCluster{
+		client:            client,
+		scheme:            s,
+		context:           clusterdCtx,
+		clusterController: controller,
+		opManagerContext:  t.Context(),
+	}
+
+	resp, _, err := reconcileCephCluster.reconcile(reconcile.Request{NamespacedName: nsName})
+	assert.NoError(t, err)
+	assert.True(t, resp.IsZero())
+
+	// Verify we emit the ReconcileSkipped event when the skip-reconcile label is set.
+	event := <-fakeRecorder.Events
+	assert.Contains(t, event, "ReconcileSkipped")
+	assert.Contains(t, event, cephv1.SkipReconcileLabelKey)
 }

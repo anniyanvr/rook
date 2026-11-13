@@ -18,17 +18,21 @@ package object
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	"github.com/coreos/pkg/capnslog"
 	"github.com/pkg/errors"
-	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/test"
 	"github.com/rook/rook/pkg/util/exec"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestExtractJson(t *testing.T) {
@@ -124,10 +128,88 @@ this line can't be parsed as json
 ]`, match)
 }
 
+func TestExtractJSONDoesNotLeakOutput(t *testing.T) {
+	// extractJSON is handed raw radosgw-admin output, which is credential-bearing on
+	// several paths: the `zone get` document below carries the realm system user's S3
+	// keys. The error is reported into the CR status and a Kubernetes event.
+	const (
+		accessKey = "EXAMPLEACCESSKEYID01"
+		secretKey = "EXAMPLEZONESECRETKEY0000000000000000000001"
+	)
+
+	tests := []struct {
+		name   string
+		output string
+		// the placeholder credential the output carries, empty when it carries none
+		credential string
+		hint       string
+	}{
+		{
+			// radosgw-admin logs to stderr ahead of the document, which is indented
+			// behind that output and cut short, so neither anchored match succeeds
+			name: "truncated document",
+			output: "failed to decode zone info" + "\n" +
+				`  {"id": "zone-a", "system_key": {"access_key": "` + accessKey + `", "secret_key": "` + secretKey + `"}`,
+			credential: secretKey,
+			hint:       "a json delimiter was found",
+		},
+		{
+			name:   "no json at all",
+			output: "ERROR: failed to load zone: (2) No such file or directory",
+			hint:   "no json delimiter was found",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := extractJSON(tc.output)
+
+			require.Error(t, err)
+			if tc.credential != "" {
+				assert.NotContains(t, err.Error(), tc.credential)
+				assert.NotContains(t, err.Error(), accessKey)
+			}
+			// the size and the delimiter hint are the only context left
+			assert.Contains(t, err.Error(), fmt.Sprintf("(%d bytes)", len(tc.output)))
+			assert.Contains(t, err.Error(), tc.hint)
+		})
+	}
+}
+
+func TestExtractJSONLogsOutputOnlyUnderTrace(t *testing.T) {
+	// the raw output is the only way to tell a truncated response from a schema
+	// change, but it may carry credentials, so it is logged only at the TRACE level
+	// that ROOK_LOG_LEVEL=TRACE_INSECURE unlocks.
+	const secretKey = "EXAMPLEZONESECRETKEY0000000000000000000001"
+	output := `  {"id": "zone-a", "system_key": {"secret_key": "` + secretKey + `"}`
+
+	for _, tc := range []struct {
+		level  capnslog.LogLevel
+		logged bool
+	}{
+		{level: capnslog.DEBUG, logged: false},
+		{level: capnslog.TRACE, logged: true},
+	} {
+		t.Run(tc.level.String(), func(t *testing.T) {
+			logBuf := captureLogsAtLevel(t, tc.level)
+
+			_, err := extractJSON(output)
+
+			require.Error(t, err)
+			assert.NotContains(t, err.Error(), secretKey)
+			if tc.logged {
+				assert.Contains(t, logBuf.String(), secretKey)
+			} else {
+				assert.NotContains(t, logBuf.String(), secretKey)
+			}
+		})
+	}
+}
+
 func TestRunAdminCommandNoMultisite(t *testing.T) {
 	objContext := &Context{
 		Context:     &clusterd.Context{RemoteExecutor: exec.RemotePodCommandExecutor{ClientSet: test.New(t, 3)}},
-		clusterInfo: client.AdminClusterInfo("mycluster"),
+		clusterInfo: client.AdminTestClusterInfo("mycluster"),
 	}
 
 	t.Run("no network provider - we run the radosgw-admin command from the operator", func(t *testing.T) {
@@ -151,7 +233,7 @@ func TestRunAdminCommandNoMultisite(t *testing.T) {
 	})
 
 	t.Run("with multus - we use the remote executor", func(t *testing.T) {
-		objContext.CephClusterSpec = v1.ClusterSpec{Network: v1.NetworkSpec{Provider: "multus"}}
+		objContext.clusterInfo.NetworkSpec = cephv1.NetworkSpec{Provider: "multus"}
 		_, err := RunAdminCommandNoMultisite(objContext, true, []string{"zone", "get"}...)
 		assert.Error(t, err)
 
@@ -237,7 +319,8 @@ func TestCommitConfigChanges(t *testing.T) {
 	}{
 		// a bit more background: creating a realm creates the first period epoch. When Rook creates
 		// zonegroup and zone, it results in many changes to the period.
-		{"real-world first reconcile (many changes, should commit period)",
+		{
+			"real-world first reconcile (many changes, should commit period)",
 			commandReturns{
 				periodGetOutput:    firstPeriodGet,
 				periodUpdateOutput: firstPeriodUpdate,
@@ -249,7 +332,8 @@ func TestCommitConfigChanges(t *testing.T) {
 			expectNoErr,
 		},
 		// note: this also tests that we support the output changing in the future to increment "epoch"
-		{"real-world second reconcile (no changes, should not commit period)",
+		{
+			"real-world second reconcile (no changes, should not commit period)",
 			commandReturns{
 				periodGetOutput:    secondPeriodGet,
 				periodUpdateOutput: secondPeriodUpdateWithoutChanges,
@@ -260,7 +344,8 @@ func TestCommitConfigChanges(t *testing.T) {
 			},
 			expectNoErr,
 		},
-		{"second reconcile with changes",
+		{
+			"second reconcile with changes",
 			commandReturns{
 				periodGetOutput:    secondPeriodGet,
 				periodUpdateOutput: secondPeriodUpdateWithChanges,
@@ -271,7 +356,8 @@ func TestCommitConfigChanges(t *testing.T) {
 			},
 			expectNoErr,
 		},
-		{"invalid get json",
+		{
+			"invalid get json",
 			commandReturns{
 				periodGetOutput:    `{"ids": [}`, // json obj with incomplete array that won't parse
 				periodUpdateOutput: firstPeriodUpdate,
@@ -282,7 +368,8 @@ func TestCommitConfigChanges(t *testing.T) {
 			},
 			expectErr,
 		},
-		{"invalid update json",
+		{
+			"invalid update json",
 			commandReturns{
 				periodGetOutput:    firstPeriodGet,
 				periodUpdateOutput: `{"ids": [}`,
@@ -293,7 +380,8 @@ func TestCommitConfigChanges(t *testing.T) {
 			},
 			expectErr,
 		},
-		{"fail period get",
+		{
+			"fail period get",
 			commandReturns{
 				periodGetOutput:    "", // error
 				periodUpdateOutput: firstPeriodUpdate,
@@ -304,7 +392,8 @@ func TestCommitConfigChanges(t *testing.T) {
 			},
 			expectErr,
 		},
-		{"fail period update",
+		{
+			"fail period update",
 			commandReturns{
 				periodGetOutput:    firstPeriodGet,
 				periodUpdateOutput: "", // error
@@ -315,7 +404,8 @@ func TestCommitConfigChanges(t *testing.T) {
 			},
 			expectErr,
 		},
-		{"fail period commit",
+		{
+			"fail period commit",
 			commandReturns{
 				periodGetOutput:    firstPeriodGet,
 				periodUpdateOutput: firstPeriodUpdate,
@@ -327,7 +417,8 @@ func TestCommitConfigChanges(t *testing.T) {
 			},
 			expectErr,
 		},
-		{"configs are removed",
+		{
+			"configs are removed",
 			commandReturns{
 				periodGetOutput:    secondPeriodUpdateWithChanges,
 				periodUpdateOutput: secondPeriodUpdateWithoutChanges,
@@ -406,7 +497,7 @@ const firstPeriodUpdate = `{
                 "id": "1580fd1d-a065-4484-82ff-329e9a779999",
                 "name": "my-store",
                 "api_name": "my-store",
-                "is_master": "true",
+                "is_master": true,
                 "endpoints": [
                     "http://10.105.59.166:80"
                 ],
@@ -489,7 +580,7 @@ const secondPeriodGet = `{
                 "id": "1580fd1d-a065-4484-82ff-329e9a779999",
                 "name": "my-store",
                 "api_name": "my-store",
-                "is_master": "true",
+                "is_master": true,
                 "endpoints": [
                     "http://10.105.59.166:80"
                 ],
@@ -562,7 +653,7 @@ const secondPeriodGet = `{
 // example real-world output from 'radosgw-admin period update' after the first period commit,
 // and with no changes since the first commit
 // note: output was modified to increment the epoch to make sure this code works in case the "epoch"
-//       behavior changes in radosgw-admin in the future
+// behavior changes in radosgw-admin in the future
 const secondPeriodUpdateWithoutChanges = `{
     "id": "94ba560d-a560-431d-8ed4-85a2891f9122:staging",
     "epoch": 2,
@@ -575,7 +666,7 @@ const secondPeriodUpdateWithoutChanges = `{
                 "id": "1580fd1d-a065-4484-82ff-329e9a779999",
                 "name": "my-store",
                 "api_name": "my-store",
-                "is_master": "true",
+                "is_master": true,
                 "endpoints": [
                     "http://10.105.59.166:80"
                 ],
@@ -659,7 +750,7 @@ const secondPeriodUpdateWithChanges = `{
                 "id": "1580fd1d-a065-4484-82ff-329e9a779999",
                 "name": "my-store",
                 "api_name": "my-store",
-                "is_master": "true",
+                "is_master": true,
                 "endpoints": [
                     "http://10.105.59.166:80",
                     "https://10.105.59.166:443"
@@ -730,3 +821,135 @@ const secondPeriodUpdateWithChanges = `{
     "realm_name": "my-store",
     "realm_epoch": 3
 }`
+
+func TestGetAdminOpsEndpoint(t *testing.T) {
+	s := &cephv1.CephObjectStore{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-store",
+			Namespace: "my-ns",
+		},
+		Spec: cephv1.ObjectStoreSpec{
+			Gateway: cephv1.GatewaySpec{},
+			Hosting: &cephv1.ObjectStoreHostingSpec{
+				// dnsNames shouldn't affect admin ops endpoints
+				DNSNames: []string{"should.not.appear"},
+			},
+		},
+	}
+
+	t.Run("internal", func(t *testing.T) {
+		t.Run("port", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.Port = 8080
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "http://rook-ceph-rgw-my-store.my-ns.svc:8080", got)
+		})
+
+		t.Run("securePort, no cert", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.SecurePort = 8443
+			got, err := GetAdminOpsEndpoint(s)
+			assert.Error(t, err)
+			assert.Equal(t, "", got)
+		})
+
+		t.Run("securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "https://rook-ceph-rgw-my-store.my-ns.svc:8443", got)
+		})
+
+		t.Run("port + securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.Port = 8080
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "https://rook-ceph-rgw-my-store.my-ns.svc:8443", got)
+		})
+	})
+
+	t.Run("external", func(t *testing.T) {
+		t.Run("port", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.Port = 8080
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "http://192.168.1.1:8080", got)
+		})
+
+		t.Run("securePort, no cert", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.SecurePort = 8443
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.Error(t, err)
+			assert.Equal(t, "", got)
+		})
+
+		t.Run("securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "https://192.168.1.1:8443", got)
+		})
+
+		t.Run("port + securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.Port = 8080
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "https://192.168.1.1:8443", got)
+		})
+	})
+
+	t.Run("advertise", func(t *testing.T) {
+		t.Run("port + securePort", func(t *testing.T) {
+			s := s.DeepCopy()
+			s.Spec.Gateway.ExternalRgwEndpoints = []cephv1.EndpointAddress{
+				{IP: "192.168.1.1"},
+				{Hostname: "s3.host.com"},
+			}
+			s.Spec.Gateway.Port = 8080
+			s.Spec.Gateway.SecurePort = 8443
+			s.Spec.Gateway.SSLCertificateRef = "my-cert"
+			s.Spec.Hosting.AdvertiseEndpoint = &cephv1.ObjectEndpointSpec{
+				DnsName: "advertise.me",
+				Port:    80,
+				UseTls:  false,
+			}
+
+			got, err := GetAdminOpsEndpoint(s)
+			assert.NoError(t, err)
+			assert.Equal(t, "http://advertise.me:80", got)
+		})
+	})
+}

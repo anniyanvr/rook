@@ -30,7 +30,7 @@ import (
 func TestCephArgs(t *testing.T) {
 	// cluster a under /etc
 	args := []string{}
-	clusterInfo := AdminClusterInfo("a")
+	clusterInfo := AdminTestClusterInfo("a")
 	exec.CephCommandsTimeout = 15 * time.Second
 	command, args := FinalizeCephCommandArgs(CephTool, clusterInfo, args, "/etc")
 	assert.Equal(t, CephTool, command)
@@ -79,7 +79,7 @@ func TestStretchElectionStrategy(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 	context := &clusterd.Context{Executor: executor}
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 
 	err := EnableStretchElectionStrategy(context, clusterInfo)
 	assert.NoError(t, err)
@@ -108,7 +108,7 @@ func TestStretchClusterMonTiebreaker(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 	context := &clusterd.Context{Executor: executor}
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 
 	err := SetMonStretchTiebreaker(context, clusterInfo, monName, failureDomain)
 	assert.NoError(t, err)
@@ -128,8 +128,8 @@ func TestMonDump(t *testing.T) {
 		logger.Infof("Command: %s %v", command, args)
 		switch {
 		case args[0] == "mon" && args[1] == "dump":
-			return `{"epoch":3,"fsid":"6a31a264-9090-4048-8d95-4b8c3cde909d","modified":"2020-12-09T18:13:36.346150Z","created":"2020-12-09T18:13:13.014270Z","min_mon_release":15,"min_mon_release_name":"octopus",
-		"features":{"persistent":["kraken","luminous","mimic","osdmap-prune","nautilus","octopus"],"optional":[]},
+			return `{"epoch":3,"fsid":"6a31a264-9090-4048-8d95-4b8c3cde909d","modified":"2020-12-09T18:13:36.346150Z","created":"2020-12-09T18:13:13.014270Z","min_mon_release":15,"min_mon_release_name":"pacific",
+		"features":{"persistent":["kraken","luminous","mimic","osdmap-prune","nautilus","octopus","pacific","quincy"],"optional":[]},
 		"election_strategy":1,"mons":[
 		{"rank":0,"name":"a","crush_location":"{zone=a}","public_addrs":{"addrvec":[{"type":"v2","addr":"10.109.80.104:3300","nonce":0},{"type":"v1","addr":"10.109.80.104:6789","nonce":0}]},"addr":"10.109.80.104:6789/0","public_addr":"10.109.80.104:6789/0","priority":0,"weight":0},
 		{"rank":1,"name":"b","crush_location":"{zone=b}","public_addrs":{"addrvec":[{"type":"v2","addr":"10.107.12.199:3300","nonce":0},{"type":"v1","addr":"10.107.12.199:6789","nonce":0}]},"addr":"10.107.12.199:6789/0","public_addr":"10.107.12.199:6789/0","priority":0,"weight":0},
@@ -139,16 +139,38 @@ func TestMonDump(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 	context := &clusterd.Context{Executor: executor}
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 
 	dump, err := GetMonDump(context, clusterInfo)
 	assert.NoError(t, err)
 	assert.Equal(t, 1, dump.ElectionStrategy)
-	assert.Equal(t, "{zone=a}", dump.Mons[0].CrushLocation)
 	assert.Equal(t, "a", dump.Mons[0].Name)
 	assert.Equal(t, 0, dump.Mons[0].Rank)
 	assert.Equal(t, "b", dump.Mons[1].Name)
 	assert.Equal(t, 1, dump.Mons[1].Rank)
 	assert.Equal(t, 3, len(dump.Mons))
 	assert.Equal(t, 3, len(dump.Quorum))
+}
+
+// TestMonDumpArrayCrushLocation verifies GetMonDump() still works against newer Ceph
+// versions (e.g. 20.2.4/tentacle) that report "crush_location" as an array of
+// {"key":..., "val":...} objects instead of the older "{zone=a}" string form.
+func TestMonDumpArrayCrushLocation(t *testing.T) {
+	executor := &exectest.MockExecutor{}
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+		switch {
+		case args[0] == "mon" && args[1] == "dump":
+			return `{"epoch":9,"fsid":"b7b8fe14-4e31-42f5-8aa1-dd46d37b6390","election_strategy":3,"stretch_mode":true,"tiebreaker_mon":"a","mons":[
+		{"rank":0,"name":"a","crush_location":[{"key":"zone","val":"a"}]}],
+		"quorum":[0]}`, nil
+		}
+		return "", errors.Errorf("unexpected ceph command %q", args)
+	}
+	context := &clusterd.Context{Executor: executor}
+	clusterInfo := AdminTestClusterInfo("mycluster")
+
+	dump, err := GetMonDump(context, clusterInfo)
+	assert.NoError(t, err)
+	assert.True(t, dump.StretchMode)
+	assert.Equal(t, "a", dump.Mons[0].Name)
 }

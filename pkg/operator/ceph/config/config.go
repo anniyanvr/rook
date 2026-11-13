@@ -49,6 +49,9 @@ const (
 	// RgwType defines the rgw DaemonType
 	RgwType = "rgw"
 
+	// NfsType defines the nfs DaemonType
+	NfsType = "nfs"
+
 	// RbdMirrorType defines the rbd-mirror DaemonType
 	RbdMirrorType = "rbd-mirror"
 
@@ -57,12 +60,6 @@ const (
 
 	// CrashType defines the crash collector DaemonType
 	CrashType = "crashcollector"
-
-	// CephUser is the Linux Ceph username
-	CephUser = "ceph"
-
-	// CephGroup is the Linux Ceph groupname
-	CephGroup = "ceph"
 )
 
 var (
@@ -84,12 +81,12 @@ var (
 
 // normalizeKey converts a key in any format to a key with underscores.
 //
-// The internal representation of Ceph config keys uses underscores only, where Ceph supports both
+// The internal representation of Ceph config keys uses underscores only, where Ceph supports
 // spaces, underscores, and hyphens. This is so that Rook can properly match and override keys even
 // when they are specified as "some config key" in one section, "some_config_key" in another
 // section, and "some-config-key" in yet another section.
 func normalizeKey(key string) string {
-	return strings.Replace(strings.Replace(key, " ", "_", -1), "-", "_", -1)
+	return strings.ReplaceAll(strings.ReplaceAll(key, " ", "_"), "-", "_")
 }
 
 // NewFlag returns the key-value pair in the format of a Ceph command line-compatible flag.
@@ -97,7 +94,7 @@ func NewFlag(key, value string) string {
 	// A flag is a normalized key with underscores replaced by dashes.
 	// "debug default" ~normalize~> "debug_default" ~to~flag~> "debug-default"
 	n := normalizeKey(key)
-	f := strings.Replace(n, "_", "-", -1)
+	f := strings.ReplaceAll(n, "_", "-")
 	return fmt.Sprintf("--%s=%s", f, value)
 }
 
@@ -113,55 +110,44 @@ func SetOrRemoveDefaultConfigs(
 	// or they are specified on the commandline when daemons are called.
 	monStore := GetMonStore(context, clusterInfo)
 
-	if err := monStore.SetAll(DefaultCentralizedConfigs(clusterInfo.CephVersion)...); err != nil {
+	if err := monStore.SetAll("global", DefaultCentralizedConfigs(clusterInfo.CephVersion)); err != nil {
 		return errors.Wrapf(err, "failed to apply default Ceph configurations")
 	}
 
 	// When enabled the collector will logrotate logs from files
 	if clusterSpec.LogCollector.Enabled {
 		// Override "log file" for existing clusters since it is empty
-		logOptions := []Option{
-			configOverride("global", "log to file", "true"),
+		logOptions := map[string]string{
+			"log to file": "true",
 		}
-
-		if err := monStore.SetAll(logOptions...); err != nil {
+		if err := monStore.SetAll("global", logOptions); err != nil {
 			return errors.Wrapf(err, "failed to apply logging configuration for log collector")
 		}
 		// If the log collector is disabled we do not log to file since we collect nothing
 	} else {
-		logOptions := []Option{
-			configOverride("global", "log to file", "false"),
+		logOptions := map[string]string{
+			"log to file": "false",
 		}
-
-		if err := monStore.SetAll(logOptions...); err != nil {
+		if err := monStore.SetAll("global", logOptions); err != nil {
 			return errors.Wrapf(err, "failed to apply logging configuration")
 		}
 	}
 
-	if err := monStore.SetAll(DefaultLegacyConfigs()...); err != nil {
-		return errors.Wrapf(err, "failed to apply legacy config overrides")
-	}
-
-	// Apply Multus if needed
-	if clusterSpec.Network.IsMultus() {
-		logger.Info("configuring ceph network(s) with multus")
-		cephNetworks, err := generateNetworkSettings(context, clusterInfo.Namespace, clusterSpec.Network.Selectors)
-		if err != nil {
-			return errors.Wrap(err, "failed to generate network settings")
-		}
-
-		// Apply ceph network settings to the mon config store
-		if err := monStore.SetAll(cephNetworks...); err != nil {
-			return errors.Wrap(err, "failed to network config overrides")
-		}
-	}
-
 	// This section will remove any previously configured option(s) from the mon centralized store
-	// This is useful for scenarios where options are not needed anymore and we just want to reset to internal's default
+	// This is useful for scenarios where options are not needed anymore and we just want to reset to the internal default
 	// On upgrade, the flag will be removed
 	if err := monStore.DeleteAll(LegacyConfigs()...); err != nil {
 		return errors.Wrap(err, "failed to remove legacy options")
 	}
 
 	return nil
+}
+
+func DisableInsecureGlobalID(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo) {
+	monStore := GetMonStore(context, clusterInfo)
+	if err := monStore.Set("mon", "auth_allow_insecure_global_id_reclaim", "false"); err != nil {
+		logger.Warningf("failed to disable the insecure global ID. %v", err)
+	} else {
+		logger.Info("insecure global ID is now disabled")
+	}
 }

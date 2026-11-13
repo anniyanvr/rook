@@ -28,35 +28,36 @@ func TestValidatePoolSpec(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "ec-pool",
 		},
-		Spec: PoolSpec{
-			ErasureCoded: ErasureCodedSpec{
-				CodingChunks: 1,
-				DataChunks:   2,
+		Spec: NamedBlockPoolSpec{
+			PoolSpec: PoolSpec{
+				ErasureCoded: ErasureCodedSpec{
+					CodingChunks: 1,
+					DataChunks:   2,
+				},
 			},
 		},
 	}
-	err := validatePoolSpec(p.Spec)
+	err := validatePoolSpec(p.ToNamedPoolSpec())
 	assert.NoError(t, err)
 
 	p.Spec.ErasureCoded.DataChunks = 1
-	err = validatePoolSpec(p.Spec)
+	err = validatePoolSpec(p.ToNamedPoolSpec())
 	assert.Error(t, err)
 }
 
-func TestCephBlockPoolValidateUpdate(t *testing.T) {
+func TestValidateCephBlockPoolBuiltInPool(t *testing.T) {
 	p := &CephBlockPool{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "ec-pool",
-		},
-		Spec: PoolSpec{
-			Replicated: ReplicatedSpec{RequireSafeReplicaSize: true, Size: 3},
+		ObjectMeta: metav1.ObjectMeta{Name: "my-pool"},
+		Spec: NamedBlockPoolSpec{
+			Name: ".mgr",
+			PoolSpec: PoolSpec{
+				ErasureCoded: ErasureCodedSpec{CodingChunks: 1, DataChunks: 2},
+			},
 		},
 	}
-	up := p.DeepCopy()
-	up.Spec.ErasureCoded.DataChunks = 2
-	up.Spec.ErasureCoded.CodingChunks = 1
-	err := up.ValidateUpdate(p)
-	assert.Error(t, err)
+
+	err := ValidateCephBlockPool(p)
+	assert.EqualError(t, err, `invalid CephBlockPool spec: ceph built-in pool ".mgr" cannot be erasure coded`)
 }
 
 func TestMirroringSpec_SnapshotSchedulesEnabled(t *testing.T) {

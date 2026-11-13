@@ -18,8 +18,11 @@ package csi
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"strings"
 
+	csiopv1 "github.com/ceph/ceph-csi-operator/api/v1"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -28,38 +31,53 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 
+	addonsv1alpha1 "github.com/csi-addons/kubernetes-csi-addons/api/csiaddons/v1alpha1"
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
+
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/csi/peermap"
 	"github.com/rook/rook/pkg/operator/k8sutil"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/runtime"
 )
 
 const (
 	controllerName = "rook-ceph-operator-csi-controller"
+
+	// csiImageSetConfigMapName is the configmap that holds CSI container image overrides
+	// for the ceph-csi-operator. Empty values cause the operator to use its built-in defaults.
+	csiImageSetConfigMapName = "rook-csi-operator-image-set-configmap"
+
+	// staleV120CephCSIImage is the cephcsi plugin image shipped as the default in Rook v1.20.
+	// If this value is found in the image-set configmap during reconcile, all values are reset
+	// to empty so the ceph-csi-operator uses its own built-in defaults.
+	staleV120CephCSIImage = "quay.io/cephcsi/cephcsi:v3.17"
 )
 
 // ReconcileCSI reconciles a ceph-csi driver
 type ReconcileCSI struct {
+	scheme           *runtime.Scheme
 	client           client.Client
 	context          *clusterd.Context
 	opManagerContext context.Context
 	opConfig         opcontroller.OperatorConfig
+	// the first cluster CR which will determine some settings for the csi driver
+	firstCephCluster *cephv1.ClusterSpec
 }
 
 // Add creates a new Ceph CSI Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) error {
-	return add(mgr, newReconciler(mgr, context, opManagerContext, opConfig))
+	return add(opManagerContext, mgr, newReconciler(mgr, context, opManagerContext, opConfig), opConfig)
 }
 
 // newReconciler returns a new reconcile.Reconciler
 func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) reconcile.Reconciler {
 	return &ReconcileCSI{
+		scheme:           mgr.GetScheme(),
 		client:           mgr.GetClient(),
 		context:          context,
 		opConfig:         opConfig,
@@ -67,7 +85,7 @@ func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerCont
 	}
 }
 
-func add(mgr manager.Manager, r reconcile.Reconciler) error {
+func add(ctx context.Context, mgr manager.Manager, r reconcile.Reconciler, opConfig opcontroller.OperatorConfig) error {
 	// Create a new controller
 	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: r})
 	if err != nil {
@@ -75,16 +93,39 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	}
 	logger.Infof("%s successfully started", controllerName)
 
+	// Add CSIAddons client to controller mgr
+	err = addonsv1alpha1.AddToScheme(mgr.GetScheme())
+	if err != nil {
+		return err
+	}
+
 	// Watch for ConfigMap (operator config)
-	err = c.Watch(&source.Kind{
-		Type: &v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}}}, &handler.EnqueueRequestForObject{}, predicateController())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&corev1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: corev1.SchemeGroupVersion.String()}},
+			&handler.TypedEnqueueRequestForObject[*corev1.ConfigMap]{},
+			cmPredicate(),
+		),
+	)
 	if err != nil {
 		return err
 	}
 
 	// Watch for CephCluster
-	err = c.Watch(&source.Kind{
-		Type: &cephv1.CephCluster{TypeMeta: metav1.TypeMeta{Kind: "CephCluster", APIVersion: v1.SchemeGroupVersion.String()}}}, &handler.EnqueueRequestForObject{}, predicateController())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&cephv1.CephCluster{TypeMeta: metav1.TypeMeta{Kind: "CephCluster", APIVersion: corev1.SchemeGroupVersion.String()}},
+			&handler.TypedEnqueueRequestForObject[*cephv1.CephCluster]{},
+			cephClusterPredicate(ctx, mgr.GetClient(), opConfig.OperatorNamespace),
+		),
+	)
+	if err != nil {
+		return err
+	}
+
+	err = csiopv1.AddToScheme(mgr.GetScheme())
 	if err != nil {
 		return err
 	}
@@ -92,10 +133,11 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	return nil
 }
 
-// Reconcile reads that state of the operator config map and makes changes based on the state read
+// Reconcile reads the state of the operator config map and makes changes based on the state read
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileCSI) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	reconcileResponse, err := r.reconcile(request)
 	if err != nil {
@@ -106,61 +148,10 @@ func (r *ReconcileCSI) Reconcile(context context.Context, request reconcile.Requ
 }
 
 func (r *ReconcileCSI) reconcile(request reconcile.Request) (reconcile.Result, error) {
-	// See if there is a CephCluster
-	cephClusters := &cephv1.CephClusterList{}
-	err := r.client.List(r.opManagerContext, cephClusters, &client.ListOptions{})
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debug("no ceph cluster found not deploying ceph csi driver")
-			return reconcile.Result{}, nil
-		}
-		// Error reading the object - requeue the request.
-		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to list ceph clusters")
-	}
+	// reconcileResult is used to communicate the result of the reconciliation back to the caller
+	var reconcileResult reconcile.Result
 
-	// // Do not nothing if no ceph cluster is present
-	if len(cephClusters.Items) == 0 {
-		logger.Debug("no ceph cluster found not deploying ceph csi driver")
-		return reconcile.Result{}, nil
-	} else {
-		for _, cluster := range cephClusters.Items {
-			if !cluster.DeletionTimestamp.IsZero() {
-				logger.Debug("ceph cluster is being deleting, no need to reconcile the csi driver")
-				return reconcile.Result{}, nil
-			}
-
-			if !cluster.Spec.External.Enable && cluster.Spec.CleanupPolicy.HasDataDirCleanPolicy() {
-				logger.Debug("ceph cluster has cleanup policy, the cluster will soon go away, no need to reconcile the csi driver")
-				return reconcile.Result{}, nil
-			}
-		}
-	}
-
-	// Fetch the operator's configmap. We force the NamespaceName to the operator since the request
-	// could be a CephCluster. If so the NamespaceName will be the one from the cluster and thus the
-	// CM won't be found
-	opNamespaceName := types.NamespacedName{Name: opcontroller.OperatorSettingConfigMapName, Namespace: r.opConfig.OperatorNamespace}
-	opConfig := &v1.ConfigMap{}
-	err = r.client.Get(r.opManagerContext, opNamespaceName, opConfig)
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debug("operator's configmap resource not found. will use default value or env var.")
-			r.opConfig.Parameters = make(map[string]string)
-		} else {
-			// Error reading the object - requeue the request.
-			return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to get operator's configmap")
-		}
-	} else {
-		// Populate the operator's config
-		r.opConfig.Parameters = opConfig.Data
-	}
-
-	serverVersion, err := r.context.Clientset.Discovery().ServerVersion()
-	if err != nil {
-		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to get server version")
-	}
-
-	ownerRef, err := k8sutil.GetDeploymentOwnerReference(r.context.Clientset, os.Getenv(k8sutil.PodNameEnvVar), r.opConfig.OperatorNamespace)
+	ownerRef, err := k8sutil.GetDeploymentOwnerReference(r.opManagerContext, r.context.Clientset, os.Getenv(k8sutil.PodNameEnvVar), r.opConfig.OperatorNamespace)
 	if err != nil {
 		logger.Warningf("could not find deployment owner reference to assign to csi drivers. %v", err)
 	}
@@ -170,22 +161,100 @@ func (r *ReconcileCSI) reconcile(request reconcile.Request) (reconcile.Result, e
 	}
 
 	ownerInfo := k8sutil.NewOwnerInfoWithOwnerRef(ownerRef, r.opConfig.OperatorNamespace)
-	// create an empty config map. config map will be filled with data
-	// later when clusters have mons
-	err = CreateCsiConfigMap(r.opConfig.OperatorNamespace, r.context.Clientset, ownerInfo)
+	err = CreateCsiConfigMap(r.opManagerContext, r.opConfig.OperatorNamespace, r.context.Clientset, ownerInfo)
 	if err != nil {
 		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed creating csi config map")
 	}
 
-	err = peermap.CreateOrUpdateConfig(r.context, &peermap.PeerIDMappings{})
+	if err := k8sutil.ApplyOperatorSettingsConfigmap(r.opManagerContext, r.context.Clientset); err != nil {
+		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to apply operator settings configmap")
+	}
+
+	r.resetStaleCSIImageSetConfigMap()
+
+	// Set driver names based on operator namespace
+	driverPrefix := fmt.Sprintf("%s.", r.opConfig.OperatorNamespace)
+	CephFSDriverName = driverPrefix + cephFSDriverSuffix
+	RBDDriverName = driverPrefix + rbdDriverSuffix
+
+	// See if there is a CephCluster
+	cephClusters := &cephv1.CephClusterList{}
+	err = r.client.List(r.opManagerContext, cephClusters, &client.ListOptions{})
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			logger.Debug("no ceph cluster found not deploying ceph csi driver")
+			return reconcile.Result{}, nil
+		}
+		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to list ceph clusters")
+	}
+
+	if len(cephClusters.Items) == 0 {
+		logger.Debug("no ceph cluster found not deploying ceph csi driver")
+		return reconcile.Result{}, nil
+	}
+
+	err = peermap.CreateOrUpdateConfig(r.opManagerContext, r.context, &peermap.PeerIDMappings{})
 	if err != nil {
 		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to create pool ID mapping config map")
 	}
 
-	err = r.validateAndConfigureDrivers(serverVersion, ownerInfo)
-	if err != nil {
-		return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed configure ceph csi")
+	for i, cluster := range cephClusters.Items {
+		if !cluster.DeletionTimestamp.IsZero() {
+			logger.Debugf("ceph cluster %q is being deleting, no need to reconcile the csi driver", request.NamespacedName)
+			return reconcile.Result{}, nil
+		}
+
+		if !cluster.Spec.External.Enable && cluster.Spec.CleanupPolicy.HasDataDirCleanPolicy() {
+			logger.Debugf("ceph cluster %q has cleanup policy, the cluster will soon go away, no need to reconcile the csi driver", cluster.Name)
+			return reconcile.Result{}, nil
+		}
+
+		if r.firstCephCluster == nil {
+			r.firstCephCluster = &cephClusters.Items[i].Spec
+		}
+
+		clusterInfo, _, _, err := opcontroller.LoadClusterInfo(r.context, r.opManagerContext, cluster.Namespace, &cephClusters.Items[i].Spec)
+		if err != nil {
+			if errors.Is(err, opcontroller.ClusterInfoNoClusterNoSecret) {
+				logger.Infof("cluster info for cluster %q is not ready yet, will retry in %s, proceeding with ready clusters", cluster.Name, opcontroller.WaitForRequeueIfCephClusterNotReady.RequeueAfter.String())
+				reconcileResult = opcontroller.WaitForRequeueIfCephClusterNotReady
+				continue
+			}
+			return opcontroller.ImmediateRetryResult, errors.Wrapf(err, "failed to load cluster info for cluster %q", cluster.Name)
+		}
+		clusterInfo.OwnerInfo = k8sutil.NewOwnerInfo(&cephClusters.Items[i], r.scheme)
 	}
 
-	return reconcile.Result{}, nil
+	return reconcileResult, nil
+}
+
+// resetStaleCSIImageSetConfigMap resets the image-set configmap values to empty if it
+// detects stale v1.20 defaults. This is a one-time migration for manifest-based
+// upgrades from v1.20 to v1.21. After the first reset, this function becomes a no-op.
+func (r *ReconcileCSI) resetStaleCSIImageSetConfigMap() {
+	ns := r.opConfig.OperatorNamespace
+	cm, err := r.context.Clientset.CoreV1().ConfigMaps(ns).Get(r.opManagerContext, csiImageSetConfigMapName, metav1.GetOptions{})
+	if err != nil {
+		if kerrors.IsNotFound(err) {
+			logger.Debugf("configmap %q not found, skipping stale image check", csiImageSetConfigMapName)
+			return
+		}
+		logger.Warningf("failed to get configmap %q for stale image check: %v", csiImageSetConfigMapName, err)
+		return
+	}
+
+	pluginImage, ok := cm.Data["plugin"]
+	if !ok || !strings.HasPrefix(pluginImage, staleV120CephCSIImage) {
+		return
+	}
+
+	logger.Infof("detected stale v1.20 CSI images in configmap %q, resetting to empty so ceph-csi-operator uses its defaults", csiImageSetConfigMapName)
+	for key := range cm.Data {
+		cm.Data[key] = ""
+	}
+
+	_, err = r.context.Clientset.CoreV1().ConfigMaps(ns).Update(r.opManagerContext, cm, metav1.UpdateOptions{})
+	if err != nil {
+		logger.Warningf("failed to reset stale configmap %q: %v", csiImageSetConfigMapName, err)
+	}
 }

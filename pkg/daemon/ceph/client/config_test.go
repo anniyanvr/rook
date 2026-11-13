@@ -17,9 +17,6 @@ limitations under the License.
 package client
 
 import (
-	"context"
-	"io/ioutil"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -31,7 +28,6 @@ import (
 
 	"github.com/go-ini/ini"
 	"github.com/rook/rook/pkg/clusterd"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -40,11 +36,10 @@ func TestCreateDefaultCephConfig(t *testing.T) {
 		FSID:          "id",
 		MonitorSecret: "monsecret",
 		Namespace:     "foo-cluster",
-		Monitors: map[string]*MonInfo{
+		InternalMonitors: map[string]*MonInfo{
 			"node0": {Name: "mon0", Endpoint: "10.0.0.1:6789"},
 			"node1": {Name: "mon1", Endpoint: "10.0.0.2:6789"},
 		},
-		CephVersion: cephver.Octopus,
 	}
 
 	// start with INFO level logging
@@ -64,13 +59,9 @@ func TestCreateDefaultCephConfig(t *testing.T) {
 }
 
 func TestGenerateConfigFile(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	// set up a temporary config directory that will be cleaned up after test
-	configDir, err := ioutil.TempDir("", "TestGenerateConfigFile")
-	if err != nil {
-		t.Fatalf("failed to create temp config dir: %+v", err)
-	}
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 
 	// create mocked cluster context and info
 	clientset := test.New(t, 3)
@@ -90,23 +81,22 @@ func TestGenerateConfigFile(t *testing.T) {
 		},
 		Data: data,
 	}
-	_, err = clientset.CoreV1().ConfigMaps(ns).Create(ctx, cm, metav1.CreateOptions{})
+	_, err := clientset.CoreV1().ConfigMaps(ns).Create(ctx, cm, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	clusterInfo := &ClusterInfo{
 		FSID:          "myfsid",
 		MonitorSecret: "monsecret",
 		Namespace:     ns,
-		Monitors: map[string]*MonInfo{
+		InternalMonitors: map[string]*MonInfo{
 			"node0": {Name: "mon0", Endpoint: "10.0.0.1:6789"},
 		},
-		CephVersion: cephver.Octopus,
-		CephCred:    CephCred{Username: "admin", Secret: "mysecret"},
-		Context:     ctx,
+		CephCred: CephCred{Username: "admin", Secret: "mysecret"},
+		Context:  ctx,
 	}
 
-	isInitialized := clusterInfo.IsInitialized(true)
-	assert.True(t, isInitialized)
+	isInitialized := clusterInfo.IsInitialized()
+	assert.NoError(t, isInitialized)
 
 	// generate the config file to disk now
 	configFilePath, err := generateConfigFile(context, clusterInfo, configDir, filepath.Join(configDir, "mykeyring"), nil, nil)
@@ -121,12 +111,12 @@ func TestGenerateConfigFile(t *testing.T) {
 }
 
 func verifyConfig(t *testing.T, cephConfig *CephConfig, cluster *ClusterInfo, loggingLevel int) {
-	monMembers := make([]string, len(cluster.Monitors))
+	monMembers := make([]string, len(cluster.InternalMonitors))
 	i := 0
-	for _, expectedMon := range cluster.Monitors {
+	for _, expectedMon := range cluster.InternalMonitors {
 		contained := false
 		monMembers[i] = expectedMon.Name
-		for _, actualMon := range strings.Split(cephConfig.MonMembers, " ") {
+		for actualMon := range strings.SplitSeq(cephConfig.MonMembers, " ") {
 			if expectedMon.Name == actualMon {
 				contained = true
 				break
@@ -140,9 +130,9 @@ func verifyConfig(t *testing.T, cephConfig *CephConfig, cluster *ClusterInfo, lo
 
 	expectedMons := "[v2:10.0.0.1:3300,v1:10.0.0.1:6789],[v2:10.0.0.2:3300,v1:10.0.0.2:6789]"
 
-	for _, expectedMon := range strings.Split(expectedMons, ",") {
+	for expectedMon := range strings.SplitSeq(expectedMons, ",") {
 		contained := false
-		for _, actualMon := range strings.Split(cephConfig.MonHost, ",") {
+		for actualMon := range strings.SplitSeq(cephConfig.MonHost, ",") {
 			if expectedMon == actualMon {
 				contained = true
 				break

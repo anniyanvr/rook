@@ -26,7 +26,7 @@ import (
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
+	"github.com/rook/rook/pkg/util/log"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -54,36 +54,36 @@ func (r *ReconcileCephRBDMirror) generateKeyring(clusterInfo *client.ClusterInfo
 	access := []string{"mon", "profile rbd-mirror", "osd", "profile rbd"}
 	s := keyring.GetSecretStore(r.context, clusterInfo, daemonConfig.ownerInfo)
 
-	key, err := s.GenerateKey(user, access)
+	keyType := cephv1.CephxKeyTypeUndefined // daemon key type always takes the default from setDefaultCephxKeyType()
+	key, err := s.GenerateKey(user, keyType, access)
 	if err != nil {
 		return "", err
 	}
 
-	// Delete legacy key store for upgrade from Rook v0.9.x to v1.0.x
-	err = r.context.Clientset.CoreV1().Secrets(clusterInfo.Namespace).Delete(r.opManagerContext, daemonConfig.ResourceName, metav1.DeleteOptions{})
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debugf("legacy rbd-mirror key %q is already removed", daemonConfig.ResourceName)
-		} else {
-			logger.Warningf("legacy rbd-mirror key %q could not be removed. %v", daemonConfig.ResourceName, err)
+	if r.shouldRotateCephxKeys {
+		log.NamespacedInfo(clusterInfo.Namespace, logger, "rotating cephx key for CephRBDMirror %q in the namespace %q", daemonConfig.ResourceName, clusterInfo.Namespace)
+		newKey, err := s.RotateKey(user, keyType)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to rotate cephx key for CephRDBMirror %q in the namespace %q", daemonConfig.ResourceName, clusterInfo.Namespace)
 		}
+		key = newKey
 	}
 
 	keyring := fmt.Sprintf(keyringTemplate, daemonConfig.DaemonID, key)
-	return keyring, s.CreateOrUpdate(daemonConfig.ResourceName, keyring)
+	return s.CreateOrUpdate(daemonConfig.ResourceName, keyring)
 }
 
 func fullDaemonName(daemonID string) string {
 	return fmt.Sprintf("client.rbd-mirror.%s", daemonID)
 }
 
-func (r *ReconcileCephRBDMirror) reconcileAddBoostrapPeer(cephRBDMirror *cephv1.CephRBDMirror, namespacedName types.NamespacedName) (reconcile.Result, error) {
-	// List all the peers secret, we can have more than one peer we might want to configure
+func (r *ReconcileCephRBDMirror) reconcileAddBootstrapPeer(cephRBDMirror *cephv1.CephRBDMirror, namespacedName types.NamespacedName) (reconcile.Result, error) {
+	// List all the peer secrets, we can have more than one peer we might want to configure
 	// For each, get the Kubernetes Secret and import the "peer token" so that we can configure the mirroring
 
-	logger.Warning("(DEPRECATED) use of peer secret names in CephRBDMirror is deprecated. Please use CephBlockPool CR to configure peer secret names and import peers.")
+	log.NamespacedWarning(cephRBDMirror.Namespace, logger, "(DEPRECATED) use of peer secret names in CephRBDMirror is deprecated. Please use CephBlockPool CR to configure peer secret names and import peers.")
 	for _, peerSecret := range cephRBDMirror.Spec.Peers.SecretNames {
-		logger.Debugf("fetching bootstrap peer kubernetes secret %q", peerSecret)
+		log.NamespacedDebug(cephRBDMirror.Namespace, logger, "fetching bootstrap peer kubernetes secret %q", peerSecret)
 		s, err := r.context.Clientset.CoreV1().Secrets(r.clusterInfo.Namespace).Get(r.opManagerContext, peerSecret, metav1.GetOptions{})
 		// We don't care about IsNotFound here, we still need to fail
 		if err != nil {

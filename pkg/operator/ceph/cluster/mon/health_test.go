@@ -19,19 +19,20 @@ package mon
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"maps"
 	"os"
 	"reflect"
-	"sync"
 	"testing"
 	"time"
 
+	csiopv1 "github.com/ceph/ceph-csi-operator/api/v1"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	clienttest "github.com/rook/rook/pkg/daemon/ceph/client/test"
 	"github.com/rook/rook/pkg/operator/ceph/config"
-	"github.com/rook/rook/pkg/operator/ceph/version"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	testopk8s "github.com/rook/rook/pkg/operator/k8sutil/test"
 	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
@@ -40,11 +41,14 @@ import (
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestCheckHealth(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	var deploymentsUpdated *[]*apps.Deployment
 	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
 
@@ -57,31 +61,35 @@ func TestCheckHealth(t *testing.T) {
 			return clienttest.MonInQuorumResponse(), nil
 		},
 	}
+	objects := []runtime.Object{
+		getCephCluster("default", "default"),
+	}
+	client := getClient(t, objects...)
 	clientset := test.New(t, 1)
-	configDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 	context := &clusterd.Context{
 		Clientset: clientset,
 		ConfigDir: configDir,
 		Executor:  executor,
+		Client:    client,
 	}
+
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	// clusterInfo is nil so we return err
-	err := c.checkHealth()
+	err := c.checkHealth(ctx)
 	assert.NotNil(t, err)
 
 	setCommonMonProperties(c, 1, cephv1.MonSpec{Count: 0, AllowMultiplePerNode: true}, "myversion")
 	// mon count is 0 so we return err
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.NotNil(t, err)
 
 	c.spec.Mon.Count = 3
-	logger.Infof("initial mons: %v", c.ClusterInfo.Monitors)
+	logger.Infof("initial mons: %v", c.ClusterInfo.InternalMonitors)
 	c.waitForStart = false
-	defer os.RemoveAll(c.context.ConfigDir)
 
-	c.mapping.Schedule["f"] = &MonScheduleInfo{
+	c.mapping.Schedule["f"] = &opcontroller.MonScheduleInfo{
 		Name:    "node0",
 		Address: "",
 	}
@@ -94,9 +102,10 @@ func TestCheckHealth(t *testing.T) {
 	}
 
 	c.ClusterInfo.Context = ctx
-	err = c.checkHealth()
+
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
-	logger.Infof("mons after checkHealth: %v", c.ClusterInfo.Monitors)
+	logger.Infof("mons after checkHealth: %v", c.ClusterInfo.InternalMonitors)
 	assert.ElementsMatch(t, []string{"rook-ceph-mon-a", "rook-ceph-mon-f"}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
 	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
 
@@ -109,8 +118,8 @@ func TestCheckHealth(t *testing.T) {
 		"g",
 	}
 	for _, monName := range newMons {
-		_, ok := c.ClusterInfo.Monitors[monName]
-		assert.True(t, ok, fmt.Sprintf("mon %s not found in monitor list. %v", monName, c.ClusterInfo.Monitors))
+		_, ok := c.ClusterInfo.InternalMonitors[monName]
+		assert.True(t, ok, fmt.Sprintf("mon %s not found in monitor list. %v", monName, c.ClusterInfo.InternalMonitors))
 	}
 
 	deployments, err := clientset.AppsV1().Deployments(c.Namespace).List(ctx, metav1.ListOptions{})
@@ -124,7 +133,7 @@ func TestCheckHealth(t *testing.T) {
 	// Check that their PVCs are not garbage collected after we create fake PVCs
 	badMon := "c"
 	goodMons := []string{"a", "g", "h"}
-	c.spec.Mon.VolumeClaimTemplate = &v1.PersistentVolumeClaim{}
+	c.spec.Mon.VolumeClaimTemplate = &cephv1.VolumeClaimTemplate{}
 	for _, name := range append(goodMons, badMon) {
 		m := &monConfig{ResourceName: "rook-ceph-mon-" + name, DaemonName: name}
 		pvc, err := c.makeDeploymentPVC(m, true)
@@ -154,54 +163,173 @@ func TestCheckHealth(t *testing.T) {
 	}
 }
 
-func TestSkipMonFailover(t *testing.T) {
-	c := New(&clusterd.Context{}, "ns", cephv1.ClusterSpec{}, nil, nil)
-	c.ClusterInfo = clienttest.CreateTestClusterInfo(1)
-	monName := "arb"
+func TestRemoveExtraMon(t *testing.T) {
+	endpoint := "1.2.3.4:6789"
+	c := &Cluster{mapping: &opcontroller.Mapping{}}
+	c.ClusterInfo = &cephclient.ClusterInfo{InternalMonitors: map[string]*cephclient.MonInfo{
+		"a": {Name: "a", Endpoint: endpoint},
+		"b": {Name: "b", Endpoint: endpoint},
+		"c": {Name: "c", Endpoint: endpoint},
+		"d": {Name: "d", Endpoint: endpoint},
+	}}
+	c.mapping.Schedule = map[string]*opcontroller.MonScheduleInfo{
+		"a": {Name: "node1"},
+		"b": {Name: "node2"},
+		"c": {Name: "node3"},
+		"d": {Name: "node1"},
+	}
+	// Remove an extra mon on the same node
+	removedMon := c.determineExtraMonToRemove()
+	if removedMon != "a" && removedMon != "d" {
+		assert.Fail(t, fmt.Sprintf("removed mon %q instead of a or d", removedMon))
+	}
 
-	t.Run("don't skip failover for non-stretch", func(t *testing.T) {
-		assert.NoError(t, c.allowFailover(monName))
-	})
+	// Remove an arbitrary mon when they are all on different nodes
+	c.mapping.Schedule["d"].Name = "node4"
+	removedMon = c.determineExtraMonToRemove()
+	assert.NotEqual(t, "", removedMon)
 
-	t.Run("don't skip failover for non-arbiter", func(t *testing.T) {
-		c.spec.Mon.Count = 5
-		c.spec.Mon.StretchCluster = &cephv1.StretchClusterSpec{
-			Zones: []cephv1.StretchClusterZoneSpec{
-				{Name: "a"},
-				{Name: "b"},
-				{Name: "c", Arbiter: true},
-			},
-		}
+	// Don't remove any extra mon from a proper stretch cluster
+	c.spec.Mon.StretchCluster = &cephv1.StretchClusterSpec{Zones: []cephv1.MonZoneSpec{
+		{Name: "x", Arbiter: true},
+		{Name: "y"},
+		{Name: "z"},
+	}}
+	c.ClusterInfo.InternalMonitors["e"] = &cephclient.MonInfo{Name: "e", Endpoint: endpoint}
+	c.mapping.Schedule["a"].Zone = "x"
+	c.mapping.Schedule["b"].Zone = "y"
+	c.mapping.Schedule["c"].Zone = "y"
+	c.mapping.Schedule["d"].Zone = "z"
+	c.mapping.Schedule["e"] = &opcontroller.MonScheduleInfo{Name: "node5", Zone: "z"}
+	removedMon = c.determineExtraMonToRemove()
+	assert.Equal(t, "", removedMon)
 
-		assert.NoError(t, c.allowFailover(monName))
-	})
+	// Remove an extra mon from the arbiter zone
+	c.mapping.Schedule["d"].Zone = "x"
+	removedMon = c.determineExtraMonToRemove()
+	if removedMon != "a" && removedMon != "d" {
+		assert.Fail(t, "removed mon %q instead of a or d from the arbiter zone", removedMon)
+	}
 
-	t.Run("skip failover for arbiter if an older version of ceph", func(t *testing.T) {
-		c.arbiterMon = monName
-		c.ClusterInfo.CephVersion = version.CephVersion{Major: 16, Minor: 2, Extra: 6}
-		assert.Error(t, c.allowFailover(monName))
-	})
+	// Remove an extra mon from a non-arbiter zone
+	c.mapping.Schedule["d"].Zone = "y"
+	removedMon = c.determineExtraMonToRemove()
+	if removedMon != "b" && removedMon != "c" && removedMon != "d" {
+		assert.Fail(t, fmt.Sprintf("removed mon %q instead of b, c, or d from the non-arbiter zone", removedMon))
+	}
+}
 
-	t.Run("don't skip failover for arbiter if a newer version of ceph", func(t *testing.T) {
-		c.ClusterInfo.CephVersion = version.CephVersion{Major: 16, Minor: 2, Extra: 7}
-		assert.NoError(t, c.allowFailover(monName))
-	})
+func TestScheduleFailoverImmediately(t *testing.T) {
+	clientset := test.New(t, 1)
+	c := &Cluster{mapping: &opcontroller.Mapping{}, context: &clusterd.Context{Clientset: clientset}}
+	c.mapping.Schedule = map[string]*opcontroller.MonScheduleInfo{
+		"a": {Name: "a", Hostname: "nodea"},
+		"b": {Name: "b"},
+		"c": {Name: "c", Hostname: "nodec"},
+	}
+
+	node := &v1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:   "a",
+			Labels: map[string]string{"kubernetes.io/hostname": "nodea"},
+		},
+	}
+	_, err := clientset.CoreV1().Nodes().Create(t.Context(), node, metav1.CreateOptions{})
+	assert.NoError(t, err)
+
+	// mon a is assigned to a node, so it should not failover immediately
+	assert.False(t, c.shouldFailoverMonImmediately((t.Context()), "a"))
+	// mon b is not assigned to a node, so it should not failover immediately
+	assert.False(t, c.shouldFailoverMonImmediately((t.Context()), "b"))
+	// mon c is assigned to a non-existent node, so it should failover immediately
+	assert.True(t, c.shouldFailoverMonImmediately((t.Context()), "c"))
+	// Test that the function detects node deletion when called repeatedly
+	err = clientset.CoreV1().Nodes().Delete(t.Context(), "a", metav1.DeleteOptions{})
+	assert.NoError(t, err)
+	// node a has been deleted, so mon a should failover immediately
+	assert.True(t, c.shouldFailoverMonImmediately((t.Context()), "a"))
+}
+
+func TestTrackMonsOutOfQuorum(t *testing.T) {
+	endpoint := "1.2.3.4:6789"
+	clientset := test.New(t, 1)
+	tempDir, err := os.MkdirTemp("", "")
+	assert.NoError(t, err)
+	defer os.RemoveAll(tempDir)
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := &Cluster{
+		mapping:   &opcontroller.Mapping{},
+		context:   &clusterd.Context{Clientset: clientset, ConfigDir: tempDir},
+		ownerInfo: ownerInfo,
+		Namespace: "ns",
+	}
+	c.ClusterInfo = &cephclient.ClusterInfo{InternalMonitors: map[string]*cephclient.MonInfo{
+		"a": {Name: "a", Endpoint: endpoint},
+		"b": {Name: "b", Endpoint: endpoint},
+		"c": {Name: "c", Endpoint: endpoint},
+	}}
+	// No change since all mons are in quorum
+	updated, err := c.trackMonInOrOutOfQuorum("a", true)
+	assert.False(t, updated)
+	assert.NoError(t, err)
+
+	// initialize the configmap
+	err = c.persistExpectedMonDaemonsInConfigMap()
+	assert.NoError(t, err)
+
+	// Track mon.a as out of quorum
+	updated, err = c.trackMonInOrOutOfQuorum("a", false)
+	assert.True(t, updated)
+	assert.NoError(t, err)
+
+	cm, err := clientset.CoreV1().ConfigMaps(c.Namespace).Get(t.Context(), EndpointConfigMapName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, "a", cm.Data[opcontroller.OutOfQuorumKey])
+
+	// Put mon.a back in quorum
+	updated, err = c.trackMonInOrOutOfQuorum("a", true)
+	assert.True(t, updated)
+	assert.NoError(t, err)
+
+	cm, err = clientset.CoreV1().ConfigMaps(c.Namespace).Get(t.Context(), EndpointConfigMapName, metav1.GetOptions{})
+	assert.NoError(t, err)
+	assert.Equal(t, "", cm.Data[opcontroller.OutOfQuorumKey])
 }
 
 func TestEvictMonOnSameNode(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	clientset := test.New(t, 1)
-	configDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 	executor := &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
 			logger.Infof("executing command: %s %+v", command, args)
 			return "{\"key\":\"mysecurekey\"}", nil
 		},
 	}
-	context := &clusterd.Context{Clientset: clientset, ConfigDir: configDir, Executor: executor}
+
+	fakeCluster := &cephv1.CephCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "default",
+		},
+		Spec: cephv1.ClusterSpec{
+			Security: cephv1.ClusterSecuritySpec{
+				CephX: cephv1.ClusterCephxConfig{
+					RBDMirrorPeer: cephv1.CephxConfig{},
+				},
+			},
+		},
+		Status: cephv1.ClusterStatus{
+			Cephx: cephv1.ClusterCephxStatus{
+				RBDMirrorPeer: cephv1.CephxStatus{},
+			},
+		},
+	}
+
+	client := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithRuntimeObjects(fakeCluster).Build()
+	context := &clusterd.Context{Clientset: clientset, Client: client, ConfigDir: configDir, Executor: executor}
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	setCommonMonProperties(c, 1, cephv1.MonSpec{Count: 0}, "myversion")
 	c.maxMonID = 2
 	c.waitForStart = false
@@ -220,7 +348,7 @@ func TestEvictMonOnSameNode(t *testing.T) {
 	// Create a second mon on a different node
 	createTestMonPod(t, clientset, c, "b", "node2")
 
-	// Nothing to evict with where mons are on different nodes
+	// Nothing to evict where mons are on different nodes
 	err = c.evictMonIfMultipleOnSameNode()
 	assert.NoError(t, err)
 
@@ -237,6 +365,34 @@ func TestEvictMonOnSameNode(t *testing.T) {
 	assert.Equal(t, 3, c.maxMonID)
 }
 
+func TestHostNetworkFailover(t *testing.T) {
+	ctx := t.Context()
+	context := &clusterd.Context{}
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
+
+	t.Run("should stop mon on default network", func(t *testing.T) {
+		assert.True(t, c.stopMonDuringFailover("a"))
+	})
+
+	t.Run("should not stop mon on host network", func(t *testing.T) {
+		c.spec.Network.Provider = "host"
+		assert.False(t, c.stopMonDuringFailover("a"))
+	})
+
+	t.Run("should stop mon converting to host network", func(t *testing.T) {
+		c.spec.Network.Provider = "host"
+		c.monsToFailover["a"] = &monConfig{UseHostNetwork: false}
+		assert.True(t, c.stopMonDuringFailover("a"))
+	})
+
+	t.Run("should stop mon converting from host network", func(t *testing.T) {
+		c.spec.Network.Provider = ""
+		c.monsToFailover["a"] = &monConfig{UseHostNetwork: true}
+		assert.True(t, c.stopMonDuringFailover("a"))
+	})
+}
+
 func createTestMonPod(t *testing.T, clientset kubernetes.Interface, c *Cluster, name, node string) {
 	m := &monConfig{ResourceName: resourceName(name), DaemonName: name, DataPathMap: &config.DataPathMap{}}
 	d, err := c.makeDeployment(m, false)
@@ -247,21 +403,21 @@ func createTestMonPod(t *testing.T, clientset kubernetes.Interface, c *Cluster, 
 	}
 	monPod.Spec.NodeName = node
 	monPod.Status.Phase = v1.PodRunning
-	_, err = clientset.CoreV1().Pods(c.Namespace).Create(context.TODO(), monPod, metav1.CreateOptions{})
+	_, err = clientset.CoreV1().Pods(c.Namespace).Create(t.Context(), monPod, metav1.CreateOptions{})
 	assert.NoError(t, err)
 }
 
 func TestScaleMonDeployment(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	clientset := test.New(t, 1)
 	context := &clusterd.Context{Clientset: clientset}
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	setCommonMonProperties(c, 1, cephv1.MonSpec{Count: 0, AllowMultiplePerNode: true}, "myversion")
 
 	name := "a"
 	c.spec.Mon.Count = 3
-	logger.Infof("initial mons: %v", c.ClusterInfo.Monitors[name])
+	logger.Infof("initial mons: %v", c.ClusterInfo.InternalMonitors[name])
 	monConfig := &monConfig{ResourceName: resourceName(name), DaemonName: name, DataPathMap: &config.DataPathMap{}}
 	d, err := c.makeDeployment(monConfig, false)
 	require.NoError(t, err)
@@ -285,7 +441,7 @@ func verifyMonReplicas(ctx context.Context, t *testing.T, c *Cluster, name strin
 }
 
 func TestCheckHealthNotFound(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	var deploymentsUpdated *[]*apps.Deployment
 	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
 
@@ -298,24 +454,34 @@ func TestCheckHealthNotFound(t *testing.T) {
 			return clienttest.MonInQuorumResponse(), nil
 		},
 	}
+
+	objects := []runtime.Object{
+		getCephCluster("default", "default"),
+	}
+	client := getClient(t, objects...)
 	clientset := test.New(t, 1)
-	configDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 	context := &clusterd.Context{
 		Clientset: clientset,
 		ConfigDir: configDir,
 		Executor:  executor,
+		Client:    client,
 	}
+	// mock out the scheduler to return node0
+	waitForMonitorScheduling = func(c *Cluster, d *apps.Deployment) (SchedulingResult, error) {
+		node, _ := clientset.CoreV1().Nodes().Get(ctx, "node0", metav1.GetOptions{})
+		return SchedulingResult{Node: node}, nil
+	}
+
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	setCommonMonProperties(c, 2, cephv1.MonSpec{Count: 3, AllowMultiplePerNode: true}, "myversion")
 	c.waitForStart = false
-	defer os.RemoveAll(c.context.ConfigDir)
 
-	c.mapping.Schedule["a"] = &MonScheduleInfo{
+	c.mapping.Schedule["a"] = &opcontroller.MonScheduleInfo{
 		Name: "node0",
 	}
-	c.mapping.Schedule["b"] = &MonScheduleInfo{
+	c.mapping.Schedule["b"] = &opcontroller.MonScheduleInfo{
 		Name: "node0",
 	}
 	c.maxMonID = 4
@@ -326,13 +492,13 @@ func TestCheckHealthNotFound(t *testing.T) {
 	// Check if the two mons are found in the configmap
 	cm, err := c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
 	assert.Nil(t, err)
-	if cm.Data[EndpointDataKey] != "a=1.2.3.1:6789,b=1.2.3.2:6789" {
-		assert.Equal(t, "b=1.2.3.2:6789,a=1.2.3.1:6789", cm.Data[EndpointDataKey])
+	if cm.Data[EndpointDataKey] != "a=1.2.3.1:3300,b=1.2.3.2:3300" {
+		assert.Equal(t, "b=1.2.3.2:3300,a=1.2.3.1:3300", cm.Data[EndpointDataKey])
 	}
 
 	// Because the mon a isn't in the MonInQuorumResponse() this will create a new mon
 	delete(c.mapping.Schedule, "b")
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
 	// No updates in unit tests w/ workaround
 	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
@@ -341,12 +507,13 @@ func TestCheckHealthNotFound(t *testing.T) {
 	// recheck that the "not found" mon has been replaced with a new one
 	cm, err = c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
 	assert.Nil(t, err)
-	if cm.Data[EndpointDataKey] != "a=1.2.3.1:6789,f=:6789" {
-		assert.Equal(t, "f=:6789,a=1.2.3.1:6789", cm.Data[EndpointDataKey])
+	if cm.Data[EndpointDataKey] != "a=1.2.3.1:3300,f=:6789" {
+		assert.Equal(t, "f=:6789,a=1.2.3.1:3300", cm.Data[EndpointDataKey])
 	}
 }
 
 func TestAddRemoveMons(t *testing.T) {
+	ctx := t.Context()
 	var deploymentsUpdated *[]*apps.Deployment
 	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
 
@@ -360,68 +527,79 @@ func TestAddRemoveMons(t *testing.T) {
 			return monQuorumResponse, nil
 		},
 	}
+
+	objects := []runtime.Object{
+		getCephCluster("default", "default"),
+	}
+	client := getClient(t, objects...)
 	clientset := test.New(t, 1)
-	configDir, _ := ioutil.TempDir("", "")
-	defer os.RemoveAll(configDir)
+	configDir := t.TempDir()
 	context := &clusterd.Context{
 		Clientset: clientset,
 		ConfigDir: configDir,
 		Executor:  executor,
+		Client:    client,
+	}
+
+	// mock out the scheduler to return node0
+	waitForMonitorScheduling = func(c *Cluster, d *apps.Deployment) (SchedulingResult, error) {
+		node, _ := clientset.CoreV1().Nodes().Get(ctx, "node0", metav1.GetOptions{})
+		return SchedulingResult{Node: node}, nil
 	}
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
-	c := New(context, "ns", cephv1.ClusterSpec{}, ownerInfo, &sync.Mutex{})
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
 	setCommonMonProperties(c, 0, cephv1.MonSpec{Count: 5, AllowMultiplePerNode: true}, "myversion")
 	c.maxMonID = 0 // "a" is max mon id
 	c.waitForStart = false
-	defer os.RemoveAll(c.context.ConfigDir)
 
 	// checking the health will increase the mons as desired all in one go
-	err := c.checkHealth()
+	err := c.checkHealth(ctx)
 	assert.Nil(t, err)
-	assert.Equal(t, 5, len(c.ClusterInfo.Monitors), fmt.Sprintf("mons: %v", c.ClusterInfo.Monitors))
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors), fmt.Sprintf("mons: %v", c.ClusterInfo.InternalMonitors))
 	assert.ElementsMatch(t, []string{
 		// b is created first, no updates
 		"rook-ceph-mon-b",                    // b updated when c created
 		"rook-ceph-mon-b", "rook-ceph-mon-c", // b and c updated when d created
 		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", // etc.
-		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", "rook-ceph-mon-e"},
+		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", "rook-ceph-mon-e",
+	},
 		testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
 	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
 
 	// reducing the mon count to 3 will reduce the mon count once each time we call checkHealth
-	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.Monitors)
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.InternalMonitors)
 	c.spec.Mon.Count = 3
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
-	assert.Equal(t, 4, len(c.ClusterInfo.Monitors))
+	assert.Equal(t, 4, len(c.ClusterInfo.InternalMonitors))
 	// No updates in unit tests w/ workaround
 	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
 	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
 
 	// after the second call we will be down to the expected count of 3
-	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.Monitors)
-	err = c.checkHealth()
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.InternalMonitors)
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
-	assert.Equal(t, 3, len(c.ClusterInfo.Monitors))
+	assert.Equal(t, 3, len(c.ClusterInfo.InternalMonitors))
 	// No updates in unit tests w/ workaround
 	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
 	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
 
 	// now attempt to reduce the mons down to quorum size 1
-	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.Monitors)
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.InternalMonitors)
 	c.spec.Mon.Count = 1
-	err = c.checkHealth()
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
-	assert.Equal(t, 2, len(c.ClusterInfo.Monitors))
+	assert.Equal(t, 2, len(c.ClusterInfo.InternalMonitors))
 	// No updates in unit tests w/ workaround
 	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
 	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
 
 	// cannot reduce from quorum size of 2 to 1
-	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.Monitors)
-	err = c.checkHealth()
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.InternalMonitors)
+	err = c.checkHealth(ctx)
 	assert.Nil(t, err)
-	assert.Equal(t, 2, len(c.ClusterInfo.Monitors))
+	assert.Equal(t, 2, len(c.ClusterInfo.InternalMonitors))
 	// No updates in unit tests w/ workaround
 	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
 	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
@@ -452,7 +630,7 @@ func TestAddOrRemoveExternalMonitor(t *testing.T) {
 	changed, err = c.addOrRemoveExternalMonitor(fakeResp)
 	assert.NoError(t, err)
 	assert.False(t, changed)
-	assert.Equal(t, 1, len(c.ClusterInfo.Monitors))
+	assert.Equal(t, 1, len(c.ClusterInfo.InternalMonitors))
 
 	//
 	// TEST 2
@@ -465,7 +643,7 @@ func TestAddOrRemoveExternalMonitor(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, changed)
 	// ClusterInfo should shrink to 1
-	assert.Equal(t, 1, len(c.ClusterInfo.Monitors))
+	assert.Equal(t, 1, len(c.ClusterInfo.InternalMonitors))
 
 	//
 	// TEST 3
@@ -486,7 +664,7 @@ func TestAddOrRemoveExternalMonitor(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, changed)
 	// ClusterInfo should now have 2 monitors
-	assert.Equal(t, 2, len(c.ClusterInfo.Monitors))
+	assert.Equal(t, 2, len(c.ClusterInfo.InternalMonitors))
 }
 
 func TestNewHealthChecker(t *testing.T) {
@@ -516,8 +694,7 @@ func TestUpdateMonTimeout(t *testing.T) {
 		assert.Equal(t, time.Minute*10, MonOutTimeout)
 	})
 	t.Run("using env var mon timeout", func(t *testing.T) {
-		os.Setenv("ROOK_MON_OUT_TIMEOUT", "10s")
-		defer os.Unsetenv("ROOK_MON_OUT_TIMEOUT")
+		t.Setenv("ROOK_MON_OUT_TIMEOUT", "10s")
 		m := &Cluster{}
 		updateMonTimeout(m)
 		assert.Equal(t, time.Second*10, MonOutTimeout)
@@ -537,8 +714,7 @@ func TestUpdateMonInterval(t *testing.T) {
 		assert.Equal(t, time.Second*45, HealthCheckInterval)
 	})
 	t.Run("using env var mon timeout", func(t *testing.T) {
-		os.Setenv("ROOK_MON_HEALTHCHECK_INTERVAL", "10s")
-		defer os.Unsetenv("ROOK_MON_HEALTHCHECK_INTERVAL")
+		t.Setenv("ROOK_MON_HEALTHCHECK_INTERVAL", "10s")
 		m := &Cluster{}
 		h := &HealthChecker{m, HealthCheckInterval}
 		updateMonInterval(m, h)
@@ -552,4 +728,620 @@ func TestUpdateMonInterval(t *testing.T) {
 		updateMonInterval(m, h)
 		assert.Equal(t, time.Minute, h.interval)
 	})
+}
+
+func Test_removeMonsFromQuorumStatusResponse(t *testing.T) {
+	type args struct {
+		quorumStatus cephclient.MonStatusResponse
+		idsToRemove  []string
+	}
+	tests := []struct {
+		name string
+		args args
+		want cephclient.MonStatusResponse
+	}{
+		{
+			name: "remove one mon",
+			args: args{
+				quorumStatus: cephclient.MonStatusResponse{
+					Quorum: []int{0, 1, 2},
+					MonMap: struct {
+						Mons []cephclient.MonMapEntry `json:"mons"`
+					}{
+						Mons: []cephclient.MonMapEntry{
+							{
+								Name: "a",
+								Rank: 0,
+							},
+							{
+								Name: "b",
+								Rank: 1,
+							},
+							{
+								Name: "c",
+								Rank: 2,
+							},
+						},
+					},
+				},
+				idsToRemove: []string{"b"},
+			},
+			want: cephclient.MonStatusResponse{
+				Quorum: []int{0, 2},
+				MonMap: struct {
+					Mons []cephclient.MonMapEntry `json:"mons"`
+				}{
+					Mons: []cephclient.MonMapEntry{
+						{
+							Name: "a",
+							Rank: 0,
+						},
+						{
+							Name: "c",
+							Rank: 2,
+						},
+					},
+				},
+			},
+		},
+		{
+			name: "not remove if not present",
+			args: args{
+				quorumStatus: cephclient.MonStatusResponse{
+					Quorum: []int{0, 1, 2},
+					MonMap: struct {
+						Mons []cephclient.MonMapEntry `json:"mons"`
+					}{
+						Mons: []cephclient.MonMapEntry{
+							{
+								Name: "a",
+								Rank: 0,
+							},
+							{
+								Name: "b",
+								Rank: 1,
+							},
+							{
+								Name: "c",
+								Rank: 2,
+							},
+						},
+					},
+				},
+				idsToRemove: []string{"e"},
+			},
+			want: cephclient.MonStatusResponse{
+				Quorum: []int{0, 1, 2},
+				MonMap: struct {
+					Mons []cephclient.MonMapEntry `json:"mons"`
+				}{
+					Mons: []cephclient.MonMapEntry{
+						{
+							Name: "a",
+							Rank: 0,
+						},
+						{
+							Name: "b",
+							Rank: 1,
+						},
+						{
+							Name: "c",
+							Rank: 2,
+						},
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := removeMonsFromQuorumStatusResponse(tt.args.quorumStatus, tt.args.idsToRemove); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("removeMonsFromQuorumStatusResponse() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestExternalMons_notInSpec_InQuorum(t *testing.T) {
+	// 1. setup test
+	ctx := t.Context()
+	var deploymentsUpdated *[]*apps.Deployment
+	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
+
+	monQuorumResponse := clienttest.MonInQuorumResponse()
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("executing command: %s %+v", command, args)
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return "{\"key\":\"mysecurekey\"}", nil
+			}
+			return monQuorumResponse, nil
+		},
+	}
+
+	fakeCluster := &cephv1.CephCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "default",
+			Namespace: "default",
+		},
+		Spec: cephv1.ClusterSpec{
+			Security: cephv1.ClusterSecuritySpec{
+				CephX: cephv1.ClusterCephxConfig{
+					RBDMirrorPeer: cephv1.CephxConfig{},
+				},
+			},
+		},
+		Status: cephv1.ClusterStatus{
+			Cephx: cephv1.ClusterCephxStatus{
+				RBDMirrorPeer: cephv1.CephxStatus{},
+			},
+		},
+	}
+
+	clientset := test.New(t, 1)
+	configDir := t.TempDir()
+	client := fake.NewClientBuilder().WithScheme(scheme.Scheme).WithRuntimeObjects(fakeCluster).Build()
+	context := &clusterd.Context{
+		Clientset: clientset,
+		ConfigDir: configDir,
+		Executor:  executor,
+		Client:    client,
+	}
+
+	// mock out the scheduler to return node0
+	waitForMonitorScheduling = func(c *Cluster, d *apps.Deployment) (SchedulingResult, error) {
+		node, _ := clientset.CoreV1().Nodes().Get(ctx, "node0", metav1.GetOptions{})
+		return SchedulingResult{Node: node}, nil
+	}
+
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
+	setCommonMonProperties(c, 0, cephv1.MonSpec{Count: 5, AllowMultiplePerNode: true}, "myversion")
+	c.maxMonID = 0 // "a" is max mon id
+	c.waitForStart = false
+
+	// checking the health will increase the mons as desired all in one go
+	err := c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors), fmt.Sprintf("mons: %v", c.ClusterInfo.InternalMonitors))
+	assert.ElementsMatch(t, []string{
+		// b is created first, no updates
+		"rook-ceph-mon-b",                    // b updated when c created
+		"rook-ceph-mon-b", "rook-ceph-mon-c", // b and c updated when d created
+		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", // etc.
+		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", "rook-ceph-mon-e",
+	},
+		testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	inital5Mons := make(map[string]*cephclient.MonInfo)
+	maps.Copy(inital5Mons, c.ClusterInfo.InternalMonitors)
+
+	// 2. add external mon to quorum but not in spec:
+
+	mons := make(map[string]*cephclient.MonInfo)
+	maps.Copy(mons, inital5Mons)
+	// add unknown mon to quorum:
+	mons["ext-mon-id"] = &cephclient.MonInfo{Name: "ext-mon-id", Endpoint: "0.0.0.0:6789"}
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(mons)
+
+	// internal mons and deployments have not changed
+	// and unknown mon was removed from quorum
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors))
+	assert.Empty(t, c.ClusterInfo.ExternalMons)
+
+	// No updates in unit tests w/ workaround
+	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that unknown mon is not in endpoint configmap
+	cm, err := c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Empty(t, cm.Data[EndpointExternalMonsKey])
+	monsFromCM := opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 5)
+	for id, mon := range monsFromCM {
+		assert.Equal(t, inital5Mons[id].Name, mon.Name)
+		assert.Equal(t, inital5Mons[id].Endpoint, mon.Endpoint)
+		assert.Equal(t, inital5Mons[id].OutOfQuorum, mon.OutOfQuorum)
+	}
+
+	// 3. downscale mons to 4:
+	c.spec.Mon.Count = 4
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.InternalMonitors)
+
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	// todo fix
+	assert.Equal(t, 4, len(c.ClusterInfo.InternalMonitors))
+	assert.Empty(t, c.ClusterInfo.ExternalMons)
+	// No updates in unit tests w/ workaround
+	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that unknown mon is not in endpoint configmap
+	cm, err = c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Empty(t, cm.Data[EndpointExternalMonsKey])
+	monsFromCM = opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 4)
+	for id, mon := range monsFromCM {
+		assert.Equal(t, inital5Mons[id].Name, mon.Name)
+		assert.Equal(t, inital5Mons[id].Endpoint, mon.Endpoint)
+		assert.Equal(t, inital5Mons[id].OutOfQuorum, mon.OutOfQuorum)
+	}
+
+	// 4. upscale back to 5:
+	c.spec.Mon.Count = 5
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.InternalMonitors)
+
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors))
+	assert.Empty(t, c.ClusterInfo.ExternalMons)
+	// No updates in unit tests w/ workaround
+	assert.Len(t, testopk8s.DeploymentNamesUpdated(deploymentsUpdated), 4)
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that unknown mon is not in endpoint configmap
+	cm, err = c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Empty(t, cm.Data[EndpointExternalMonsKey])
+	monsFromCM = opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 5)
+	for id, mon := range monsFromCM {
+		assert.Equal(t, c.ClusterInfo.InternalMonitors[id].Name, mon.Name)
+		assert.Equal(t, c.ClusterInfo.InternalMonitors[id].Endpoint, mon.Endpoint)
+		assert.Equal(t, c.ClusterInfo.InternalMonitors[id].OutOfQuorum, mon.OutOfQuorum)
+	}
+}
+
+func TestExternalMons_inSpec_notInQuorum(t *testing.T) {
+	// 1. setup test
+	ctx := t.Context()
+	var deploymentsUpdated *[]*apps.Deployment
+	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
+
+	monQuorumResponse := clienttest.MonInQuorumResponse()
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("executing command: %s %+v", command, args)
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return "{\"key\":\"mysecurekey\"}", nil
+			}
+			return monQuorumResponse, nil
+		},
+	}
+
+	objects := []runtime.Object{
+		getCephCluster("default", "default"),
+	}
+	client := getClient(t, objects...)
+	clientset := test.New(t, 1)
+	configDir := t.TempDir()
+	context := &clusterd.Context{
+		Clientset: clientset,
+		ConfigDir: configDir,
+		Executor:  executor,
+		Client:    client,
+	}
+
+	// mock out the scheduler to return node0
+	waitForMonitorScheduling = func(c *Cluster, d *apps.Deployment) (SchedulingResult, error) {
+		node, _ := clientset.CoreV1().Nodes().Get(ctx, "node0", metav1.GetOptions{})
+		return SchedulingResult{Node: node}, nil
+	}
+
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
+	setCommonMonProperties(c, 0, cephv1.MonSpec{Count: 5, AllowMultiplePerNode: true}, "myversion")
+	c.maxMonID = 0 // "a" is max mon id
+	c.waitForStart = false
+
+	// checking the health will increase the mons as desired all in one go
+	err := c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors), fmt.Sprintf("mons: %v", c.ClusterInfo.InternalMonitors))
+	assert.ElementsMatch(t, []string{
+		// b is created first, no updates
+		"rook-ceph-mon-b",                    // b updated when c created
+		"rook-ceph-mon-b", "rook-ceph-mon-c", // b and c updated when d created
+		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", // etc.
+		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", "rook-ceph-mon-e",
+	},
+		testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	inital5Mons := make(map[string]*cephclient.MonInfo)
+	maps.Copy(inital5Mons, c.ClusterInfo.InternalMonitors)
+
+	// 2. add external mon id to spec but not to quorum
+	c.spec.Mon.ExternalMonIDs = []string{"ext-mon-id"}
+
+	// don't add ext mon to quorum:
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(inital5Mons)
+
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors))
+	assert.Empty(t, c.ClusterInfo.ExternalMons)
+
+	// No updates in unit tests w/ workaround
+	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that unknown mon is not in endpoint configmap
+	cm, err := c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Empty(t, cm.Data[EndpointExternalMonsKey])
+	monsFromCM := opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 5)
+	for id, mon := range monsFromCM {
+		assert.Equal(t, inital5Mons[id].Name, mon.Name)
+		assert.Equal(t, inital5Mons[id].Endpoint, mon.Endpoint)
+		assert.Equal(t, inital5Mons[id].OutOfQuorum, mon.OutOfQuorum)
+	}
+
+	// 3. downscale mons to 4:
+	c.spec.Mon.Count = 4
+
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 4, len(c.ClusterInfo.InternalMonitors))
+	assert.Empty(t, c.ClusterInfo.ExternalMons)
+	// No updates in unit tests w/ workaround
+	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that unknown mon is not in endpoint configmap
+	cm, err = c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Empty(t, cm.Data[EndpointExternalMonsKey])
+	monsFromCM = opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 4)
+	for id, mon := range monsFromCM {
+		assert.Equal(t, inital5Mons[id].Name, mon.Name)
+		assert.Equal(t, inital5Mons[id].Endpoint, mon.Endpoint)
+		assert.Equal(t, inital5Mons[id].OutOfQuorum, mon.OutOfQuorum)
+	}
+
+	// 4. upscale back to 5:
+	c.spec.Mon.Count = 5
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(c.ClusterInfo.InternalMonitors)
+
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors))
+	assert.Empty(t, c.ClusterInfo.ExternalMons)
+	// No updates in unit tests w/ workaround
+	assert.Len(t, testopk8s.DeploymentNamesUpdated(deploymentsUpdated), 4)
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that unknown mon is not in endpoint configmap
+	cm, err = c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Empty(t, cm.Data[EndpointExternalMonsKey])
+	monsFromCM = opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 5)
+	for id, mon := range monsFromCM {
+		assert.Equal(t, c.ClusterInfo.InternalMonitors[id].Name, mon.Name)
+		assert.Equal(t, c.ClusterInfo.InternalMonitors[id].Endpoint, mon.Endpoint)
+		assert.Equal(t, c.ClusterInfo.InternalMonitors[id].OutOfQuorum, mon.OutOfQuorum)
+	}
+}
+
+func TestExternalMons_inSpec_inQuorum(t *testing.T) {
+	// 1. setup test
+	ctx := t.Context()
+	var deploymentsUpdated *[]*apps.Deployment
+	updateDeploymentAndWait, deploymentsUpdated = testopk8s.UpdateDeploymentAndWaitStub()
+
+	monQuorumResponse := clienttest.MonInQuorumResponse()
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			logger.Infof("executing command: %s %+v", command, args)
+			if args[0] == "auth" && args[1] == "get-or-create-key" {
+				return "{\"key\":\"mysecurekey\"}", nil
+			}
+			return monQuorumResponse, nil
+		},
+	}
+	objects := []runtime.Object{
+		getCephCluster("default", "default"),
+	}
+	client := getClient(t, objects...)
+	clientset := test.New(t, 1)
+	configDir := t.TempDir()
+	context := &clusterd.Context{
+		Clientset: clientset,
+		ConfigDir: configDir,
+		Executor:  executor,
+		Client:    client,
+	}
+
+	// mock out the scheduler to return node0
+	waitForMonitorScheduling = func(c *Cluster, d *apps.Deployment) (SchedulingResult, error) {
+		node, _ := clientset.CoreV1().Nodes().Get(ctx, "node0", metav1.GetOptions{})
+		return SchedulingResult{Node: node}, nil
+	}
+
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	c := New(ctx, context, "ns", cephv1.ClusterSpec{}, ownerInfo)
+	setCommonMonProperties(c, 0, cephv1.MonSpec{Count: 5, AllowMultiplePerNode: true}, "myversion")
+	c.maxMonID = 0 // "a" is max mon id
+	c.waitForStart = false
+
+	// checking the health will increase the mons as desired all in one go
+	err := c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors), fmt.Sprintf("mons: %v", c.ClusterInfo.InternalMonitors))
+	assert.ElementsMatch(t, []string{
+		// b is created first, no updates
+		"rook-ceph-mon-b",                    // b updated when c created
+		"rook-ceph-mon-b", "rook-ceph-mon-c", // b and c updated when d created
+		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", // etc.
+		"rook-ceph-mon-b", "rook-ceph-mon-c", "rook-ceph-mon-d", "rook-ceph-mon-e",
+	},
+		testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	inital5Mons := make(map[string]*cephclient.MonInfo)
+	maps.Copy(inital5Mons, c.ClusterInfo.InternalMonitors)
+
+	// 2. add external mon id to spec
+	c.spec.Mon.ExternalMonIDs = []string{"ext-mon-id"}
+
+	// add ext mon to quorum:
+	mons := make(map[string]*cephclient.MonInfo)
+	maps.Copy(mons, inital5Mons)
+	mons["ext-mon-id"] = &cephclient.MonInfo{Name: "ext-mon-id", Endpoint: "0.0.0.0:6789"}
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(mons)
+
+	// internal mons and deployments have not changed
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors))
+	// external mon is in quorum
+	assert.Len(t, c.ClusterInfo.ExternalMons, 1)
+	assert.Equal(t, "ext-mon-id", c.ClusterInfo.ExternalMons["ext-mon-id"].Name)
+
+	// No updates in unit tests w/ workaround
+	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that ext mon is in endpoint configmap
+	cm, err := c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Equal(t, "ext-mon-id", cm.Data[EndpointExternalMonsKey])
+	monsFromCM := opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 6)
+	for id, mon := range monsFromCM {
+		if id == "ext-mon-id" {
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].Name, mon.Name)
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].Endpoint, mon.Endpoint)
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].OutOfQuorum, mon.OutOfQuorum)
+		} else {
+			assert.Equal(t, inital5Mons[id].Name, mon.Name)
+			assert.Equal(t, inital5Mons[id].Endpoint, mon.Endpoint)
+			assert.Equal(t, inital5Mons[id].OutOfQuorum, mon.OutOfQuorum)
+		}
+	}
+
+	// 3. downscale mons to 4:
+	c.spec.Mon.Count = 4
+
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 4, len(c.ClusterInfo.InternalMonitors))
+	assert.Len(t, c.ClusterInfo.ExternalMons, 1)
+	// No updates in unit tests w/ workaround
+	assert.ElementsMatch(t, []string{}, testopk8s.DeploymentNamesUpdated(deploymentsUpdated))
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that unknown mon is not in endpoint configmap
+	cm, err = c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Equal(t, "ext-mon-id", cm.Data[EndpointExternalMonsKey])
+	monsFromCM = opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 5)
+	for id, mon := range monsFromCM {
+		if id == "ext-mon-id" {
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].Name, mon.Name)
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].Endpoint, mon.Endpoint)
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].OutOfQuorum, mon.OutOfQuorum)
+		} else {
+			assert.Equal(t, inital5Mons[id].Name, mon.Name)
+			assert.Equal(t, inital5Mons[id].Endpoint, mon.Endpoint)
+			assert.Equal(t, inital5Mons[id].OutOfQuorum, mon.OutOfQuorum)
+		}
+	}
+
+	// 4. upscale back to 5:
+	c.spec.Mon.Count = 5
+	mons = make(map[string]*cephclient.MonInfo)
+	maps.Copy(mons, c.ClusterInfo.InternalMonitors)
+	mons["ext-mon-id"] = &cephclient.MonInfo{Name: "ext-mon-id", Endpoint: "0.0.0.0:6789"}
+	monQuorumResponse = clienttest.MonInQuorumResponseFromMons(mons)
+
+	err = c.checkHealth(ctx)
+	assert.Nil(t, err)
+	assert.Equal(t, 5, len(c.ClusterInfo.InternalMonitors))
+	assert.Len(t, c.ClusterInfo.ExternalMons, 1)
+	// No updates in unit tests w/ workaround
+	assert.Len(t, testopk8s.DeploymentNamesUpdated(deploymentsUpdated), 4)
+	testopk8s.ClearDeploymentsUpdated(deploymentsUpdated)
+
+	// check that unknown mon is not in endpoint configmap
+	cm, err = c.context.Clientset.CoreV1().ConfigMaps(c.Namespace).Get(ctx, EndpointConfigMapName, metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.Equal(t, "ext-mon-id", cm.Data[EndpointExternalMonsKey])
+	monsFromCM = opcontroller.ParseMonEndpoints(cm.Data[EndpointDataKey])
+	assert.Len(t, monsFromCM, 6)
+	for id, mon := range monsFromCM {
+		if id == "ext-mon-id" {
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].Name, mon.Name)
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].Endpoint, mon.Endpoint)
+			assert.Equal(t, c.ClusterInfo.ExternalMons[id].OutOfQuorum, mon.OutOfQuorum)
+		} else {
+			assert.Equal(t, c.ClusterInfo.InternalMonitors[id].Name, mon.Name)
+			assert.Equal(t, c.ClusterInfo.InternalMonitors[id].Endpoint, mon.Endpoint)
+			assert.Equal(t, c.ClusterInfo.InternalMonitors[id].OutOfQuorum, mon.OutOfQuorum)
+		}
+	}
+}
+
+func getClient(t *testing.T, obj ...runtime.Object) client.Client {
+	// Register operator types with the runtime scheme.
+	s := scheme.Scheme
+	s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{})
+	assert.NoError(t, csiopv1.AddToScheme(s))
+	client := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(obj...).Build()
+	return client
+}
+
+func getCephCluster(name, namespace string) *cephv1.CephCluster {
+	return &cephv1.CephCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: namespace,
+		},
+		Spec: cephv1.ClusterSpec{
+			Security: cephv1.ClusterSecuritySpec{
+				CephX: cephv1.ClusterCephxConfig{
+					RBDMirrorPeer: cephv1.CephxConfig{},
+				},
+			},
+		},
+		Status: cephv1.ClusterStatus{
+			Cephx: cephv1.ClusterCephxStatus{
+				RBDMirrorPeer: cephv1.CephxStatus{},
+			},
+		},
+	}
+}
+
+func TestExternalMonAdvertisingMsgr1KeepsDaemonMsgr1(t *testing.T) {
+	namespace := "ns"
+	context, err := newTestStartCluster(t, namespace)
+	require.NoError(t, err)
+	c := newCluster(context, namespace, true, v1.ResourceRequirements{})
+	c.ClusterInfo = clienttest.CreateTestClusterInfo(3)
+	c.spec.Network.Connections = &cephv1.ConnectionsSpec{RequireMsgr2: true}
+	c.spec.Mon.ExternalMonIDs = []string{"ext"}
+	// every mon deployed by Rook is on the msgr2 port
+	require.Equal(t, []string{"--ms-bind-msgr1=false"}, opcontroller.Msgr1BindingFlags(c.ClusterInfo, &c.spec))
+
+	ext := cephclient.MonMapEntry{Name: "ext", Rank: 3, PublicAddr: "10.0.0.9:6789/0"}
+	ext.PublicAddrs.Addrvec = []cephclient.AddrvecEntry{{Type: "v2", Addr: "10.0.0.9:3300"}, {Type: "v1", Addr: "10.0.0.9:6789"}}
+	status := cephclient.MonStatusResponse{Quorum: []int{3}}
+	status.MonMap.Mons = []cephclient.MonMapEntry{ext}
+	_, err = c.reconcileExternalMons(t.Context(), status)
+	require.NoError(t, err)
+
+	// the external mon is recorded on the msgr2 port although it still advertises msgr1
+	require.Contains(t, c.ClusterInfo.ExternalMons, "ext")
+	assert.Equal(t, "10.0.0.9:3300", c.ClusterInfo.ExternalMons["ext"].Endpoint)
+	assert.Empty(t, opcontroller.Msgr1BindingFlags(c.ClusterInfo, &c.spec))
 }

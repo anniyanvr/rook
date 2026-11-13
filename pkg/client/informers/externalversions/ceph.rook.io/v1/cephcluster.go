@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,25 +19,54 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	apiscephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	versioned "github.com/rook/rook/pkg/client/clientset/versioned"
 	internalinterfaces "github.com/rook/rook/pkg/client/informers/externalversions/internalinterfaces"
-	v1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
+	cephrookiov1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephClusterInformer provides access to a shared informer and lister for
-// CephClusters.
+// CephClusters. Prefer using the type-safe variant (see [TypedCephClusterInformer]).
 type CephClusterInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.CephClusterLister
+	Lister() cephrookiov1.CephClusterLister
 }
+
+// TypedCephClusterInformer provides access to a shared informer and lister for
+// CephClusters, including the type-safe TypedInformer variant.
+// It is a superset of CephClusterInformer.
+type TypedCephClusterInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() CephClusterIndexInformer
+	Lister() cephrookiov1.CephClusterLister
+}
+
+// CephClusterIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type CephClusterIndexInformer cache.TypedSharedIndexInformer[*apiscephrookiov1.CephCluster]
+
+// CephClusterHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for CephCluster.
+type CephClusterHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*apiscephrookiov1.CephCluster]
+
+// CephClusterDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for CephCluster.
+type CephClusterDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*apiscephrookiov1.CephCluster]
+
+// CephClusterFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for CephCluster.
+type CephClusterFilteringHandler = cache.TypedFilteringResourceEventHandler[*apiscephrookiov1.CephCluster]
+
+// CephClusterIndexers is a specialization of [cache.TypedIndexers] for CephCluster.
+type CephClusterIndexers = cache.TypedIndexers[*apiscephrookiov1.CephCluster]
+
+// DeletedCephCluster is a specialization of [cache.DeletedObject] for CephCluster.
+type DeletedCephCluster = cache.DeletedObject[*apiscephrookiov1.CephCluster]
 
 type cephClusterInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +77,132 @@ type cephClusterInformer struct {
 // NewCephClusterInformer constructs a new informer for CephCluster type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephClusterInformer]).
 func NewCephClusterInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredCephClusterInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewCephClusterInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedCephClusterInformer constructs a new informer for CephCluster type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephClusterInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephClusterIndexers) CephClusterIndexInformer {
+	return NewTypedCephClusterInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredCephClusterInformer constructs a new informer for CephCluster type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredCephClusterInformer]).
 func NewFilteredCephClusterInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+	return NewTypedCephClusterInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredCephClusterInformer constructs a new informer for CephCluster type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredCephClusterInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephClusterIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) CephClusterIndexInformer {
+	return NewTypedCephClusterInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewCephClusterInformerWithOptions constructs a new informer for CephCluster type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephClusterInformerWithOptions]).
+func NewCephClusterInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedCephClusterInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedCephClusterInformerWithOptions constructs a new informer for CephCluster type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephClusterInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) CephClusterIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "ceph.rook.io", Version: "v1", Resource: "cephclusters"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephCluster](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephClusters(namespace).List(context.TODO(), options)
+				return client.CephV1().CephClusters(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephClusters(namespace).Watch(context.TODO(), options)
+				return client.CephV1().CephClusters(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephClusters(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephClusters(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&apiscephrookiov1.CephCluster{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&cephrookiov1.CephCluster{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *cephClusterInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredCephClusterInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedCephClusterInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *cephClusterInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&cephrookiov1.CephCluster{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *cephClusterInformer) Lister() v1.CephClusterLister {
-	return v1.NewCephClusterLister(f.Informer().GetIndexer())
+func (f *cephClusterInformer) TypedInformer() CephClusterIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephCluster](f.factory.InformerFor(&apiscephrookiov1.CephCluster{}, f.defaultInformer))
+}
+
+func (f *cephClusterInformer) Lister() cephrookiov1.CephClusterLister {
+	return cephrookiov1.NewCephClusterLister(f.Informer().GetIndexer())
+}
+
+// ToTypedCephClusterInformer converts an untyped informer into a TypedCephClusterInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephCluster. If that is not the case, calling type-safe methods of the returned
+// TypedCephClusterInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedCephClusterInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedCephClusterInformer(informer CephClusterInformer) TypedCephClusterInformer {
+	if informer, ok := informer.(TypedCephClusterInformer); ok {
+		return informer
+	}
+	return &cephClusterTypedInformerAdapter{informer}
+}
+
+type cephClusterTypedInformerAdapter struct {
+	CephClusterInformer
+}
+
+func (a *cephClusterTypedInformerAdapter) TypedInformer() CephClusterIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephCluster](a.Informer())
+}
+
+// ToCephClusterIndexInformer converts an untyped informer into a CephClusterIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephCluster. If that is not the case, calling type-safe methods of the returned
+// CephClusterIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a CephClusterIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToCephClusterIndexInformer(informer cache.SharedIndexInformer) CephClusterIndexInformer {
+	if informer, ok := informer.(CephClusterIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephCluster](informer)
 }

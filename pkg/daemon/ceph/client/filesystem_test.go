@@ -23,9 +23,8 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	exectest "github.com/rook/rook/pkg/util/exec/test"
-
 	"github.com/rook/rook/pkg/clusterd"
+	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 )
 
@@ -49,7 +48,8 @@ func TestFilesystemListMarshal(t *testing.T) {
 			MetadataPool:   "myfs1-metadata",
 			MetadataPoolID: 2,
 			DataPools:      []string{"myfs1-data"},
-			DataPoolIDs:    []int{1}},
+			DataPoolIDs:    []int{1},
+		},
 	}
 
 	assert.Equal(t, expectedFilesystems, filesystems)
@@ -94,7 +94,7 @@ func TestFilesystemGetMarshal(t *testing.T) {
 func TestFilesystemRemove(t *testing.T) {
 	dataDeleted := false
 	metadataDeleted := false
-	crushDeleted := false
+	deletedPools := map[string]bool{}
 	executor := &exectest.MockExecutor{}
 	context := &clusterd.Context{Executor: executor}
 	fs := CephFilesystemDetails{
@@ -119,9 +119,12 @@ func TestFilesystemRemove(t *testing.T) {
 		}
 		if args[0] == "osd" {
 			if args[1] == "lspools" {
-				pools := []*CephStoragePoolSummary{
-					{Name: "mydata", Number: 1},
-					{Name: "mymetadata", Number: 2},
+				pools := []*CephStoragePoolSummary{}
+				if !deletedPools["mydata"] {
+					pools = append(pools, &CephStoragePoolSummary{Name: "mydata", Number: 1})
+				}
+				if !deletedPools["mymetadata"] {
+					pools = append(pools, &CephStoragePoolSummary{Name: "mymetadata", Number: 2})
 				}
 				output, err := json.Marshal(pools)
 				assert.Nil(t, err)
@@ -129,24 +132,20 @@ func TestFilesystemRemove(t *testing.T) {
 			}
 			if args[1] == "pool" {
 				if args[2] == "get" {
-					return `{"pool_id":1}`, nil
+					return `{"pool_id":1,"crush_rule":"myrule"}`, nil
 				}
 				if args[2] == "delete" {
 					if args[3] == "mydata" {
+						deletedPools["mydata"] = true
 						dataDeleted = true
 						return "", nil
 					}
 					if args[3] == "mymetadata" {
+						deletedPools["mymetadata"] = true
 						metadataDeleted = true
 						return "", nil
 					}
 				}
-			}
-			if args[1] == "crush" {
-				assert.Equal(t, "rule", args[2])
-				assert.Equal(t, "rm", args[3])
-				crushDeleted = true
-				return "", nil
 			}
 		}
 		emptyPool := "{\"images\":{\"count\":0,\"provisioned_bytes\":0,\"snap_count\":0},\"trash\":{\"count\":1,\"provisioned_bytes\":2048,\"snap_count\":0}}"
@@ -158,11 +157,10 @@ func TestFilesystemRemove(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err := RemoveFilesystem(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, false)
+	err := RemoveFilesystem(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, false)
 	assert.Nil(t, err)
 	assert.True(t, metadataDeleted)
 	assert.True(t, dataDeleted)
-	assert.True(t, crushDeleted)
 }
 
 func TestFailAllStandbyReplayMDS(t *testing.T) {
@@ -213,7 +211,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err := FailAllStandbyReplayMDS(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
+	err := FailAllStandbyReplayMDS(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, failedGids, []string{"124"})
 
@@ -259,7 +257,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
-	err = FailAllStandbyReplayMDS(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
+	err = FailAllStandbyReplayMDS(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
 	assert.NoError(t, err)
 
 	fs = CephFilesystemDetails{
@@ -304,7 +302,7 @@ func TestFailAllStandbyReplayMDS(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
-	err = FailAllStandbyReplayMDS(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
+	err = FailAllStandbyReplayMDS(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "expected execution of mds fail")
 }
@@ -355,7 +353,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	name, err := GetMdsIdByRank(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
+	name, err := GetMdsIdByRank(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
 	assert.Equal(t, name, "myfs1-a")
 	assert.NoError(t, err)
 
@@ -378,7 +376,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	name, err = GetMdsIdByRank(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
+	name, err = GetMdsIdByRank(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
 	assert.Equal(t, "", name)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "test ceph fs get error")
@@ -427,7 +425,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	name, err = GetMdsIdByRank(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
+	name, err = GetMdsIdByRank(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
 	assert.Equal(t, "", name)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to get mds gid from rank 0")
@@ -475,7 +473,7 @@ func TestGetMdsIdByRank(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	name, err = GetMdsIdByRank(context, AdminClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
+	name, err = GetMdsIdByRank(context, AdminTestClusterInfo("mycluster"), fs.MDSMap.FilesystemName, 0)
 	assert.Equal(t, "", name)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to get mds info for rank 0")
@@ -503,7 +501,7 @@ func TestGetMDSDump(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	mdsDump, err := GetMDSDump(context, AdminClusterInfo("mycluster"))
+	mdsDump, err := GetMDSDump(context, AdminTestClusterInfo("mycluster"))
 	assert.NoError(t, err)
 	assert.ElementsMatch(t, mdsDump.Standbys, []MDSStandBy{{Name: "rook-ceph-filesystem-b", Rank: -1}})
 
@@ -517,13 +515,37 @@ func TestGetMDSDump(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	_, err = GetMDSDump(context, AdminClusterInfo("mycluster"))
+	_, err = GetMDSDump(context, AdminTestClusterInfo("mycluster"))
 	assert.Error(t, err)
+}
+
+func TestFSHasStandby(t *testing.T) {
+	// Not found in an empty list
+	fsName := "foo"
+	dump := &MDSDump{}
+	assert.False(t, filesystemHasStandby(dump, fsName))
+
+	// Not found with a non-matching name
+	dump = &MDSDump{Standbys: []MDSStandBy{{Name: "foo-cd"}}}
+	assert.False(t, filesystemHasStandby(dump, fsName))
+
+	// Found in the list with -a suffix
+	dump = &MDSDump{Standbys: []MDSStandBy{{Name: "foo-a"}}}
+	assert.True(t, filesystemHasStandby(dump, fsName))
+
+	// Found in the list with -c suffix
+	dump = &MDSDump{Standbys: []MDSStandBy{{Name: "foo-c"}}}
+	assert.True(t, filesystemHasStandby(dump, fsName))
+
+	// Does not match another filesystem
+	fsName = "bar"
+	assert.False(t, filesystemHasStandby(dump, fsName))
 }
 
 func TestWaitForNoStandbys(t *testing.T) {
 	executor := &exectest.MockExecutor{}
 	context := &clusterd.Context{Executor: executor}
+	fsName := "rook-ceph-filesystem"
 	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "fs" {
@@ -543,7 +565,7 @@ func TestWaitForNoStandbys(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err := WaitForNoStandbys(context, AdminClusterInfo("mycluster"), 6*time.Second)
+	err := WaitForNoStandbys(context, AdminTestClusterInfo("mycluster"), fsName, time.Millisecond, 5*time.Millisecond)
 	assert.Error(t, err)
 
 	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
@@ -556,7 +578,7 @@ func TestWaitForNoStandbys(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	err = WaitForNoStandbys(context, AdminClusterInfo("mycluster"), 6*time.Second)
+	err = WaitForNoStandbys(context, AdminTestClusterInfo("mycluster"), fsName, time.Millisecond, 5*time.Millisecond)
 	assert.Error(t, err)
 
 	firstCall := true
@@ -583,7 +605,204 @@ func TestWaitForNoStandbys(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
-	err = WaitForNoStandbys(context, AdminClusterInfo("mycluster"), 6*time.Second)
+	// Use a generous timeout here: this case must poll at least twice (the first
+	// dump reports a standby, subsequent dumps report none) before it can succeed.
+	// A tight timeout makes the test flaky under CI scheduling jitter. The poll
+	// returns as soon as the condition is met, so a large timeout keeps the test
+	// fast while eliminating the race.
+	err = WaitForNoStandbys(context, AdminTestClusterInfo("mycluster"), fsName, time.Millisecond, 10*time.Second)
 	assert.NoError(t, err)
+}
 
+func TestListSubvolumeGroups(t *testing.T) {
+	fsName := "myfs"
+
+	newContext := func(retString string, retErr error) *clusterd.Context {
+		t.Helper()
+
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+				t.Logf("Command: %s %v", command, args)
+				if args[0] == "fs" && args[1] == "subvolumegroup" && args[2] == "ls" && args[3] == fsName {
+					return retString, retErr
+				}
+				panic(fmt.Sprintf("unhandled command %q %v", command, args))
+			},
+		}
+
+		return &clusterd.Context{Executor: executor}
+	}
+
+	t.Run("no groups", func(t *testing.T) {
+		ctx := newContext("[]", nil)
+		ret, err := ListSubvolumeGroups(ctx, AdminTestClusterInfo("mycluster"), fsName)
+		assert.NoError(t, err)
+		assert.Empty(t, ret)
+	})
+
+	t.Run("one group", func(t *testing.T) {
+		ctx := newContext(`[
+    {
+        "name": "csi"
+    }
+]
+`, nil)
+		ret, err := ListSubvolumeGroups(ctx, AdminTestClusterInfo("mycluster"), fsName)
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, ret, SubvolumeGroupList{
+			SubvolumeGroup{Name: "csi"},
+		})
+	})
+
+	t.Run("multiple groups", func(t *testing.T) {
+		ctx := newContext(`[
+    {
+        "name": "group-a"
+    },
+    {
+        "name": "csi"
+    }
+]
+`, nil)
+		ret, err := ListSubvolumeGroups(ctx, AdminTestClusterInfo("mycluster"), fsName)
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, ret, SubvolumeGroupList{
+			SubvolumeGroup{Name: "group-a"},
+			SubvolumeGroup{Name: "csi"},
+		})
+	})
+
+	t.Run("cli return error", func(t *testing.T) {
+		ctx := newContext(`[
+    {
+        "name": "csi"
+    }
+]`, errors.New("induced error"))
+		ret, err := ListSubvolumeGroups(ctx, AdminTestClusterInfo("mycluster"), fsName)
+		assert.Error(t, err)
+		t.Log("error return", err.Error())
+		assert.Contains(t, err.Error(), `induced error`)
+		assert.Contains(t, err.Error(), `failed to list subvolumegroups in filesystem "myfs"`)
+		assert.Empty(t, ret)
+	})
+}
+
+func TestListSubvolumesInGroup(t *testing.T) {
+	fsName := "myfs"
+	groupName := "csi"
+
+	newContext := func(retString string, retErr error) *clusterd.Context {
+		t.Helper()
+
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
+				t.Logf("Command: %s %v", command, args)
+				if args[0] == "fs" && args[1] == "subvolume" && args[2] == "ls" && args[3] == fsName && args[4] == groupName {
+					return retString, retErr
+				}
+				panic(fmt.Sprintf("unhandled command %q %v", command, args))
+			},
+		}
+
+		return &clusterd.Context{Executor: executor}
+	}
+
+	t.Run("no subvolumes", func(t *testing.T) {
+		ctx := newContext("[]", nil)
+		ret, err := ListSubvolumesInGroup(ctx, AdminTestClusterInfo("mycluster"), fsName, groupName)
+		assert.NoError(t, err)
+		assert.Empty(t, ret)
+	})
+
+	t.Run("one subvolume", func(t *testing.T) {
+		ctx := newContext(`[
+    {
+        "name": "csi-vol-hash"
+    }
+]
+`, nil)
+		ret, err := ListSubvolumesInGroup(ctx, AdminTestClusterInfo("mycluster"), fsName, groupName)
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, ret, SubvolumeList{
+			Subvolume{Name: "csi-vol-hash"},
+		})
+	})
+
+	t.Run("multiple groups", func(t *testing.T) {
+		ctx := newContext(`[
+    {
+        "name": "csi-vol-hash"
+    },
+    {
+        "name": "csi-nfs-vol-hash"
+    }
+]
+`, nil)
+		ret, err := ListSubvolumesInGroup(ctx, AdminTestClusterInfo("mycluster"), fsName, groupName)
+		assert.NoError(t, err)
+		assert.ElementsMatch(t, ret, SubvolumeList{
+			Subvolume{Name: "csi-vol-hash"},
+			Subvolume{Name: "csi-nfs-vol-hash"},
+		})
+	})
+
+	t.Run("cli return error", func(t *testing.T) {
+		ctx := newContext(`[
+    {
+        "name": "csi-vol-hash"
+    }
+]`, errors.New("induced error"))
+		ret, err := ListSubvolumesInGroup(ctx, AdminTestClusterInfo("mycluster"), fsName, groupName)
+		assert.Error(t, err)
+		t.Log("error return", err.Error())
+		assert.Contains(t, err.Error(), `induced error`)
+		assert.Contains(t, err.Error(), `failed to list subvolumes in filesystem "myfs" subvolume group "csi"`)
+		assert.Empty(t, ret)
+	})
+}
+
+func TestAllowStandbyReplay(t *testing.T) {
+	cephFSName := "myfs"
+	newContext := func(standbyWanted bool, standbyCount int32) *clusterd.Context {
+		t.Helper()
+
+		executor := &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				t.Logf("Command: %s %v", command, args)
+				if args[0] == "fs" && args[1] == "set" && args[2] == cephFSName {
+					switch args[3] {
+					case "allow_standby_replay":
+						if args[4] == fmt.Sprint(standbyWanted) {
+							return "", nil
+						}
+					case "standby_count_wanted":
+						if args[4] == fmt.Sprint(standbyCount) {
+							return "", nil
+						}
+					}
+				}
+				panic(fmt.Sprintf("unhandled command %q %v", command, args))
+			},
+		}
+
+		return &clusterd.Context{Executor: executor}
+	}
+
+	t.Run("no standby mds", func(t *testing.T) {
+		ctx := newContext(false, 0)
+		err := AllowStandbyReplay(ctx, AdminTestClusterInfo("mycluster"), cephFSName, false, int32(1))
+		assert.NoError(t, err)
+	})
+
+	t.Run("standby mds", func(t *testing.T) {
+		ctx := newContext(true, 1)
+		err := AllowStandbyReplay(ctx, AdminTestClusterInfo("mycluster"), cephFSName, true, int32(1))
+		assert.NoError(t, err)
+	})
+
+	t.Run("standby mds multiple", func(t *testing.T) {
+		ctx := newContext(true, 3)
+		err := AllowStandbyReplay(ctx, AdminTestClusterInfo("mycluster"), cephFSName, true, int32(3))
+		assert.NoError(t, err)
+	})
 }

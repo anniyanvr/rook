@@ -24,7 +24,6 @@ import (
 	"github.com/rook/rook/tests/framework/clients"
 	"github.com/rook/rook/tests/framework/installer"
 	"github.com/rook/rook/tests/framework/utils"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 )
@@ -50,10 +49,6 @@ const (
 // - Create the object store via the CRD
 // *************************************************************
 func TestCephMultiClusterDeploySuite(t *testing.T) {
-	if installer.SkipTestSuite(installer.CephTestSuite) {
-		t.Skip()
-	}
-
 	s := new(MultiClusterDeploySuite)
 	defer func(s *MultiClusterDeploySuite) {
 		HandlePanics(recover(), s.TearDownSuite, s.T)
@@ -78,16 +73,17 @@ func (s *MultiClusterDeploySuite) SetupSuite() {
 	s.poolName = "multi-cluster-pool1"
 	coreNamespace := "multi-core"
 	s.settings = &installer.TestCephSettings{
-		ClusterName:               "multi-cluster",
-		Namespace:                 coreNamespace,
-		OperatorNamespace:         installer.SystemNamespace(coreNamespace),
-		StorageClassName:          "manual",
-		UsePVC:                    installer.UsePVC(),
-		Mons:                      1,
-		MultipleMgrs:              true,
-		EnableAdmissionController: true,
-		RookVersion:               installer.LocalBuildTag,
-		CephVersion:               installer.OctopusVersion,
+		ClusterName:        "multi-cluster",
+		Namespace:          coreNamespace,
+		OperatorNamespace:  installer.SystemNamespace(coreNamespace),
+		StorageClassName:   "manual",
+		UsePVC:             installer.UsePVC(),
+		Mons:               1,
+		MultipleMgrs:       true,
+		RookVersion:        installer.LocalBuildTag,
+		CephVersion:        installer.TentacleVersion,
+		RequireMsgr2:       true,
+		ClusterConcurrency: 2,
 	}
 	s.settings.ApplyEnvVars()
 	externalSettings := &installer.TestCephSettings{
@@ -96,15 +92,10 @@ func (s *MultiClusterDeploySuite) SetupSuite() {
 		Namespace:         "multi-external",
 		OperatorNamespace: s.settings.OperatorNamespace,
 		RookVersion:       s.settings.RookVersion,
+		CephVersion:       installer.TentacleVersion,
 	}
 	externalSettings.ApplyEnvVars()
 	s.externalManifests = installer.NewCephManifests(externalSettings)
-
-	k8sh, err := utils.CreateK8sHelper(s.T)
-	assert.NoError(s.T(), err)
-	if !k8sh.VersionAtLeast("v1.16.0") {
-		s.T().Skip("requires at least k8s 1.16, no need to run on older versions")
-	}
 
 	// Start the core storage cluster
 	s.setupMultiClusterCore()
@@ -129,8 +120,8 @@ func (s *MultiClusterDeploySuite) createPools() {
 }
 
 func (s *MultiClusterDeploySuite) deletePools() {
-	// create a test pool in each cluster so that we get some PGs
-	clusterInfo := client.AdminClusterInfo(s.settings.Namespace)
+	// delete the test pool created in each cluster
+	clusterInfo := client.AdminTestClusterInfo(s.settings.Namespace)
 	if err := s.testClient.PoolClient.DeletePool(s.testClient.BlockClient, clusterInfo, s.poolName); err != nil {
 		logger.Errorf("failed to delete pool %q. %v", s.poolName, err)
 	} else {
@@ -147,21 +138,23 @@ func (s *MultiClusterDeploySuite) TearDownSuite() {
 func (s *MultiClusterDeploySuite) TestInstallingMultipleRookClusters() {
 	// Check if Rook cluster 1 is deployed successfully
 	client.RunAllCephCommandsInToolboxPod = s.coreToolbox
-	checkIfRookClusterIsInstalled(s.Suite, s.k8sh, s.settings.OperatorNamespace, s.settings.Namespace, 1)
-	checkIfRookClusterIsHealthy(s.Suite, s.testClient, s.settings.Namespace)
+	checkIfRookClusterIsInstalled(&s.Suite, s.k8sh, s.settings.OperatorNamespace, s.settings.Namespace, 1)
+	checkIfRookClusterIsHealthy(&s.Suite, s.testClient, s.settings.Namespace)
 
 	// Check if Rook external cluster is deployed successfully
 	// Checking health status is enough to validate the connection
 	client.RunAllCephCommandsInToolboxPod = s.externalToolbox
-	checkIfRookClusterIsHealthy(s.Suite, s.testClient, s.externalManifests.Settings().Namespace)
+	checkIfRookClusterIsHealthy(&s.Suite, s.testClient, s.externalManifests.Settings().Namespace)
 }
 
-// Setup is wrapper for setting up multiple rook clusters.
+// setupMultiClusterCore is a wrapper for setting up the core rook cluster.
 func (s *MultiClusterDeploySuite) setupMultiClusterCore() {
 	root, err := utils.FindRookRoot()
 	require.NoError(s.T(), err, "failed to get rook root")
-	cmdArgs := utils.CommandArgs{Command: filepath.Join(root, localPathPVCmd),
-		CmdArgs: []string{installer.TestScratchDevice()}}
+	cmdArgs := utils.CommandArgs{
+		Command: filepath.Join(root, localPathPVCmd),
+		CmdArgs: []string{installer.TestScratchDevice()},
+	}
 	cmdOut := utils.ExecuteCommand(cmdArgs)
 	require.NoError(s.T(), cmdOut.Err)
 

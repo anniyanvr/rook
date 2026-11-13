@@ -17,7 +17,35 @@ limitations under the License.
 package v1
 
 import (
+	"maps"
+	"strings"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
+)
+
+const (
+	// SkipReconcileLabelKey is a label indicating that the pod should not be reconciled
+	SkipReconcileLabelKey = "ceph.rook.io/do-not-reconcile"
+
+	// ReplaceOSDAnnotationKey is set by a user on an OSD Deployment to trigger its replacement.
+	ReplaceOSDAnnotationKey = "osd.rook.io/replace"
+
+	// ReplaceOSDAnnotationValueFmt is the required value of ReplaceOSDAnnotationKey, where %d is the
+	// OSD id (must match the Deployment's id, as a confirmation guard). E.g. "yes-really-replace-osd-3".
+	ReplaceOSDAnnotationValueFmt = "yes-really-replace-osd-%d"
+
+	// ReplaceInProgressOSDAnnotationKey is set by Rook on the OSD Deployment once a replacement request
+	// passed validation, and removed when the replacement is cancelled. E.g.
+	// "osd.rook.io/replace-in-progress": "true". Only Rook ever writes it, which is what makes it the
+	// ownership marker for the replacement flow: SkipReconcileLabelKey is a fence that the kubectl-rook-ceph
+	// plugin and cluster admins also set, so it cannot tell an in-flight replacement from an unrelated
+	// manual fence.
+	ReplaceInProgressOSDAnnotationKey = "osd.rook.io/replace-in-progress"
+
+	// ReadyForSwapOSDAnnotationKey is set by Rook on the OSD Deployment once the OSD is destroyed and
+	// the disk may be physically swapped. E.g. "osd.rook.io/replace-ready-for-swap": "true".
+	ReadyForSwapOSDAnnotationKey = "osd.rook.io/replace-ready-for-swap"
 )
 
 // LabelsSpec is the main spec label for all daemons
@@ -26,7 +54,7 @@ type LabelsSpec map[KeyType]Labels
 // KeyType type safety
 type KeyType string
 
-// Labels are label for a given daemons
+// Labels are the labels for a given daemon
 type Labels map[string]string
 
 func (a LabelsSpec) All() Labels {
@@ -38,9 +66,19 @@ func GetMgrLabels(a LabelsSpec) Labels {
 	return mergeAllLabelsWithKey(a, KeyMgr)
 }
 
+// GetDashboardLabels returns the Labels for the Dashboard service
+func GetDashboardLabels(a LabelsSpec) Labels {
+	return mergeAllLabelsWithKey(a, KeyDashboard)
+}
+
 // GetMonLabels returns the Labels for the MON service
 func GetMonLabels(a LabelsSpec) Labels {
 	return mergeAllLabelsWithKey(a, KeyMon)
+}
+
+// GetKeyRotationLabels returns labels for the key Rotation job
+func GetKeyRotationLabels(a LabelsSpec) Labels {
+	return mergeAllLabelsWithKey(a, KeyRotation)
 }
 
 // GetOSDPrepareLabels returns the Labels for the OSD prepare job
@@ -68,6 +106,14 @@ func GetCrashCollectorLabels(a LabelsSpec) Labels {
 	return mergeAllLabelsWithKey(a, KeyCrashCollector)
 }
 
+func GetCephExporterLabels(a LabelsSpec) Labels {
+	return mergeAllLabelsWithKey(a, KeyCephExporter)
+}
+
+func GetCmdReporterLabels(a LabelsSpec) Labels {
+	return mergeAllLabelsWithKey(a, KeyCmdReporter)
+}
+
 func mergeAllLabelsWithKey(a LabelsSpec, name KeyType) Labels {
 	all := a.All()
 	if all != nil {
@@ -88,6 +134,14 @@ func (a Labels) ApplyToObjectMeta(t *metav1.ObjectMeta) {
 	}
 }
 
+// OverwriteApplyToObjectMeta adds labels to object meta, overwriting keys that are already defined.
+func (a Labels) OverwriteApplyToObjectMeta(t *metav1.ObjectMeta) {
+	if t.Labels == nil {
+		t.Labels = map[string]string{}
+	}
+	maps.Copy(t.Labels, a)
+}
+
 // Merge returns a Labels which results from merging the attributes of the
 // original Labels with the attributes of the supplied one. The supplied
 // Labels attributes will override the original ones if defined.
@@ -104,4 +158,79 @@ func (a Labels) Merge(with Labels) Labels {
 		}
 	}
 	return ret
+}
+
+// ToValidDNSLabel converts a given string to a valid DNS-1035 spec label. The DNS-1035 spec
+// follows the regex '[a-z]([-a-z0-9]*[a-z0-9])?' and is at most 63 chars long. DNS-1035 is used
+// over DNS-1123 because it is more strict. Kubernetes docs are not always clear when a DNS_LABEL is
+// supposed to be 1035 or 1123 compliant, so we use the more strict version for ease of use.
+//   - Any input symbol that is not valid is converted to a dash ('-').
+//   - Multiple resultant dashes in a row are compressed to a single dash.
+//   - If the starting character is a number, a 'd' is prepended to preserve the number.
+//   - Any non-alphanumeric starting or ending characters are removed.
+//   - If the resultant string is longer than the maximum-allowed 63 characters, characters are
+//     removed from the middle and replaced with a double dash ('--') to reduce the string to 63
+//     characters.
+func ToValidDNSLabel(input string) string {
+	maxl := validation.DNS1035LabelMaxLength
+
+	if input == "" {
+		return ""
+	}
+
+	outbuf := make([]byte, len(input)+1)
+	j := 0 // position in output buffer
+	last := byte('-')
+	for _, c := range []byte(input) {
+		switch {
+		case c >= 'a' && c <= 'z':
+			outbuf[j] = c
+		case c >= '0' && c <= '9':
+			// if the first char is a number, add a 'd' (for decimal) in front
+			if j == 0 {
+				outbuf[j] = 'd' // for decimal
+				j++
+			}
+			outbuf[j] = c
+		case c >= 'A' && c <= 'Z':
+			// convert to lower case
+			outbuf[j] = c - 'A' + 'a' // convert to lower case
+		default:
+			if last == '-' {
+				// don't write two dashes in a row
+				continue
+			}
+			outbuf[j] = byte('-')
+		}
+		last = outbuf[j]
+		j++
+	}
+
+	// set the length of the output buffer to the number of chars we copied to it so there aren't
+	// \0x00 chars at the end
+	outbuf = outbuf[:j]
+
+	// trim any leading or trailing dashes
+	out := strings.Trim(string(outbuf), "-")
+
+	// if string is longer than max length, cut content from the middle to get it to length
+	if len(out) > maxl {
+		out = cutMiddle(out, maxl)
+	}
+
+	return out
+}
+
+// don't use this function for anything less than toSize=4 chars long
+func cutMiddle(input string, toSize int) string {
+	if len(input) <= toSize {
+		return input
+	}
+
+	lenLeft := toSize / 2               // truncation rounds down the left side
+	lenRight := toSize/2 + (toSize % 2) // modulo rounds up the right side
+
+	buf := []byte(input)
+
+	return string(buf[:lenLeft-1]) + "--" + string(buf[len(input)-lenRight+1:])
 }

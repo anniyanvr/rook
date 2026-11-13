@@ -20,7 +20,6 @@ import (
 	"strconv"
 
 	"github.com/rook/rook/pkg/daemon/ceph/client"
-	kms "github.com/rook/rook/pkg/daemon/ceph/osd/kms"
 	opmon "github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"gopkg.in/ini.v1"
@@ -32,6 +31,7 @@ const (
 	osdWalSizeEnvVarName      = "ROOK_OSD_WAL_SIZE"
 	osdsPerDeviceEnvVarName   = "ROOK_OSDS_PER_DEVICE"
 	osdDeviceClassEnvVarName  = "ROOK_OSD_DEVICE_CLASS"
+	osdConfigMapOverrideName  = "rook-ceph-osd-env-override"
 	// EncryptedDeviceEnvVarName is used in the pod spec to indicate whether the OSD is encrypted or not
 	EncryptedDeviceEnvVarName = "ROOK_ENCRYPTED_DEVICE"
 	PVCNameEnvVarName         = "ROOK_PVC_NAME"
@@ -47,15 +47,16 @@ const (
 	lvBackedPVVarName                   = "ROOK_LV_BACKED_PV"
 	CrushDeviceClassVarName             = "ROOK_OSD_CRUSH_DEVICE_CLASS"
 	CrushInitialWeightVarName           = "ROOK_OSD_CRUSH_INITIAL_WEIGHT"
+	OSDStoreTypeVarName                 = "ROOK_OSD_STORE_TYPE"
+	MigrateOSDIDVarName                 = "ROOK_MIGRATE_OSD"
 	CrushRootVarName                    = "ROOK_CRUSHMAP_ROOT"
 	tcmallocMaxTotalThreadCacheBytesEnv = "TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES"
+	wipeDevicesFromOtherClustersVarName = "ROOK_WIPE_DEVICES_FROM_OTHER_CLUSTERS"
 )
 
-var (
-	cephEnvConfigFile = "/etc/sysconfig/ceph"
-)
+var cephEnvConfigFile = "/etc/sysconfig/ceph"
 
-func (c *Cluster) getConfigEnvVars(osdProps osdProperties, dataDir string) []v1.EnvVar {
+func (c *Cluster) getConfigEnvVars(osdProps osdProperties, dataDir string, prepare bool) []v1.EnvVar {
 	envVars := []v1.EnvVar{
 		nodeNameEnvVar(osdProps.crushHostname),
 		{Name: "ROOK_CLUSTER_ID", Value: string(c.clusterInfo.OwnerInfo.GetUID())},
@@ -64,19 +65,23 @@ func (c *Cluster) getConfigEnvVars(osdProps osdProperties, dataDir string) []v1.
 		k8sutil.PodIPEnvVar(k8sutil.PublicIPEnvVar),
 		opmon.PodNamespaceEnvVar(c.clusterInfo.Namespace),
 		opmon.EndpointEnvVar(),
-		opmon.SecretEnvVar(),
-		opmon.CephUsernameEnvVar(),
-		opmon.CephSecretEnvVar(),
 		k8sutil.ConfigDirEnvVar(dataDir),
 		k8sutil.ConfigOverrideEnvVar(),
-		{Name: "ROOK_FSID", ValueFrom: &v1.EnvVarSource{
-			SecretKeyRef: &v1.SecretKeySelector{
-				LocalObjectReference: v1.LocalObjectReference{Name: "rook-ceph-mon"},
-				Key:                  "fsid",
-			},
-		}},
 		k8sutil.NodeEnvVar(),
 		{Name: CrushRootVarName, Value: client.GetCrushRootFromSpec(&c.spec)},
+	}
+	if prepare {
+		envVars = append(envVars, []v1.EnvVar{
+			opmon.CephUsernameEnvVar(),
+			{Name: "ROOK_FSID", ValueFrom: &v1.EnvVarSource{
+				SecretKeyRef: &v1.SecretKeySelector{
+					LocalObjectReference: v1.LocalObjectReference{Name: "rook-ceph-mon"},
+					Key:                  "fsid",
+				},
+			}},
+		}...)
+
+		envVars = append(envVars, osdStoreTypeEnvVar(c.spec.Storage.GetOSDStore()))
 	}
 
 	// Give a hint to the prepare pod for what the host in the CRUSH map should be
@@ -141,6 +146,10 @@ func pvcBackedOSDEnvVar(pvcBacked string) v1.EnvVar {
 	return v1.EnvVar{Name: PVCBackedOSDVarName, Value: pvcBacked}
 }
 
+func wipeDevicesFromOtherClustersEnvVar() v1.EnvVar {
+	return v1.EnvVar{Name: wipeDevicesFromOtherClustersVarName, Value: "true"}
+}
+
 func setDebugLogLevelEnvVar(debug bool) v1.EnvVar {
 	level := "INFO"
 	if debug {
@@ -165,6 +174,14 @@ func crushDeviceClassEnvVar(crushDeviceClass string) v1.EnvVar {
 	return v1.EnvVar{Name: CrushDeviceClassVarName, Value: crushDeviceClass}
 }
 
+func osdStoreTypeEnvVar(storeType string) v1.EnvVar {
+	return v1.EnvVar{Name: OSDStoreTypeVarName, Value: storeType}
+}
+
+func migrateOSDIDEnvVar(id string) v1.EnvVar {
+	return v1.EnvVar{Name: MigrateOSDIDVarName, Value: id}
+}
+
 func crushInitialWeightEnvVar(crushInitialWeight string) v1.EnvVar {
 	return v1.EnvVar{Name: CrushInitialWeightVarName, Value: crushInitialWeight}
 }
@@ -172,22 +189,9 @@ func crushInitialWeightEnvVar(crushInitialWeight string) v1.EnvVar {
 func encryptedDeviceEnvVar(encryptedDevice bool) v1.EnvVar {
 	return v1.EnvVar{Name: EncryptedDeviceEnvVarName, Value: strconv.FormatBool(encryptedDevice)}
 }
+
 func pvcNameEnvVar(pvcName string) v1.EnvVar {
 	return v1.EnvVar{Name: PVCNameEnvVarName, Value: pvcName}
-}
-
-func cephVolumeRawEncryptedEnvVarFromSecret(osdProps osdProperties) v1.EnvVar {
-	return v1.EnvVar{
-		Name: CephVolumeEncryptedKeyEnvVarName,
-		ValueFrom: &v1.EnvVarSource{
-			SecretKeyRef: &v1.SecretKeySelector{
-				LocalObjectReference: v1.LocalObjectReference{
-					Name: kms.GenerateOSDEncryptionSecretName(osdProps.pvc.ClaimName),
-				},
-				Key: kms.OsdEncryptionSecretNameKeyName,
-			},
-		},
-	}
 }
 
 func cephVolumeEnvVar() []v1.EnvVar {
@@ -202,15 +206,34 @@ func cephVolumeEnvVar() []v1.EnvVar {
 
 func osdActivateEnvVar() []v1.EnvVar {
 	monEnvVars := []v1.EnvVar{
-		{Name: "ROOK_CEPH_MON_HOST",
+		{
+			Name: "ROOK_CEPH_MON_HOST",
 			ValueFrom: &v1.EnvVarSource{
-				SecretKeyRef: &v1.SecretKeySelector{LocalObjectReference: v1.LocalObjectReference{
-					Name: "rook-ceph-config"},
-					Key: "mon_host"}}},
+				SecretKeyRef: &v1.SecretKeySelector{
+					LocalObjectReference: v1.LocalObjectReference{
+						Name: "rook-ceph-config",
+					},
+					Key: "mon_host",
+				},
+			},
+		},
 		{Name: "CEPH_ARGS", Value: "-m $(ROOK_CEPH_MON_HOST)"},
 	}
 
 	return append(cephVolumeEnvVar(), monEnvVars...)
+}
+
+func getEnvFromSources() []v1.EnvFromSource {
+	optionalConfigMapRef := true
+
+	return []v1.EnvFromSource{
+		{
+			ConfigMapRef: &v1.ConfigMapEnvSource{
+				LocalObjectReference: v1.LocalObjectReference{Name: osdConfigMapOverrideName},
+				Optional:             &optionalConfigMapRef,
+			},
+		},
+	}
 }
 
 func getTcmallocMaxTotalThreadCacheBytes(tcmallocMaxTotalThreadCacheBytes string) v1.EnvVar {

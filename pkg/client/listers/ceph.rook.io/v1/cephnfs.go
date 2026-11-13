@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,10 +19,10 @@ limitations under the License.
 package v1
 
 import (
-	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
+	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	labels "k8s.io/apimachinery/pkg/labels"
+	listers "k8s.io/client-go/listers"
+	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephNFSLister helps list CephNFSes.
@@ -30,7 +30,7 @@ import (
 type CephNFSLister interface {
 	// List lists all CephNFSes in the indexer.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CephNFS, err error)
+	List(selector labels.Selector) (ret []*cephrookiov1.CephNFS, err error)
 	// CephNFSes returns an object that can list and get CephNFSes.
 	CephNFSes(namespace string) CephNFSNamespaceLister
 	CephNFSListerExpansion
@@ -38,25 +38,17 @@ type CephNFSLister interface {
 
 // cephNFSLister implements the CephNFSLister interface.
 type cephNFSLister struct {
-	indexer cache.Indexer
+	listers.ResourceIndexer[*cephrookiov1.CephNFS]
 }
 
 // NewCephNFSLister returns a new CephNFSLister.
 func NewCephNFSLister(indexer cache.Indexer) CephNFSLister {
-	return &cephNFSLister{indexer: indexer}
-}
-
-// List lists all CephNFSes in the indexer.
-func (s *cephNFSLister) List(selector labels.Selector) (ret []*v1.CephNFS, err error) {
-	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CephNFS))
-	})
-	return ret, err
+	return &cephNFSLister{listers.New[*cephrookiov1.CephNFS](indexer, cephrookiov1.Resource("cephnfs"))}
 }
 
 // CephNFSes returns an object that can list and get CephNFSes.
 func (s *cephNFSLister) CephNFSes(namespace string) CephNFSNamespaceLister {
-	return cephNFSNamespaceLister{indexer: s.indexer, namespace: namespace}
+	return cephNFSNamespaceLister{listers.NewNamespaced[*cephrookiov1.CephNFS](s.ResourceIndexer, namespace)}
 }
 
 // CephNFSNamespaceLister helps list and get CephNFSes.
@@ -64,36 +56,15 @@ func (s *cephNFSLister) CephNFSes(namespace string) CephNFSNamespaceLister {
 type CephNFSNamespaceLister interface {
 	// List lists all CephNFSes in the indexer for a given namespace.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CephNFS, err error)
+	List(selector labels.Selector) (ret []*cephrookiov1.CephNFS, err error)
 	// Get retrieves the CephNFS from the indexer for a given namespace and name.
 	// Objects returned here must be treated as read-only.
-	Get(name string) (*v1.CephNFS, error)
+	Get(name string) (*cephrookiov1.CephNFS, error)
 	CephNFSNamespaceListerExpansion
 }
 
 // cephNFSNamespaceLister implements the CephNFSNamespaceLister
 // interface.
 type cephNFSNamespaceLister struct {
-	indexer   cache.Indexer
-	namespace string
-}
-
-// List lists all CephNFSes in the indexer for a given namespace.
-func (s cephNFSNamespaceLister) List(selector labels.Selector) (ret []*v1.CephNFS, err error) {
-	err = cache.ListAllByNamespace(s.indexer, s.namespace, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CephNFS))
-	})
-	return ret, err
-}
-
-// Get retrieves the CephNFS from the indexer for a given namespace and name.
-func (s cephNFSNamespaceLister) Get(name string) (*v1.CephNFS, error) {
-	obj, exists, err := s.indexer.GetByKey(s.namespace + "/" + name)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, errors.NewNotFound(v1.Resource("cephnfs"), name)
-	}
-	return obj.(*v1.CephNFS), nil
+	listers.ResourceIndexer[*cephrookiov1.CephNFS]
 }

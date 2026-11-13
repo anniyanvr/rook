@@ -20,14 +20,26 @@ set -xEe
 if [ -z "$DAEMON_TO_VALIDATE" ]; then
   DAEMON_TO_VALIDATE=all
 fi
-OSD_COUNT=$2
+# The second script arg is optional and depends on the daemon
+if [ "$DAEMON_TO_VALIDATE" == "rgw" ]; then
+  export OBJECT_STORE_NAME=$2
+else
+  export OSD_COUNT=$2
+  # default to the name of the object store from object-a.yaml
+  export OBJECT_STORE_NAME=store-a
+fi
 
 #############
 # FUNCTIONS #
 #############
-EXEC_COMMAND="kubectl -n rook-ceph exec $(kubectl get pod -l app=rook-ceph-tools -n rook-ceph -o jsonpath='{.items[*].metadata.name}') -- ceph --connect-timeout 3"
+# Wait for the toolbox to be ready before the per-daemon wait budgets start, and exec through
+# the deployment so every call resolves a currently-ready pod instead of a name captured once
+# (a pod whose container is still creating, or that has been replaced, fails every exec with
+# "container not found").
+kubectl -n rook-ceph rollout status deploy/rook-ceph-tools --timeout=120s
+EXEC_COMMAND="kubectl -n rook-ceph exec deploy/rook-ceph-tools -- ceph --connect-timeout 10"
 
-function wait_for_daemon () {
+function wait_for_daemon() {
   timeout=90
   daemon_to_test=$1
   while [ $timeout -ne 0 ]; do
@@ -44,23 +56,24 @@ function wait_for_daemon () {
 }
 
 function test_demo_mon {
-  # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq quorum")
+  wait_for_daemon "$EXEC_COMMAND -s | grep -sq quorum"
 }
 
 function test_demo_mgr {
-  # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'mgr:'")
+  wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'mgr:'"
 }
 
 function test_demo_osd {
-  # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq \"$OSD_COUNT osds: $OSD_COUNT up.*, $OSD_COUNT in.*\"")
+  wait_for_daemon "$EXEC_COMMAND -s | grep -sq \"$OSD_COUNT osds: $OSD_COUNT up.*, $OSD_COUNT in.*\""
 }
 
 function test_demo_rgw {
-  # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'rgw:'")
+  timeout 360 bash -x <<-'EOF'
+    until [[ "$(kubectl -n rook-ceph get pods -l rgw=$OBJECT_STORE_NAME -o 'jsonpath={..status.conditions[?(@.type=="Ready")].status}')" == "True" ]]; do
+      echo "waiting for rgw pods to be ready"
+      sleep 5
+    done
+EOF
 }
 
 function test_demo_mds {
@@ -68,29 +81,32 @@ function test_demo_mds {
   # NOTE: metadata server always takes up to 5 sec to run
   # so we first check if the pools exit, from that we assume that
   # the process will start. We stop waiting after 10 seconds.
-  # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND osd dump | grep -sq cephfs && $EXEC_COMMAND -s | grep -sq up")
+  wait_for_daemon "$EXEC_COMMAND osd dump | grep -sq cephfs && $EXEC_COMMAND -s | grep -sq up"
 }
 
 function test_demo_rbd_mirror {
-  # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'rbd-mirror:'")
+  wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'rbd-mirror:'"
 }
 
 function test_demo_fs_mirror {
-  # shellcheck disable=SC2046
-    return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'cephfs-mirror:'")
-}
-
-function test_demo_pool {
-  # shellcheck disable=SC2046
-  return $(wait_for_daemon "$EXEC_COMMAND -s | grep -sq '11 pools'")
+  wait_for_daemon "$EXEC_COMMAND -s | grep -sq 'cephfs-mirror:'"
 }
 
 function test_csi {
-  timeout 180 bash <<-'EOF'
-    until [[ "$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running|grep -c ^csi-)" -eq 4 ]]; do
-      echo "waiting for csi pods to be ready"
+  csi_pod_min_count="${CSI_POD_MIN_COUNT:-7}"
+  timeout 360 bash -x <<EOF
+    until [[ "\$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running | grep -c csi.)" -ge "${csi_pod_min_count}" ]]; do
+      echo "waiting for csi pods to be ready (need ${csi_pod_min_count})"
+      kubectl -n rook-ceph get pods | grep csi
+      sleep 5
+    done
+EOF
+}
+
+function test_nfs {
+  timeout 360 bash <<-'EOF'
+    until [[ "$(kubectl -n rook-ceph get pods --field-selector=status.phase=Running|grep -c ^rook-ceph-nfs-)" -eq 1 ]]; do
+      echo "waiting for nfs pods to be ready"
       sleep 5
     done
 EOF
@@ -104,13 +120,13 @@ test_demo_mon
 test_demo_mgr
 
 if [[ "$DAEMON_TO_VALIDATE" == "all" ]]; then
-  daemons_list="osd mds rgw rbd_mirror fs_mirror"
+  daemons_list="osd mds rgw rbd_mirror fs_mirror nfs"
 else
   # change commas to space
   comma_to_space=${DAEMON_TO_VALIDATE//,/ }
 
   # transform to an array
-  IFS=" " read -r -a array <<< "$comma_to_space"
+  IFS=" " read -r -a array <<<"$comma_to_space"
 
   # sort and remove potential duplicate
   daemons_list=$(echo "${array[@]}" | tr ' ' '\n' | sort -u | tr '\n' ' ')
@@ -118,32 +134,35 @@ fi
 
 for daemon in $daemons_list; do
   case "$daemon" in
-    mon)
-      continue
-      ;;
-    mgr)
-      continue
-      ;;
-    osd)
-      test_demo_osd
-      ;;
-    mds)
-      test_demo_mds
-      ;;
-    rgw)
-      test_demo_rgw
-      ;;
-    rbd_mirror)
-      test_demo_rbd_mirror
-      ;;
-    fs_mirror)
-      test_demo_fs_mirror
-      ;;
-    *)
-      log "ERROR: unknown daemon to validate!"
-      log "Available daemon are: mon mgr osd mds rgw rbd_mirror fs_mirror"
-      exit 1
-      ;;
+  mon)
+    continue
+    ;;
+  mgr)
+    continue
+    ;;
+  osd)
+    test_demo_osd
+    ;;
+  mds)
+    test_demo_mds
+    ;;
+  rgw)
+    test_demo_rgw
+    ;;
+  rbd_mirror)
+    test_demo_rbd_mirror
+    ;;
+  fs_mirror)
+    test_demo_fs_mirror
+    ;;
+  nfs)
+    test_nfs
+    ;;
+  *)
+    log "ERROR: unknown daemon to validate!"
+    log "Available daemon are: mon mgr osd mds rgw rbd_mirror fs_mirror"
+    exit 1
+    ;;
   esac
 done
 

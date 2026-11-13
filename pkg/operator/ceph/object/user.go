@@ -20,10 +20,12 @@ import (
 	"encoding/json"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/ceph/go-ceph/rgw/admin"
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/util/exec"
+	"github.com/rook/rook/pkg/util/log"
 )
 
 const (
@@ -54,7 +56,11 @@ func decodeUser(data string) (*ObjectUser, int, error) {
 	var user admin.User
 	err := json.Unmarshal([]byte(data), &user)
 	if err != nil {
-		return nil, RGWErrorParse, errors.Wrapf(err, "failed to unmarshal json. %s", data)
+		// the payload is a radosgw-admin user document, which carries the user's S3
+		// keys. A type error names the offending field, but a syntax error reports
+		// only its message, so report the response size in its place.
+		logger.Tracef("failed to unmarshal user json: %s", data) // only trace(insecure) logged because the response carries the user's S3 keys
+		return nil, RGWErrorParse, errors.Wrapf(err, "failed to unmarshal user json (%d bytes)", len(data))
 	}
 
 	rookUser := ObjectUser{UserID: user.ID, DisplayName: &user.DisplayName, Email: &user.Email}
@@ -82,17 +88,22 @@ func decodeUser(data string) (*ObjectUser, int, error) {
 }
 
 // GetUser returns the user with the given ID.
-// The function is used **ONCE** only to provision so the RGW Admin Ops User
+// The function is used **ONCE** only to provision the RGW Admin Ops User
 // Subsequent interaction with the API will be done with the created user
 func GetUser(c *Context, id string) (*ObjectUser, int, error) {
-	logger.Debugf("getting s3 user %q", id)
+	log.NamedDebug(c.NsName(), logger, "getting s3 user %q", id)
 	// note: err is set for non-existent user but result output is also empty
 	result, err := runAdminCommand(c, false, "user", "info", "--uid", id)
 	if strings.Contains(result, "no user info saved") {
 		return nil, RGWErrorNotFound, errors.New("warn: s3 user not found")
 	}
 	if err != nil {
-		return nil, RGWErrorUnknown, errors.Wrapf(err, "radosgw-admin command err. %s", result)
+		// the output is whatever `user info` wrote before failing, which is the user
+		// document and its S3 keys when the command printed one, and this error is
+		// reported into the CephObjectStore status and a Kubernetes event, so report
+		// the response size in place of the response.
+		log.NamedTrace(c.NsName(), logger, "failed to get s3 user %q: %s", id, result) // only trace(insecure) logged because the response may carry the user's S3 keys
+		return nil, RGWErrorUnknown, errors.Wrapf(err, "radosgw-admin command err. user info response (%d bytes)", len(result))
 	}
 	match, err := extractJSON(result)
 	if err != nil {
@@ -102,10 +113,17 @@ func GetUser(c *Context, id string) (*ObjectUser, int, error) {
 }
 
 // CreateUser creates a new user with the information given.
-// The function is used **ONCE** only to provision so the RGW Admin Ops User
+// The function is used **ONCE** only to provision the RGW Admin Ops User
 // Subsequent interaction with the API will be done with the created user
 func CreateUser(c *Context, user ObjectUser, force bool) (*ObjectUser, int, error) {
-	logger.Debugf("creating s3 user %q", user.UserID)
+	log.NamedDebug(c.NsName(), logger, "creating s3 user %q", user.UserID)
+	timeout := exec.CephCommandsTimeout
+	if user.UserID == RGWAdminOpsUserSecretName {
+		// Setting a really long timeout for the command that creates the admin user
+		// This is a workaround until we find what is the root cause that the creation
+		// is commonly taking about two minutes, instead of sub-second as in previous releases.
+		timeout = 10 * time.Minute
+	}
 
 	if strings.TrimSpace(user.UserID) == "" {
 		return nil, RGWErrorBadData, errors.New("userId cannot be empty")
@@ -134,11 +152,19 @@ func CreateUser(c *Context, user ObjectUser, force bool) (*ObjectUser, int, erro
 		args = append(args, "--caps", rgwAdminOpsUserCaps)
 	}
 
+	if user.AccessKey != nil {
+		args = append(args, "--access-key", *user.AccessKey)
+	}
+
+	if user.SecretKey != nil {
+		args = append(args, "--secret", *user.SecretKey)
+	}
+
 	if force {
 		args = append(args, "--yes-i-really-mean-it")
 	}
 
-	result, err := runAdminCommand(c, true, args...)
+	result, err := runAdminCommandWithTimeout(c, true, timeout, args...)
 	if err != nil {
 		if code, err := exec.ExtractExitCode(err); err == nil && code == int(syscall.EEXIST) {
 			return nil, ErrorCodeFileExists, errors.New("s3 user already exists")
@@ -162,8 +188,31 @@ func CreateUser(c *Context, user ObjectUser, force bool) (*ObjectUser, int, erro
 	return decodeUser(result)
 }
 
-func ListUserBuckets(c *Context, id string, opts ...string) (string, error) {
+// CreateOrRecreateUserIfExists if the user doesn't exist, it is created, should it already exist it is deleted and re-created
+// It is called from the rgw dashboard setup logic.
+func CreateOrRecreateUserIfExists(c *Context, user ObjectUser, force bool) (*ObjectUser, int, error) {
+	objUser, errCode, err := CreateUser(c, user, force)
+	// CreateUser reports an existing user as ErrorCodeFileExists along with an error, so the code
+	// has to be checked first or the user is never re-created.
+	if errCode != ErrorCodeFileExists && (err != nil || errCode != RGWErrorNone) {
+		return nil, errCode, err
+	}
 
+	switch errCode {
+	case RGWErrorNone:
+		return objUser, errCode, err
+	case ErrorCodeFileExists:
+		// If the user already exists, delete and re-create it
+		_, err := DeleteUser(c, user.UserID)
+		if err != nil {
+			return nil, RGWErrorUnknown, err
+		}
+	}
+
+	return CreateUser(c, user, force)
+}
+
+func ListUserBuckets(c *Context, id string, opts ...string) (string, error) {
 	args := []string{"bucket", "list", "--uid", id}
 	if opts != nil {
 		args = append(args, opts...)

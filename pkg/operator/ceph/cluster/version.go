@@ -24,10 +24,12 @@ import (
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
+	"github.com/rook/rook/pkg/util/log"
 )
 
 func (c *ClusterController) detectAndValidateCephVersion(cluster *cluster) (*cephver.CephVersion, bool, error) {
 	version, err := controller.DetectCephVersion(
+		c.OpManagerCtx,
 		c.rookImage,
 		cluster.Namespace,
 		detectVersionName,
@@ -39,13 +41,13 @@ func (c *ClusterController) detectAndValidateCephVersion(cluster *cluster) (*cep
 		return nil, false, err
 	}
 
-	logger.Info("validating ceph version from provided image")
+	log.NamespacedInfo(cluster.Namespace, logger, "validating ceph version from provided image")
 	if err := cluster.validateCephVersion(version); err != nil {
 		return nil, cluster.isUpgrade, err
 	}
 
 	// Update ceph version field in cluster object status
-	c.updateClusterCephVersion(cluster.Spec.CephVersion.Image, *version)
+	c.updateClusterCephVersion(cluster, *version)
 
 	return version, cluster.isUpgrade, nil
 }
@@ -53,7 +55,7 @@ func (c *ClusterController) detectAndValidateCephVersion(cluster *cluster) (*cep
 func (c *cluster) printOverallCephVersion() {
 	versions, err := daemonclient.GetAllCephDaemonVersions(c.context, c.ClusterInfo)
 	if err != nil {
-		logger.Errorf("failed to get ceph daemons versions. %v", err)
+		log.NamespacedError(c.Namespace, logger, "failed to get ceph daemons versions. %v", err)
 		return
 	}
 
@@ -61,21 +63,21 @@ func (c *cluster) printOverallCephVersion() {
 		for v := range versions.Overall {
 			version, err := cephver.ExtractCephVersion(v)
 			if err != nil {
-				logger.Errorf("failed to extract ceph version. %v", err)
+				log.NamespacedError(c.Namespace, logger, "failed to extract ceph version. %v", err)
 				return
 			}
 			vv := *version
-			logger.Infof("successfully upgraded cluster to version: %q", vv.String())
+			log.NamespacedInfo(c.Namespace, logger, "successfully upgraded cluster to version: %q", vv.String())
 		}
 	} else {
 		// This shouldn't happen, but let's log just in case
-		logger.Warningf("upgrade orchestration completed but somehow we still have more than one Ceph version running. %v:", versions.Overall)
+		log.NamespacedWarning(c.Namespace, logger, "upgrade orchestration completed but somehow we still have more than one Ceph version running. %v:", versions.Overall)
 	}
 }
 
-// This function compare the Ceph spec image and the cluster running version
+// This function compares the Ceph spec image and the cluster running version
 // It returns true if the image is different and false if identical
-func diffImageSpecAndClusterRunningVersion(imageSpecVersion cephver.CephVersion, runningVersions cephv1.CephDaemonsVersions) (bool, error) {
+func (c *cluster) diffImageSpecAndClusterRunningVersion(imageSpecVersion cephver.CephVersion, runningVersions cephv1.CephDaemonsVersions) (bool, error) {
 	numberOfCephVersions := len(runningVersions.Overall)
 	if numberOfCephVersions == 0 {
 		// let's return immediately
@@ -84,7 +86,7 @@ func diffImageSpecAndClusterRunningVersion(imageSpecVersion cephver.CephVersion,
 
 	if numberOfCephVersions > 1 {
 		// let's return immediately
-		logger.Warningf("it looks like we have more than one ceph version running. triggering upgrade. %+v:", runningVersions.Overall)
+		log.NamespacedWarning(c.Namespace, logger, "it looks like we have more than one ceph version running. triggering upgrade. %+v:", runningVersions.Overall)
 		return true, nil
 	}
 
@@ -92,24 +94,25 @@ func diffImageSpecAndClusterRunningVersion(imageSpecVersion cephver.CephVersion,
 		for v := range runningVersions.Overall {
 			version, err := cephver.ExtractCephVersion(v)
 			if err != nil {
-				logger.Errorf("failed to extract ceph version. %v", err)
+				log.NamespacedError(c.Namespace, logger, "failed to extract ceph version. %v", err)
 				return false, err
 			}
 			clusterRunningVersion := *version
 
 			// If this is the same version
 			if cephver.IsIdentical(clusterRunningVersion, imageSpecVersion) {
-				logger.Debugf("both cluster and image spec versions are identical, doing nothing %s", imageSpecVersion.String())
+				log.NamespacedDebug(c.Namespace, logger, "both cluster and image spec versions are identical, doing nothing %s", imageSpecVersion.String())
 				return false, nil
 			}
 
 			if cephver.IsSuperior(imageSpecVersion, clusterRunningVersion) {
-				logger.Infof("image spec version %s is higher than the running cluster version %s, upgrading", imageSpecVersion.String(), clusterRunningVersion.String())
+				log.NamespacedInfo(c.Namespace, logger, "image spec version %s is higher than the running cluster version %s, upgrading", imageSpecVersion.String(), clusterRunningVersion.String())
 				return true, nil
 			}
 
 			if cephver.IsInferior(imageSpecVersion, clusterRunningVersion) {
-				return true, errors.Errorf("image spec version %s is lower than the running cluster version %s, downgrading is not supported", imageSpecVersion.String(), clusterRunningVersion.String())
+				log.NamespacedWarning(c.Namespace, logger, "image spec version %s is lower than the running cluster version %s, downgrading is not supported", imageSpecVersion.String(), clusterRunningVersion.String())
+				return true, nil
 			}
 		}
 	}
@@ -127,11 +130,11 @@ func (c *cluster) validateCephVersion(version *cephver.CephVersion) error {
 			if !c.Spec.CephVersion.AllowUnsupported {
 				return errors.Errorf("allowUnsupported must be set to true to run with this version %q", version.String())
 			}
-			logger.Warningf("unsupported ceph version detected: %q, pursuing", version)
+			log.NamespacedWarning(c.Namespace, logger, "unsupported ceph version detected: %q, pursuing", version)
 		}
 
 		if version.Unsupported() {
-			logger.Errorf("UNSUPPORTED: ceph version %q detected, it is recommended to rollback to the previous pin-point stable release, pursuing anyways", version)
+			log.NamespacedError(c.Namespace, logger, "UNSUPPORTED: ceph version %q detected, it is recommended to rollback to the previous pin-point stable release, pursuing anyways", version)
 		}
 	}
 
@@ -141,19 +144,19 @@ func (c *cluster) validateCephVersion(version *cephver.CephVersion) error {
 	// state we are in and if we should upgrade or not
 
 	// Try to load clusterInfo so we can compare the running version with the one from the spec image
-	clusterInfo, _, _, err := mon.LoadClusterInfo(c.context, c.ClusterInfo.Context, c.Namespace)
+	clusterInfo, _, _, err := controller.LoadClusterInfo(c.context, c.ClusterInfo.Context, c.Namespace, c.Spec)
 	if err == nil {
 		clusterInfo.Context = c.ClusterInfo.Context
 		// Write connection info (ceph config file and keyring) for ceph commands
 		err = mon.WriteConnectionConfig(c.context, clusterInfo)
 		if err != nil {
-			logger.Errorf("failed to write config. attempting to continue. %v", err)
+			log.NamespacedError(c.Namespace, logger, "failed to write config. attempting to continue. %v", err)
 		}
 	}
 
-	if !clusterInfo.IsInitialized(false) {
+	if err := clusterInfo.IsInitialized(); err != nil {
 		// If not initialized, this is likely a new cluster so there is nothing to do
-		logger.Debug("cluster not initialized, nothing to validate")
+		log.NamespacedDebug(c.Namespace, logger, "cluster not initialized, nothing to validate. %v", err)
 		return nil
 	}
 
@@ -168,21 +171,21 @@ func (c *cluster) validateCephVersion(version *cephver.CephVersion) error {
 	// On external cluster setup, if we don't bootstrap any resources in the Kubernetes cluster then
 	// there is no need to validate the Ceph image further
 	if c.Spec.External.Enable && c.Spec.CephVersion.Image == "" {
-		logger.Debug("no spec image specified on external cluster, not validating Ceph version.")
+		log.NamespacedDebug(c.Namespace, logger, "no spec image specified on external cluster, not validating Ceph version.")
 		return nil
 	}
 
 	// Get cluster running versions
 	versions, err := daemonclient.GetAllCephDaemonVersions(c.context, c.ClusterInfo)
 	if err != nil {
-		logger.Errorf("failed to get ceph daemons versions, this typically happens during the first cluster initialization. %v", err)
+		log.NamespacedError(c.Namespace, logger, "failed to get ceph daemons versions, this typically happens during the first cluster initialization. %v", err)
 		return nil
 	}
 
 	runningVersions := *versions
-	differentImages, err := diffImageSpecAndClusterRunningVersion(*version, runningVersions)
+	differentImages, err := c.diffImageSpecAndClusterRunningVersion(*version, runningVersions)
 	if err != nil {
-		logger.Errorf("failed to determine if we should upgrade or not. %v", err)
+		log.NamespacedError(c.Namespace, logger, "failed to determine if we should upgrade or not. %v", err)
 		// we shouldn't block the orchestration if we can't determine the version of the image spec, we proceed anyway in best effort
 		// we won't be able to check if there is an update or not and what to do, so we don't check the cluster status either
 		// This will happen if someone uses ceph/daemon:latest-master for instance
@@ -194,14 +197,25 @@ func (c *cluster) validateCephVersion(version *cephver.CephVersion) error {
 		// check ceph's status, if not healthy we fail
 		cephHealthy := daemonclient.IsCephHealthy(c.context, c.ClusterInfo)
 		if !cephHealthy {
+			// HEALTH_ERR from cephx key type checks is expected mid-upgrade once mons run a
+			// version that supports AES256K keys. It only clears when the upgrade finishes and
+			// keys are rotated, so it must not block the upgrade from resuming.
+			clusterObj := &cephv1.CephCluster{}
+			if err := c.context.Client.Get(c.ClusterInfo.Context, c.namespacedName, clusterObj); err == nil &&
+				controller.CanIgnoreHealthErrStatusInReconcile(*clusterObj, "ceph-cluster-controller") {
+				log.NamespacedWarning(c.Namespace, logger, "ceph is not healthy, but all health errors can be cleared by continuing the upgrade, proceeding")
+				cephHealthy = true
+			}
+		}
+		if !cephHealthy {
 			if c.Spec.SkipUpgradeChecks {
-				logger.Warning("ceph is not healthy but SkipUpgradeChecks is set, forcing upgrade.")
+				log.NamespacedWarning(c.Namespace, logger, "ceph is not healthy but SkipUpgradeChecks is set, forcing upgrade.")
 			} else {
 				return errors.Errorf("ceph status in namespace %s is not healthy, refusing to upgrade. Either fix the health issue or force an update by setting skipUpgradeChecks to true in the cluster CR", c.Namespace)
 			}
 		}
 		// This is an upgrade
-		logger.Infof("upgrading ceph cluster to %q", version.String())
+		log.NamespacedInfo(c.Namespace, logger, "upgrading ceph cluster to %q", version.String())
 		c.isUpgrade = true
 	}
 

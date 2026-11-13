@@ -84,7 +84,7 @@ func TestTolerationSet(t *testing.T) {
 			Effect:   corev1.TaintEffectNoExecute,
 		},
 	}
-	//identical to uniqueTolerationsManualA
+	// identical to uniqueTolerationsManualA
 	uniqueTolerationsManualB := []corev1.Toleration{
 		// key1
 		//   exists
@@ -149,8 +149,9 @@ func TestTolerationSet(t *testing.T) {
 	for i := range uniqueTolerationsManualA {
 		tolerationsWithDuplicates = append(tolerationsWithDuplicates, uniqueTolerationsManualA[i])
 
-		//append the previous one again if it's within range, else append the last one
+		// append the previous one again if it's within range, else append the last one
 		if i > 0 {
+			// #nosec G602 -- i > 0 is checked above so i-1 is always within bounds
 			tolerationsWithDuplicates = append(tolerationsWithDuplicates, uniqueTolerationsManualB[i-1])
 		} else {
 			tolerationsWithDuplicates = append(tolerationsWithDuplicates, uniqueTolerationsManualB[len(uniqueTolerationsManualB)-1])
@@ -164,6 +165,17 @@ func TestTolerationSet(t *testing.T) {
 	uniqueTolerations := uniqueTolerationsMap.ToList()
 
 	assert.Equal(t, len(uniqueTolerationsManualA), len(uniqueTolerations))
+	assert.Equal(t, []string{
+		"key1-Equal-NoExecute-value2",
+		"key1-Equal-NoSchedule-value1",
+		"key1-Equal-NoSchedule-value2",
+		"key1-Exists-NoSchedule-",
+		"key1-Exists-PreferNoSchedule-",
+		"key2-Equal-NoExecute-value2",
+		"key2-Equal-NoSchedule-value1",
+		"key2-Equal-NoSchedule-value2",
+		"key2-Exists-NoSchedule-",
+	}, tolerationKeys(uniqueTolerations))
 	for _, tolerationI := range uniqueTolerationsManualA {
 		found := false
 		for _, tolerationJ := range uniqueTolerations {
@@ -173,4 +185,12 @@ func TestTolerationSet(t *testing.T) {
 		}
 		assert.True(t, found)
 	}
+}
+
+func tolerationKeys(tolerations []corev1.Toleration) []string {
+	keys := make([]string, 0, len(tolerations))
+	for _, toleration := range tolerations {
+		keys = append(keys, getKey(toleration))
+	}
+	return keys
 }

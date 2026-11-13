@@ -26,44 +26,48 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
+	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util/log"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
 
 const (
-	// #nosec G101 since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
-	poolMirrorBoostrapPeerSecretName = "pool-peer-token"
-	// #nosec G101 since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
-	fsMirrorBoostrapPeerSecretName = "fs-peer-token"
-	// #nosec G101 since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
-	clusterMirrorBoostrapPeerSecretName = "cluster-peer-token"
-	// RBDMirrorBootstrapPeerSecretName #nosec G101 since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
+	//nolint:gosec // since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
+	poolMirrorBootstrapPeerSecretName = "pool-peer-token"
+	//nolint:gosec // since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
+	fsMirrorBootstrapPeerSecretName = "fs-peer-token"
+	//nolint:gosec // // since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
+	clusterMirrorBootstrapPeerSecretName = "cluster-peer-token"
+	//nolint:gosec // since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
 	RBDMirrorBootstrapPeerSecretName = "rbdMirrorBootstrapPeerSecretName"
-	// FSMirrorBootstrapPeerSecretName #nosec G101 since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
+	//nolint:gosec // since this is not leaking any hardcoded credentials, it's just the prefix of the secret name
 	FSMirrorBootstrapPeerSecretName = "fsMirrorBootstrapPeerSecretName"
 )
 
 func CreateBootstrapPeerSecret(ctx *clusterd.Context, clusterInfo *cephclient.ClusterInfo, object client.Object, ownerInfo *k8sutil.OwnerInfo) (reconcile.Result, error) {
 	var err error
 	var ns, name, daemonType string
-	var boostrapToken []byte
+	var bootstrapToken []byte
 	switch objectType := object.(type) {
 	case *cephv1.CephBlockPool:
 		ns = objectType.Namespace
 		name = objectType.Name
 		daemonType = "rbd"
 		// Create rbd mirror bootstrap peer token
-		boostrapToken, err = cephclient.CreateRBDMirrorBootstrapPeer(ctx, clusterInfo, name)
+		bootstrapToken, err = cephclient.CreateRBDMirrorBootstrapPeer(ctx, clusterInfo, name)
 		if err != nil {
 			return ImmediateRetryResult, errors.Wrapf(err, "failed to create %s-mirror bootstrap peer", daemonType)
 		}
 
 		// Add additional information to the peer token
-		boostrapToken, err = expandBootstrapPeerToken(ctx, clusterInfo, boostrapToken)
+		bootstrapToken, err = expandBootstrapPeerToken(ctx, clusterInfo, bootstrapToken)
 		if err != nil {
 			return ImmediateRetryResult, errors.Wrap(err, "failed to add extra information to rbd-mirror bootstrap peer")
 		}
@@ -71,14 +75,27 @@ func CreateBootstrapPeerSecret(ctx *clusterd.Context, clusterInfo *cephclient.Cl
 	case *cephv1.CephCluster:
 		ns = objectType.Namespace
 		daemonType = "cluster-rbd"
+
+		// check if rbd-mirror-peer user needs to be rotated
+		shouldRotateKeys, keyType, err := shouldRotateMirrorPeerKeys(ctx, clusterInfo)
+		if err != nil {
+			return ImmediateRetryResult, errors.Wrap(err, "failed to check if rbd-mirror-peer keys should be rotated or not")
+		}
+
 		// Create rbd mirror bootstrap peer token
-		boostrapToken, err = cephclient.CreateRBDMirrorBootstrapPeerWithoutPool(ctx, clusterInfo)
+		bootstrapToken, err = cephclient.CreateRBDMirrorBootstrapPeerWithoutPool(ctx, clusterInfo, keyType, shouldRotateKeys)
 		if err != nil {
 			return ImmediateRetryResult, errors.Wrapf(err, "failed to create %s-mirror bootstrap peer", daemonType)
 		}
 
+		// update rbd mirror peer cephx status in cephCluster resource
+		err = updateCephClusterCephxRbdMirrorStatus(ctx, clusterInfo, shouldRotateKeys)
+		if err != nil {
+			return ImmediateRetryResult, errors.Wrapf(err, "failed to update rbd-mirror-peer cephx status in the ceph cluster")
+		}
+
 		// Add additional information to the peer token
-		boostrapToken, err = expandBootstrapPeerToken(ctx, clusterInfo, boostrapToken)
+		bootstrapToken, err = expandBootstrapPeerToken(ctx, clusterInfo, bootstrapToken)
 		if err != nil {
 			return ImmediateRetryResult, errors.Wrap(err, "failed to add extra information to rbd-mirror bootstrap peer")
 		}
@@ -87,7 +104,7 @@ func CreateBootstrapPeerSecret(ctx *clusterd.Context, clusterInfo *cephclient.Cl
 		ns = objectType.Namespace
 		name = objectType.Name
 		daemonType = "cephfs"
-		boostrapToken, err = cephclient.CreateFSMirrorBootstrapPeer(ctx, clusterInfo, name)
+		bootstrapToken, err = cephclient.CreateFSMirrorBootstrapPeer(ctx, clusterInfo, name)
 		if err != nil {
 			return ImmediateRetryResult, errors.Wrapf(err, "failed to create %s-mirror bootstrap peer", daemonType)
 		}
@@ -97,7 +114,7 @@ func CreateBootstrapPeerSecret(ctx *clusterd.Context, clusterInfo *cephclient.Cl
 	}
 
 	// Generate and create a Kubernetes Secret with this token
-	s := GenerateBootstrapPeerSecret(object, boostrapToken)
+	s := GenerateBootstrapPeerSecret(object, bootstrapToken)
 
 	// set ownerref to the Secret
 	err = ownerInfo.SetControllerReference(s)
@@ -106,8 +123,8 @@ func CreateBootstrapPeerSecret(ctx *clusterd.Context, clusterInfo *cephclient.Cl
 	}
 
 	// Create Secret
-	logger.Debugf("store %s-mirror bootstrap token in a Kubernetes Secret %q in namespace %q", daemonType, s.Name, ns)
-	_, err = k8sutil.CreateOrUpdateSecret(ctx.Clientset, s)
+	log.NamedDebug(NsName(ns, s.Name), logger, "store %s-mirror bootstrap token in a Kubernetes Secret", daemonType)
+	_, err = k8sutil.CreateOrUpdateSecret(clusterInfo.Context, ctx.Clientset, s)
 	if err != nil && !kerrors.IsAlreadyExists(err) {
 		return ImmediateRetryResult, errors.Wrapf(err, "failed to create %s-mirror bootstrap peer %q secret", daemonType, s.Name)
 	}
@@ -136,7 +153,7 @@ func GenerateBootstrapPeerSecret(object client.Object, token []byte) *v1.Secret 
 
 	s := &v1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      buildBoostrapPeerSecretName(object),
+			Name:      buildBootstrapPeerSecretName(object),
 			Namespace: entityNamespace,
 		},
 		Data: map[string][]byte{
@@ -149,14 +166,14 @@ func GenerateBootstrapPeerSecret(object client.Object, token []byte) *v1.Secret 
 	return s
 }
 
-func buildBoostrapPeerSecretName(object client.Object) string {
+func buildBootstrapPeerSecretName(object client.Object) string {
 	switch objectType := object.(type) {
 	case *cephv1.CephFilesystem:
-		return fmt.Sprintf("%s-%s", fsMirrorBoostrapPeerSecretName, objectType.Name)
+		return fmt.Sprintf("%s-%s", fsMirrorBootstrapPeerSecretName, objectType.Name)
 	case *cephv1.CephBlockPool:
-		return fmt.Sprintf("%s-%s", poolMirrorBoostrapPeerSecretName, objectType.Name)
+		return fmt.Sprintf("%s-%s", poolMirrorBootstrapPeerSecretName, objectType.Name)
 	case *cephv1.CephCluster:
-		return fmt.Sprintf("%s-%s", clusterMirrorBoostrapPeerSecretName, objectType.Name)
+		return fmt.Sprintf("%s-%s", clusterMirrorBootstrapPeerSecretName, objectType.Name)
 	}
 
 	return ""
@@ -167,9 +184,9 @@ func GenerateStatusInfo(object client.Object) map[string]string {
 
 	switch object.(type) {
 	case *cephv1.CephFilesystem:
-		m[FSMirrorBootstrapPeerSecretName] = buildBoostrapPeerSecretName(object)
+		m[FSMirrorBootstrapPeerSecretName] = buildBootstrapPeerSecretName(object)
 	case *cephv1.CephBlockPool:
-		m[RBDMirrorBootstrapPeerSecretName] = buildBoostrapPeerSecretName(object)
+		m[RBDMirrorBootstrapPeerSecretName] = buildBootstrapPeerSecretName(object)
 	}
 
 	return m
@@ -221,4 +238,50 @@ func expandBootstrapPeerToken(ctx *clusterd.Context, clusterInfo *cephclient.Clu
 
 	// Return the base64 encoded token
 	return []byte(base64.StdEncoding.EncodeToString(decodedTokenBackToJSON)), nil
+}
+
+func shouldRotateMirrorPeerKeys(c *clusterd.Context, clusterInfo *cephclient.ClusterInfo) (bool, string, error) {
+	cephObj := &cephv1.CephCluster{}
+	if err := c.Client.Get(clusterInfo.Context, clusterInfo.NamespacedName(), cephObj); err != nil {
+		return false, "", errors.Wrapf(err, "failed to get cluster %v to get the cephx keys to rotate.", clusterInfo.NamespacedName())
+	}
+
+	// TODO: for rotation WithCephVersionUpdate fix this to have the right runningCephVersion and desiredCephVersion
+	desiredCephVersion := clusterInfo.CephVersion
+	runningCephVersion := clusterInfo.CephVersion
+
+	// do not ignore key type for non-daemon rbd mirror peer key
+	shouldRotateKeys, err := keyring.ShouldRotateCephxKeys(
+		cephObj.Spec.Security.CephX.RBDMirrorPeer, runningCephVersion, desiredCephVersion, cephObj.Status.Cephx.RBDMirrorPeer, false, clusterInfo.Namespace)
+	if err != nil {
+		return false, "", errors.Wrap(err, "failed to check if mirror peer keys should be rotated or not")
+	}
+
+	// mirror peer keys are non-daemon and so need to be able to be specified by users
+	keyType := cephObj.Spec.Security.CephX.RBDMirrorPeer.KeyType
+
+	return shouldRotateKeys, string(keyType), nil
+}
+
+// updateCephClusterCephxRbdMirrorStatus fetches the latest cephCluster instance and updates mirror peer cephx status
+func updateCephClusterCephxRbdMirrorStatus(c *clusterd.Context, clusterInfo *cephclient.ClusterInfo, didRotate bool) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cluster := &cephv1.CephCluster{}
+		if err := c.Client.Get(clusterInfo.Context, clusterInfo.NamespacedName(), cluster); err != nil {
+			return errors.Wrapf(err, "failed to get cluster %v to update the conditions.", clusterInfo.NamespacedName())
+		}
+		keyType := cluster.Spec.Security.CephX.RBDMirrorPeer.KeyType // assume key type is what was specified
+		updatedStatus := keyring.UpdatedCephxStatus(didRotate, cluster.Spec.Security.CephX.RBDMirrorPeer, clusterInfo.CephVersion, cluster.Status.Cephx.RBDMirrorPeer, keyType)
+		cluster.Status.Cephx.RBDMirrorPeer = updatedStatus
+		log.NamespacedDebug(clusterInfo.Namespace, logger, "updating rbd-mirror cephx status to %+v", cluster.Status.Cephx.RBDMirrorPeer)
+		if err := reporting.UpdateStatus(c.Client, cluster); err != nil {
+			return errors.Wrap(err, "failed to update cluster cephx status for rbd-mirror")
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	log.NamespacedDebug(clusterInfo.Namespace, logger, "successfully updated rbd-mirror cephx status")
+	return nil
 }

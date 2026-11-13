@@ -18,28 +18,18 @@ package client
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 
 	"github.com/pkg/errors"
 	"github.com/rook/rook/pkg/clusterd"
+	"github.com/rook/rook/pkg/util/log"
 )
 
 const (
-	// CephHealthOK denotes the status of ceph cluster when healthy.
-	CephHealthOK = "HEALTH_OK"
-
-	// CephHealthWarn denotes the status of ceph cluster when unhealthy but recovering.
-	CephHealthWarn = "HEALTH_WARN"
-
-	// CephHealthErr denotes the status of ceph cluster when unhealthy but usually needs
-	// manual intervention.
-	CephHealthErr = "HEALTH_ERR"
+	defaultPgHealthyRegex = `^active(\+(clean|deep|scrubbing|snaptrim|snaptrim_wait))+$`
 )
 
-const (
-	activeClean              = "active+clean"
-	activeCleanScrubbing     = "active+clean+scrubbing"
-	activeCleanScrubbingDeep = "active+clean+scrubbing+deep"
-)
+var defaultPgHealthyRegexCompiled = regexp.MustCompile(defaultPgHealthyRegex)
 
 type CephStatus struct {
 	Health        HealthStatus `json:"health"`
@@ -48,12 +38,10 @@ type CephStatus struct {
 	Quorum        []int        `json:"quorum"`
 	QuorumNames   []string     `json:"quorum_names"`
 	MonMap        MonMap       `json:"monmap"`
-	OsdMap        struct {
-		OsdMap OsdMap `json:"osdmap"`
-	} `json:"osdmap"`
-	PgMap  PgMap  `json:"pgmap"`
-	MgrMap MgrMap `json:"mgrmap"`
-	Fsmap  Fsmap  `json:"fsmap"`
+	OsdMap        OsdMap       `json:"osdmap"`
+	PgMap         PgMap        `json:"pgmap"`
+	MgrMap        MgrMap       `json:"mgrmap"`
+	Fsmap         Fsmap        `json:"fsmap"`
 }
 
 type HealthStatus struct {
@@ -72,6 +60,7 @@ type Summary struct {
 
 type MonMap struct {
 	Epoch        int           `json:"epoch"`
+	NumMons      int           `json:"num_mons"`
 	FSID         string        `json:"fsid"`
 	CreatedTime  string        `json:"created"`
 	ModifiedTime string        `json:"modified"`
@@ -146,7 +135,7 @@ type Fsmap struct {
 		Rank         int    `json:"rank"`
 		Name         string `json:"name"`
 		Status       string `json:"status"`
-		Gid          int    `json:"gid"`
+		Gid          uint64 `json:"gid"`
 	} `json:"by_rank"`
 	UpStandby int `json:"up:standby"`
 }
@@ -191,34 +180,28 @@ func StatusWithUser(context *clusterd.Context, clusterInfo *ClusterInfo) (CephSt
 // msg describes the state of the PGs
 // clean is true if the cluster is clean
 // err is not nil if getting the status failed.
-func IsClusterClean(context *clusterd.Context, clusterInfo *ClusterInfo) (string, bool, error) {
+func IsClusterClean(context *clusterd.Context, clusterInfo *ClusterInfo, pgHealthyRegex string) (string, bool, error) {
 	status, err := Status(context, clusterInfo)
 	if err != nil {
 		return "unable to get PG health", false, err
 	}
-	msg, clean := isClusterClean(status)
+
+	pgHealthyRegexCompiled := defaultPgHealthyRegexCompiled
+	if pgHealthyRegex != "" {
+		pgHealthyRegexCompiled, err = regexp.Compile(pgHealthyRegex)
+		if err != nil {
+			return "unable to compile pgHealthyRegex", false, err
+		}
+	}
+
+	msg, clean := isClusterClean(status, pgHealthyRegexCompiled)
 	if !clean {
 		return msg, false, nil
 	}
 	return msg, true, nil
 }
 
-// IsClusterCleanError returns an error indicating if the cluster is fully clean yet (i.e., all placement
-// groups are in the active+clean state). It returns nil if the cluster is clean.
-// Using IsClusterClean is recommended if you want to differentiate between a failure of the status query and
-// an unclean cluster.
-func IsClusterCleanError(context *clusterd.Context, clusterInfo *ClusterInfo) error {
-	msg, clean, err := IsClusterClean(context, clusterInfo)
-	if err != nil {
-		return err
-	}
-	if !clean {
-		return errors.New(msg)
-	}
-	return nil
-}
-
-func isClusterClean(status CephStatus) (string, bool) {
+func isClusterClean(status CephStatus, pgHealthyRegex *regexp.Regexp) (string, bool) {
 	if status.PgMap.NumPgs == 0 {
 		// there are no PGs yet, that still counts as clean
 		return "cluster has no PGs", true
@@ -226,7 +209,7 @@ func isClusterClean(status CephStatus) (string, bool) {
 
 	cleanPGs := 0
 	for _, pg := range status.PgMap.PgsByState {
-		if pg.StateName == activeClean || pg.StateName == activeCleanScrubbing || pg.StateName == activeCleanScrubbingDeep {
+		if pgHealthyRegex.MatchString(pg.StateName) {
 			cleanPGs += pg.Count
 		}
 	}
@@ -305,4 +288,25 @@ func isCephHealthy(status CephStatus) bool {
 	}
 
 	return false
+}
+
+// MuteHealthWarning mutes or unmutes a Ceph health warning.
+func MuteHealthWarning(context *clusterd.Context, clusterInfo *ClusterInfo, warning, value string) error {
+	var args []string
+	switch value {
+	case "unmute":
+		args = []string{"health", "unmute", warning}
+	case "mute":
+		args = []string{"health", "mute", warning, "--sticky"}
+	default:
+		return fmt.Errorf("unknown health warning mute value %q for warning %q", value, warning)
+	}
+
+	_, err := NewCephCommand(context, clusterInfo, args).Run()
+	if err != nil {
+		logger.Warningf("failed to configure health warning mute %q=%q: %v", warning, value, err)
+		return err
+	}
+	log.NamespacedInfo(clusterInfo.Namespace, logger, "successfully configured health warning mute %q=%q", warning, value)
+	return nil
 }

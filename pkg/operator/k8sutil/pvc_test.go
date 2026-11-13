@@ -17,7 +17,6 @@ limitations under the License.
 package k8sutil
 
 import (
-	"context"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -30,7 +29,6 @@ import (
 )
 
 func TestExpandPVCIfRequired(t *testing.T) {
-
 	testcases := []struct {
 		label            string
 		currentPVCSize   string
@@ -84,7 +82,7 @@ func TestExpandPVCIfRequired(t *testing.T) {
 			AccessModes: []v1.PersistentVolumeAccessMode{
 				v1.ReadWriteOnce,
 			},
-			Resources: v1.ResourceRequirements{
+			Resources: v1.VolumeResourceRequirements{
 				Requests: v1.ResourceList{
 					v1.ResourceName(v1.ResourceStorage): apiresource.MustParse("1Mi"),
 				},
@@ -96,22 +94,29 @@ func TestExpandPVCIfRequired(t *testing.T) {
 	for _, tc := range testcases {
 
 		desiredPVC.Spec.Resources.Requests[v1.ResourceStorage] = apiresource.MustParse(tc.currentPVCSize)
-		storageClass.AllowVolumeExpansion = &tc.expansionAllowed
+		expansionAllowed := tc.expansionAllowed
+		storageClass.AllowVolumeExpansion = &expansionAllowed
 
 		// create fake client with PVC
 		cl := fake.NewClientBuilder().WithRuntimeObjects(desiredPVC, storageClass).Build()
 
 		// get existing PVC
 		existingPVC := &v1.PersistentVolumeClaim{}
-		err := cl.Get(context.TODO(), client.ObjectKey{Name: "test", Namespace: "rook-ceph"}, existingPVC)
+		err := cl.Get(t.Context(), client.ObjectKey{Name: "test", Namespace: "rook-ceph"}, existingPVC)
 		assert.NoError(t, err)
 
 		desiredPVC.Spec.Resources.Requests[v1.ResourceStorage] = apiresource.MustParse(tc.desiredPVCSize)
 
-		ExpandPVCIfRequired(cl, desiredPVC, existingPVC)
+		desiredPVC.Status = v1.PersistentVolumeClaimStatus{
+			Capacity: v1.ResourceList{
+				v1.ResourceName(v1.ResourceStorage): apiresource.MustParse("2Mi"),
+			},
+		}
+
+		ExpandPVCIfRequired(t.Context(), cl, desiredPVC, existingPVC)
 
 		// get existing PVC
-		err = cl.Get(context.TODO(), client.ObjectKey{Name: "test", Namespace: "rook-ceph"}, existingPVC)
+		err = cl.Get(t.Context(), client.ObjectKey{Name: "test", Namespace: "rook-ceph"}, existingPVC)
 		assert.NoError(t, err)
 
 		// verify size

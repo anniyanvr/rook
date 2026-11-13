@@ -20,7 +20,7 @@ package test
 The goal here is not to test every individual specification of the pod/container. Testing that the
 generated pod spec has each piece set in the Rook code isn't a particularly effective use of unit
 tests. Any time the Rook code changes the pod spec intentionally, the unit test changes in the
-exact same way, which doesn't really help prevent against errors where devs are changing the wrong
+exact same way, which doesn't really help guard against errors where devs are changing the wrong
 spec values.
 
 Instead, the unit tests should focus on testing things that are universal truths about
@@ -67,10 +67,10 @@ func NewPodSpecTester(t *testing.T, spec *v1.PodSpec) *PodSpecTester {
 func (ps *PodSpecTester) AssertVolumesMeetCephRequirements(
 	daemonType, daemonID string,
 ) {
-	// #nosec because of the word `Secret`
+	//nolint:gosec // because of the word `Secret`
 	keyringSecretName := fmt.Sprintf("rook-ceph-%s-%s-keyring", daemonType, daemonID)
 	if daemonType == config.MonType {
-		// #nosec because of the word `Secret`
+		//nolint:gosec // because of the word `Secret`
 		keyringSecretName = "rook-ceph-mons-keyring"
 	}
 	// CephFS mirror has no index so the daemon name is just "rook-ceph-fs-mirror"
@@ -81,6 +81,7 @@ func (ps *PodSpecTester) AssertVolumesMeetCephRequirements(
 	if daemonType != config.RbdMirrorType && daemonType != config.FilesystemMirrorType {
 		requiredVols = append(requiredVols, "ceph-daemon-data")
 	}
+	requiredVols = append(requiredVols, "ceph-daemons-sock-dir")
 	vols := []string{}
 
 	for _, v := range ps.spec.Volumes {
@@ -128,7 +129,7 @@ func (ps *PodSpecTester) AssertChownContainer(daemonType string) {
 	}
 }
 
-// AssertPriorityClassNameMatch asserts that the pod spec has priorityClassName set to be the same
+// AssertPriorityClassNameMatch asserts that the pod spec has priorityClassName set to the given name.
 func (ps *PodSpecTester) AssertPriorityClassNameMatch(name string) {
 	assert.Equal(ps.t, name, ps.spec.PriorityClassName)
 }

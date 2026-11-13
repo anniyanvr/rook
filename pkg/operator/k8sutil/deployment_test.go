@@ -72,23 +72,25 @@ func TestUpdateMultipleDeploymentsAndWait(t *testing.T) {
 		return d
 	}
 
-	timesCalled := 0
+	timesCalled := int32(0)
 	// generate a status that is not ready when first called but becomes ready later
-	status := func(timesCalled int) appsv1.DeploymentStatus {
+	status := func(timesCalled int32) appsv1.DeploymentStatus {
 		if timesCalled < 0 {
 			timesCalled = 0
 		}
 		return appsv1.DeploymentStatus{
 			ObservedGeneration: int64(timesCalled),
-			UpdatedReplicas:    int32(timesCalled),
-			ReadyReplicas:      int32(timesCalled),
+			//nolint:gosec // G115 widening cast - no integer overflow
+			UpdatedReplicas: int32(timesCalled),
+			//nolint:gosec // G115 widening cast - no integer overflow
+			ReadyReplicas: int32(timesCalled),
 			Conditions: []appsv1.DeploymentCondition{
 				{Type: appsv1.DeploymentProgressing, Reason: "DoinStuff"},
 			},
 		}
 	}
 	// generate a deployment with no errors and status=status(timesCalled)
-	okayDeployment := func(name string, timesCalled int) appsv1.Deployment {
+	okayDeployment := func(name string, timesCalled int32) appsv1.Deployment {
 		return appsv1.Deployment{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: name,
@@ -98,10 +100,11 @@ func TestUpdateMultipleDeploymentsAndWait(t *testing.T) {
 	}
 	addProgressDeadlineExceeded := func(d *appsv1.Deployment) {
 		d.Status.Conditions = append(d.Status.Conditions, appsv1.DeploymentCondition{
-			Type: appsv1.DeploymentProgressing, Reason: "ProgressDeadlineExceeded"})
+			Type: appsv1.DeploymentProgressing, Reason: "ProgressDeadlineExceeded",
+		})
 	}
 
-	clientset = fake.NewSimpleClientset()
+	clientset = fake.NewClientset()
 	depsUpdated := []string{}
 	var deploymentReactor k8stesting.ReactionFunc = func(action k8stesting.Action) (handled bool, ret runtime.Object, err error) {
 		switch action := action.(type) {
@@ -146,7 +149,7 @@ func TestUpdateMultipleDeploymentsAndWait(t *testing.T) {
 			timesCalled++
 			return l, nil
 		}
-		failures = UpdateMultipleDeploymentsAndWait(clientset, deployments, listFunc)
+		failures = UpdateMultipleDeploymentsAndWait(t.Context(), clientset, deployments, listFunc)
 		assert.Len(t, failures, 3)
 		assert.ElementsMatch(t,
 			[]string{failures[0].ResourceName, failures[1].ResourceName, failures[2].ResourceName},
@@ -189,15 +192,15 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 	var pds *int32 // progressDeadlineSeconds
 
 	t.Run("no deployments to be updated", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		deployments = []*appsv1.Deployment{}
-		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(clientset, deployments)
+		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(t.Context(), clientset, deployments)
 		assert.Len(t, deploymentsUpdated, 0)
 		assert.Len(t, failures, 0)
 	})
 
 	t.Run("update deployments successfully", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		createDeploymentOrDie(clientset, deployment("d1", nil))
 		createDeploymentOrDie(clientset, deployment("d2", nil))
 		createDeploymentOrDie(clientset, deployment("d3", nil))
@@ -206,7 +209,7 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 			modifiedDeployment("d2", nil),
 			modifiedDeployment("d3", nil),
 		}
-		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(clientset, deployments)
+		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(t.Context(), clientset, deployments)
 		assert.Len(t, deploymentsUpdated, 3)
 		assert.Len(t, failures, 0)
 		assert.Contains(t, deploymentsUpdated, "d1")
@@ -217,7 +220,7 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 
 	t.Run("do not update deployments with no modifications", func(t *testing.T) {
 		// clientset with preexisting and updated deployments from previous test
-		d3 := modifiedDeployment("d3", newInt32(5))
+		d3 := modifiedDeployment("d3", new(int32(5)))
 		// d3.ObjectMeta.Labels = map[string]string{
 		// 	"new": "label",
 		// }
@@ -226,7 +229,7 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 			// d2 from before should also not be updated
 			d3, // should be updated
 		}
-		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(clientset, deployments)
+		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(t.Context(), clientset, deployments)
 		assert.Len(t, deploymentsUpdated, 1)
 		assert.Len(t, failures, 0)
 		assert.Contains(t, deploymentsUpdated, "d3")
@@ -234,16 +237,16 @@ func TestUpdateMultipleDeployments(t *testing.T) {
 	})
 
 	t.Run("failures if deployments do not exist", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
-		createDeploymentOrDie(clientset, deployment("d1", newInt32(30)))
-		createDeploymentOrDie(clientset, deployment("d3", newInt32(30)))
+		clientset = fake.NewClientset()
+		createDeploymentOrDie(clientset, deployment("d1", new(int32(30))))
+		createDeploymentOrDie(clientset, deployment("d3", new(int32(30))))
 		deployments = []*appsv1.Deployment{
-			modifiedDeployment("d1", newInt32(30)),
-			modifiedDeployment("d2", newInt32(30)),
-			modifiedDeployment("d3", newInt32(30)),
-			modifiedDeployment("d4", newInt32(30)),
+			modifiedDeployment("d1", new(int32(30))),
+			modifiedDeployment("d2", new(int32(30))),
+			modifiedDeployment("d3", new(int32(30))),
+			modifiedDeployment("d4", new(int32(30))),
 		}
-		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(clientset, deployments)
+		deploymentsUpdated, failures, pds = UpdateMultipleDeployments(t.Context(), clientset, deployments)
 		assert.Len(t, deploymentsUpdated, 2)
 		assert.Len(t, failures, 2)
 		assert.Contains(t, deploymentsUpdated, "d1")
@@ -263,8 +266,8 @@ func TestWaitForDeploymentsToUpdate(t *testing.T) {
 		waitForDeploymentPeriod = oldPeriod
 		waitForDeploymentTimeout = oldTimeout
 	}()
-	waitForDeploymentPeriod = 1 * time.Millisecond
-	waitForDeploymentTimeout = 3 * time.Millisecond
+	waitForDeploymentPeriod = 3 * time.Millisecond
+	waitForDeploymentTimeout = 9 * time.Millisecond
 
 	timesCalled := 0
 	// generate a status that is not ready when first called but becomes ready later
@@ -274,8 +277,10 @@ func TestWaitForDeploymentsToUpdate(t *testing.T) {
 		}
 		return appsv1.DeploymentStatus{
 			ObservedGeneration: int64(timesCalled),
-			UpdatedReplicas:    int32(timesCalled),
-			ReadyReplicas:      int32(timesCalled),
+			// nolint:gosec // G115 No overflow: widening cast.
+			UpdatedReplicas: int32(timesCalled),
+			// nolint:gosec // G115 No overflow: widening cast.
+			ReadyReplicas: int32(timesCalled),
 			Conditions: []appsv1.DeploymentCondition{
 				{Type: appsv1.DeploymentProgressing, Reason: "DoinStuff"},
 			},
@@ -292,7 +297,8 @@ func TestWaitForDeploymentsToUpdate(t *testing.T) {
 	}
 	addProgressDeadlineExceeded := func(d *appsv1.Deployment) {
 		d.Status.Conditions = append(d.Status.Conditions, appsv1.DeploymentCondition{
-			Type: appsv1.DeploymentProgressing, Reason: "ProgressDeadlineExceeded"})
+			Type: appsv1.DeploymentProgressing, Reason: "ProgressDeadlineExceeded",
+		})
 	}
 
 	// inputs
@@ -323,6 +329,7 @@ func TestWaitForDeploymentsToUpdate(t *testing.T) {
 		}
 		runTest()
 		assert.Len(t, failures, 0)
+		assert.Equal(t, 0, timesCalled)
 	})
 
 	t.Run("wait successful", func(t *testing.T) {
@@ -456,22 +463,18 @@ func Test_maxInt32Ptr(t *testing.T) {
 		args args
 		want int32
 	}{
-		{"a nil", args{nil, newInt32(2)}, 2},
-		{"b nil", args{newInt32(0), nil}, 0},
-		{"negatives", args{newInt32(-5), newInt32(-4)}, -4},
-		{"neg and pos", args{newInt32(-3), newInt32(1)}, 1},
-		{"positives", args{newInt32(1), newInt32(3)}, 3},
-		{"with zero", args{newInt32(0), newInt32(2)}, 2},
+		{"a nil", args{nil, new(int32(2))}, 2},
+		{"b nil", args{new(int32(0)), nil}, 0},
+		{"negatives", args{new(int32(-5)), new(int32(-4))}, -4},
+		{"neg and pos", args{new(int32(-3)), new(int32(1))}, 1},
+		{"positives", args{new(int32(1)), new(int32(3))}, 3},
+		{"with zero", args{new(int32(0)), new(int32(2))}, 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, *maxInt32Ptr(tt.args.a, tt.args.b))
 		})
 	}
-}
-
-func newInt32(i int32) *int32 {
-	return &i
 }
 
 func createDeploymentOrDie(clientset *fake.Clientset, d *appsv1.Deployment) {

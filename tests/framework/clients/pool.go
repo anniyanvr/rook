@@ -97,7 +97,7 @@ func (p *PoolOperation) PoolCRDExists(namespace, name string) (bool, error) {
 }
 
 func (p *PoolOperation) CephPoolExists(namespace, name string) (bool, error) {
-	clusterInfo := client.AdminClusterInfo(namespace)
+	clusterInfo := client.AdminTestClusterInfo(namespace)
 	pools, err := p.ListCephPools(clusterInfo)
 	if err != nil {
 		return false, err
@@ -117,18 +117,18 @@ func (p *PoolOperation) DeletePool(blockClient *BlockOperation, clusterInfo *cli
 	logger.Infof("listing images in pool %q", poolName)
 	blockImagesList, _ := blockClient.ListImagesInPool(clusterInfo, poolName)
 	for _, blockImage := range blockImagesList {
-		logger.Infof("force deleting block image %q in pool %q", blockImage, poolName)
+		logger.Infof("force deleting block image %q in pool %q", blockImage.Name, poolName)
 		max := 10
 		// Wait and retry up to 10 times/seconds to delete RBD images
-		for i := 0; i < max; i++ {
+		for i := range max {
 			err := blockClient.DeleteBlockImage(clusterInfo, blockImage)
 			if err == nil {
 				break
 			}
-			logger.Infof("failed deleting image %q from %q. %v", blockImage, poolName, err)
+			logger.Infof("failed deleting image %q from %q. %v", blockImage.Name, poolName, err)
 			time.Sleep(2 * time.Second)
 			if i == max-1 {
-				return fmt.Errorf("gave up waiting for image %q from %q to be deleted. %v", blockImage, poolName, err)
+				return fmt.Errorf("gave up waiting for image %q from %q to be deleted. %v", blockImage.Name, poolName, err)
 			}
 		}
 	}

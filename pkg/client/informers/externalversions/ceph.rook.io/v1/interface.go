@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -25,29 +25,43 @@ import (
 // Interface provides access to all the informers in this group version.
 type Interface interface {
 	// CephBlockPools returns a CephBlockPoolInformer.
-	CephBlockPools() CephBlockPoolInformer
+	CephBlockPools() TypedCephBlockPoolInformer
+	// CephBlockPoolRadosNamespaces returns a CephBlockPoolRadosNamespaceInformer.
+	CephBlockPoolRadosNamespaces() TypedCephBlockPoolRadosNamespaceInformer
+	// CephBucketNotifications returns a CephBucketNotificationInformer.
+	CephBucketNotifications() TypedCephBucketNotificationInformer
+	// CephBucketTopics returns a CephBucketTopicInformer.
+	CephBucketTopics() TypedCephBucketTopicInformer
+	// CephCOSIDrivers returns a CephCOSIDriverInformer.
+	CephCOSIDrivers() TypedCephCOSIDriverInformer
 	// CephClients returns a CephClientInformer.
-	CephClients() CephClientInformer
+	CephClients() TypedCephClientInformer
 	// CephClusters returns a CephClusterInformer.
-	CephClusters() CephClusterInformer
+	CephClusters() TypedCephClusterInformer
 	// CephFilesystems returns a CephFilesystemInformer.
-	CephFilesystems() CephFilesystemInformer
+	CephFilesystems() TypedCephFilesystemInformer
 	// CephFilesystemMirrors returns a CephFilesystemMirrorInformer.
-	CephFilesystemMirrors() CephFilesystemMirrorInformer
+	CephFilesystemMirrors() TypedCephFilesystemMirrorInformer
+	// CephFilesystemSubVolumeGroups returns a CephFilesystemSubVolumeGroupInformer.
+	CephFilesystemSubVolumeGroups() TypedCephFilesystemSubVolumeGroupInformer
 	// CephNFSes returns a CephNFSInformer.
-	CephNFSes() CephNFSInformer
+	CephNFSes() TypedCephNFSInformer
+	// CephNVMeOFGateways returns a CephNVMeOFGatewayInformer.
+	CephNVMeOFGateways() TypedCephNVMeOFGatewayInformer
 	// CephObjectRealms returns a CephObjectRealmInformer.
-	CephObjectRealms() CephObjectRealmInformer
+	CephObjectRealms() TypedCephObjectRealmInformer
 	// CephObjectStores returns a CephObjectStoreInformer.
-	CephObjectStores() CephObjectStoreInformer
+	CephObjectStores() TypedCephObjectStoreInformer
+	// CephObjectStoreAccounts returns a CephObjectStoreAccountInformer.
+	CephObjectStoreAccounts() TypedCephObjectStoreAccountInformer
 	// CephObjectStoreUsers returns a CephObjectStoreUserInformer.
-	CephObjectStoreUsers() CephObjectStoreUserInformer
+	CephObjectStoreUsers() TypedCephObjectStoreUserInformer
 	// CephObjectZones returns a CephObjectZoneInformer.
-	CephObjectZones() CephObjectZoneInformer
+	CephObjectZones() TypedCephObjectZoneInformer
 	// CephObjectZoneGroups returns a CephObjectZoneGroupInformer.
-	CephObjectZoneGroups() CephObjectZoneGroupInformer
+	CephObjectZoneGroups() TypedCephObjectZoneGroupInformer
 	// CephRBDMirrors returns a CephRBDMirrorInformer.
-	CephRBDMirrors() CephRBDMirrorInformer
+	CephRBDMirrors() TypedCephRBDMirrorInformer
 }
 
 type version struct {
@@ -61,62 +75,97 @@ func New(f internalinterfaces.SharedInformerFactory, namespace string, tweakList
 	return &version{factory: f, namespace: namespace, tweakListOptions: tweakListOptions}
 }
 
-// CephBlockPools returns a CephBlockPoolInformer.
-func (v *version) CephBlockPools() CephBlockPoolInformer {
+// CephBlockPools returns a TypedCephBlockPoolInformer.
+func (v *version) CephBlockPools() TypedCephBlockPoolInformer {
 	return &cephBlockPoolInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephClients returns a CephClientInformer.
-func (v *version) CephClients() CephClientInformer {
+// CephBlockPoolRadosNamespaces returns a TypedCephBlockPoolRadosNamespaceInformer.
+func (v *version) CephBlockPoolRadosNamespaces() TypedCephBlockPoolRadosNamespaceInformer {
+	return &cephBlockPoolRadosNamespaceInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// CephBucketNotifications returns a TypedCephBucketNotificationInformer.
+func (v *version) CephBucketNotifications() TypedCephBucketNotificationInformer {
+	return &cephBucketNotificationInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// CephBucketTopics returns a TypedCephBucketTopicInformer.
+func (v *version) CephBucketTopics() TypedCephBucketTopicInformer {
+	return &cephBucketTopicInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// CephCOSIDrivers returns a TypedCephCOSIDriverInformer.
+func (v *version) CephCOSIDrivers() TypedCephCOSIDriverInformer {
+	return &cephCOSIDriverInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// CephClients returns a TypedCephClientInformer.
+func (v *version) CephClients() TypedCephClientInformer {
 	return &cephClientInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephClusters returns a CephClusterInformer.
-func (v *version) CephClusters() CephClusterInformer {
+// CephClusters returns a TypedCephClusterInformer.
+func (v *version) CephClusters() TypedCephClusterInformer {
 	return &cephClusterInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephFilesystems returns a CephFilesystemInformer.
-func (v *version) CephFilesystems() CephFilesystemInformer {
+// CephFilesystems returns a TypedCephFilesystemInformer.
+func (v *version) CephFilesystems() TypedCephFilesystemInformer {
 	return &cephFilesystemInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephFilesystemMirrors returns a CephFilesystemMirrorInformer.
-func (v *version) CephFilesystemMirrors() CephFilesystemMirrorInformer {
+// CephFilesystemMirrors returns a TypedCephFilesystemMirrorInformer.
+func (v *version) CephFilesystemMirrors() TypedCephFilesystemMirrorInformer {
 	return &cephFilesystemMirrorInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephNFSes returns a CephNFSInformer.
-func (v *version) CephNFSes() CephNFSInformer {
+// CephFilesystemSubVolumeGroups returns a TypedCephFilesystemSubVolumeGroupInformer.
+func (v *version) CephFilesystemSubVolumeGroups() TypedCephFilesystemSubVolumeGroupInformer {
+	return &cephFilesystemSubVolumeGroupInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// CephNFSes returns a TypedCephNFSInformer.
+func (v *version) CephNFSes() TypedCephNFSInformer {
 	return &cephNFSInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephObjectRealms returns a CephObjectRealmInformer.
-func (v *version) CephObjectRealms() CephObjectRealmInformer {
+// CephNVMeOFGateways returns a TypedCephNVMeOFGatewayInformer.
+func (v *version) CephNVMeOFGateways() TypedCephNVMeOFGatewayInformer {
+	return &cephNVMeOFGatewayInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// CephObjectRealms returns a TypedCephObjectRealmInformer.
+func (v *version) CephObjectRealms() TypedCephObjectRealmInformer {
 	return &cephObjectRealmInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephObjectStores returns a CephObjectStoreInformer.
-func (v *version) CephObjectStores() CephObjectStoreInformer {
+// CephObjectStores returns a TypedCephObjectStoreInformer.
+func (v *version) CephObjectStores() TypedCephObjectStoreInformer {
 	return &cephObjectStoreInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephObjectStoreUsers returns a CephObjectStoreUserInformer.
-func (v *version) CephObjectStoreUsers() CephObjectStoreUserInformer {
+// CephObjectStoreAccounts returns a TypedCephObjectStoreAccountInformer.
+func (v *version) CephObjectStoreAccounts() TypedCephObjectStoreAccountInformer {
+	return &cephObjectStoreAccountInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
+}
+
+// CephObjectStoreUsers returns a TypedCephObjectStoreUserInformer.
+func (v *version) CephObjectStoreUsers() TypedCephObjectStoreUserInformer {
 	return &cephObjectStoreUserInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephObjectZones returns a CephObjectZoneInformer.
-func (v *version) CephObjectZones() CephObjectZoneInformer {
+// CephObjectZones returns a TypedCephObjectZoneInformer.
+func (v *version) CephObjectZones() TypedCephObjectZoneInformer {
 	return &cephObjectZoneInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephObjectZoneGroups returns a CephObjectZoneGroupInformer.
-func (v *version) CephObjectZoneGroups() CephObjectZoneGroupInformer {
+// CephObjectZoneGroups returns a TypedCephObjectZoneGroupInformer.
+func (v *version) CephObjectZoneGroups() TypedCephObjectZoneGroupInformer {
 	return &cephObjectZoneGroupInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }
 
-// CephRBDMirrors returns a CephRBDMirrorInformer.
-func (v *version) CephRBDMirrors() CephRBDMirrorInformer {
+// CephRBDMirrors returns a TypedCephRBDMirrorInformer.
+func (v *version) CephRBDMirrors() TypedCephRBDMirrorInformer {
 	return &cephRBDMirrorInformer{factory: v.factory, namespace: v.namespace, tweakListOptions: v.tweakListOptions}
 }

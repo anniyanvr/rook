@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -29,51 +29,79 @@ type FakeCephV1 struct {
 }
 
 func (c *FakeCephV1) CephBlockPools(namespace string) v1.CephBlockPoolInterface {
-	return &FakeCephBlockPools{c, namespace}
+	return newFakeCephBlockPools(c, namespace)
+}
+
+func (c *FakeCephV1) CephBlockPoolRadosNamespaces(namespace string) v1.CephBlockPoolRadosNamespaceInterface {
+	return newFakeCephBlockPoolRadosNamespaces(c, namespace)
+}
+
+func (c *FakeCephV1) CephBucketNotifications(namespace string) v1.CephBucketNotificationInterface {
+	return newFakeCephBucketNotifications(c, namespace)
+}
+
+func (c *FakeCephV1) CephBucketTopics(namespace string) v1.CephBucketTopicInterface {
+	return newFakeCephBucketTopics(c, namespace)
+}
+
+func (c *FakeCephV1) CephCOSIDrivers(namespace string) v1.CephCOSIDriverInterface {
+	return newFakeCephCOSIDrivers(c, namespace)
 }
 
 func (c *FakeCephV1) CephClients(namespace string) v1.CephClientInterface {
-	return &FakeCephClients{c, namespace}
+	return newFakeCephClients(c, namespace)
 }
 
 func (c *FakeCephV1) CephClusters(namespace string) v1.CephClusterInterface {
-	return &FakeCephClusters{c, namespace}
+	return newFakeCephClusters(c, namespace)
 }
 
 func (c *FakeCephV1) CephFilesystems(namespace string) v1.CephFilesystemInterface {
-	return &FakeCephFilesystems{c, namespace}
+	return newFakeCephFilesystems(c, namespace)
 }
 
 func (c *FakeCephV1) CephFilesystemMirrors(namespace string) v1.CephFilesystemMirrorInterface {
-	return &FakeCephFilesystemMirrors{c, namespace}
+	return newFakeCephFilesystemMirrors(c, namespace)
+}
+
+func (c *FakeCephV1) CephFilesystemSubVolumeGroups(namespace string) v1.CephFilesystemSubVolumeGroupInterface {
+	return newFakeCephFilesystemSubVolumeGroups(c, namespace)
 }
 
 func (c *FakeCephV1) CephNFSes(namespace string) v1.CephNFSInterface {
-	return &FakeCephNFSes{c, namespace}
+	return newFakeCephNFSes(c, namespace)
+}
+
+func (c *FakeCephV1) CephNVMeOFGateways(namespace string) v1.CephNVMeOFGatewayInterface {
+	return newFakeCephNVMeOFGateways(c, namespace)
 }
 
 func (c *FakeCephV1) CephObjectRealms(namespace string) v1.CephObjectRealmInterface {
-	return &FakeCephObjectRealms{c, namespace}
+	return newFakeCephObjectRealms(c, namespace)
 }
 
 func (c *FakeCephV1) CephObjectStores(namespace string) v1.CephObjectStoreInterface {
-	return &FakeCephObjectStores{c, namespace}
+	return newFakeCephObjectStores(c, namespace)
+}
+
+func (c *FakeCephV1) CephObjectStoreAccounts(namespace string) v1.CephObjectStoreAccountInterface {
+	return newFakeCephObjectStoreAccounts(c, namespace)
 }
 
 func (c *FakeCephV1) CephObjectStoreUsers(namespace string) v1.CephObjectStoreUserInterface {
-	return &FakeCephObjectStoreUsers{c, namespace}
+	return newFakeCephObjectStoreUsers(c, namespace)
 }
 
 func (c *FakeCephV1) CephObjectZones(namespace string) v1.CephObjectZoneInterface {
-	return &FakeCephObjectZones{c, namespace}
+	return newFakeCephObjectZones(c, namespace)
 }
 
 func (c *FakeCephV1) CephObjectZoneGroups(namespace string) v1.CephObjectZoneGroupInterface {
-	return &FakeCephObjectZoneGroups{c, namespace}
+	return newFakeCephObjectZoneGroups(c, namespace)
 }
 
 func (c *FakeCephV1) CephRBDMirrors(namespace string) v1.CephRBDMirrorInterface {
-	return &FakeCephRBDMirrors{c, namespace}
+	return newFakeCephRBDMirrors(c, namespace)
 }
 
 // RESTClient returns a RESTClient that is used to communicate

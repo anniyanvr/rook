@@ -29,7 +29,7 @@ import (
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "testutil")
 
-// CommandArgs is a warpper for cmd args
+// CommandArgs is a wrapper for cmd args
 type CommandArgs struct {
 	Command             string
 	CmdArgs             []string
@@ -45,7 +45,7 @@ type CommandOut struct {
 	Err      error
 }
 
-// ExecuteCommand executes a os command with stdin and returns output
+// ExecuteCommand executes an OS command with stdin and returns output
 func ExecuteCommand(cmdStruct CommandArgs) CommandOut {
 	logger.Infof("Running %s %v", cmdStruct.Command, cmdStruct.CmdArgs)
 
@@ -56,13 +56,11 @@ func ExecuteCommand(cmdStruct CommandArgs) CommandOut {
 	cmd.Env = append(cmd.Env, cmdStruct.EnvironmentVariable...)
 
 	stdOut, err := cmd.StdoutPipe()
-
 	if err != nil {
 		return CommandOut{StdErr: errBuffer.String(), StdOut: outBuffer.String(), Err: err}
 	}
 
 	stdin, err := cmd.StdinPipe()
-
 	if err != nil {
 		return CommandOut{Err: err}
 	}
@@ -78,7 +76,6 @@ func ExecuteCommand(cmdStruct CommandArgs) CommandOut {
 	}()
 
 	stdErr, err := cmd.StderrPipe()
-
 	if err != nil {
 		return CommandOut{StdErr: errBuffer.String(), StdOut: outBuffer.String(), Err: err}
 	}

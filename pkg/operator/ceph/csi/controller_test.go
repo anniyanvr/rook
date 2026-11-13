@@ -17,10 +17,10 @@ limitations under the License.
 package csi
 
 import (
-	"context"
 	"os"
 	"testing"
 
+	csiopv1 "github.com/ceph/ceph-csi-operator/api/v1"
 	"github.com/coreos/pkg/capnslog"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
@@ -39,25 +39,16 @@ import (
 )
 
 func TestCephCSIController(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	var (
 		name      = "rook-ceph"
 		namespace = "rook-ceph"
 	)
-	// Set DEBUG logging
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
-	os.Setenv(k8sutil.PodNameEnvVar, "rook-ceph-operator")
-	os.Setenv(k8sutil.PodNamespaceEnvVar, namespace)
+	t.Setenv(k8sutil.PodNameEnvVar, "rook-ceph-operator")
+	t.Setenv(k8sutil.PodNamespaceEnvVar, namespace)
 
-	os.Setenv("ROOK_CSI_ALLOW_UNSUPPORTED_VERSION", "true")
-	CSIParam = Param{
-		CSIPluginImage:   "image",
-		RegistrarImage:   "image",
-		ProvisionerImage: "image",
-		AttacherImage:    "image",
-		SnapshotterImage: "image",
-	}
 	req := reconcile.Request{
 		NamespacedName: types.NamespacedName{
 			Name:      name,
@@ -75,17 +66,15 @@ func TestCephCSIController(t *testing.T) {
 
 		_, err := c.Clientset.CoreV1().Pods(namespace).Create(ctx, test.FakeOperatorPod(namespace), metav1.CreateOptions{})
 		assert.NoError(t, err)
-		_, err = c.Clientset.AppsV1().ReplicaSets(namespace).Create(context.TODO(), test.FakeReplicaSet(namespace), metav1.CreateOptions{})
+		_, err = c.Clientset.AppsV1().ReplicaSets(namespace).Create(t.Context(), test.FakeReplicaSet(namespace), metav1.CreateOptions{})
 		assert.NoError(t, err)
-		// Register operator types with the runtime scheme.
 		s := scheme.Scheme
-		s.AddKnownTypes(cephv1.SchemeGroupVersion, &v1.ConfigMap{}, &v1.ConfigMapList{}, &cephv1.CephClusterList{})
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &v1.ConfigMap{}, &v1.ConfigMapList{}, &cephv1.CephClusterList{},
+			&csiopv1.CephConnection{}, &csiopv1.ClientProfile{}, &csiopv1.OperatorConfig{}, &csiopv1.Driver{})
 
-		// Create a fake client to mock API calls.
 		cl := fake.NewClientBuilder().WithScheme(s).Build()
 		c.Client = cl
 
-		// Create a ReconcileCSI object with the scheme and fake client.
 		r := &ReconcileCSI{
 			client:  cl,
 			context: c,
@@ -110,7 +99,7 @@ func TestCephCSIController(t *testing.T) {
 		}
 		_, err := c.Clientset.CoreV1().Pods(namespace).Create(ctx, test.FakeOperatorPod(namespace), metav1.CreateOptions{})
 		assert.NoError(t, err)
-		_, err = c.Clientset.AppsV1().ReplicaSets(namespace).Create(context.TODO(), test.FakeReplicaSet(namespace), metav1.CreateOptions{})
+		_, err = c.Clientset.AppsV1().ReplicaSets(namespace).Create(t.Context(), test.FakeReplicaSet(namespace), metav1.CreateOptions{})
 		assert.NoError(t, err)
 		cephCluster := &cephv1.CephCluster{
 			ObjectMeta: metav1.ObjectMeta{
@@ -127,16 +116,28 @@ func TestCephCSIController(t *testing.T) {
 				},
 			},
 		}
+		secrets := map[string][]byte{
+			"fsid":         []byte(name),
+			"mon-secret":   []byte("monsecret"),
+			"admin-secret": []byte("adminsecret"),
+		}
+		secret := &v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "rook-ceph-mon",
+				Namespace: namespace,
+			},
+			Data: secrets,
+			Type: k8sutil.RookType,
+		}
+		_, err = c.Clientset.CoreV1().Secrets(namespace).Create(ctx, secret, metav1.CreateOptions{})
+		assert.NoError(t, err)
 		s := scheme.Scheme
-		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &cephv1.CephClusterList{})
-
+		s.AddKnownTypes(cephv1.SchemeGroupVersion, &cephv1.CephCluster{}, &cephv1.CephClusterList{}, &v1.ConfigMap{})
 		object := []runtime.Object{
 			cephCluster,
 		}
-		// Create a fake client to mock API calls.
 		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 		c.Client = cl
-		// // Create a ReconcileCSI object with the scheme and fake client.
 		r := &ReconcileCSI{
 			client:  cl,
 			context: c,
@@ -150,9 +151,5 @@ func TestCephCSIController(t *testing.T) {
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.False(t, res.Requeue)
-
-		ds, err := c.Clientset.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
-		assert.NoError(t, err)
-		assert.Equal(t, 2, len(ds.Items), ds)
 	})
 }

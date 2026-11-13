@@ -24,23 +24,23 @@ import (
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/osd"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/util/log"
 )
 
-var (
-	monitorDaemonList = []string{"mon", "osd", "status"}
-)
+var monitorDaemonList = []string{"mon", "osd", "status"}
 
 func (c *ClusterController) configureCephMonitoring(cluster *cluster, clusterInfo *cephclient.ClusterInfo) {
 	var isEnabled bool
 	for _, daemon := range monitorDaemonList {
 		// Is the monitoring enabled for that daemon?
 		isEnabled = isMonitoringEnabled(daemon, cluster.Spec)
-		if health, ok := cluster.monitoringRoutines[daemon]; ok {
+		if health, ok := cluster.monitoringRoutines.Load(daemon); ok {
 			// If the context Err() is nil this means it hasn't been cancelled yet
-			if health.internalCtx.Err() == nil {
-				logger.Debugf("monitoring routine for %q is already running", daemon)
+			if health.(*opcontroller.ClusterHealth).InternalCtx.Err() == nil {
+				log.NamespacedDebug(cluster.Namespace, logger, "monitoring routine for %q is already running", daemon)
 				if !isEnabled {
-					cluster.monitoringRoutines[daemon].internalCancel()
+					health.(*opcontroller.ClusterHealth).InternalCancel()
 				}
 			}
 		} else {
@@ -49,9 +49,15 @@ func (c *ClusterController) configureCephMonitoring(cluster *cluster, clusterInf
 				// They can individually be cancelled and will be cancelled when the parent context is cancelled
 				internalCtx, internalCancel := context.WithCancel(c.OpManagerCtx)
 
-				cluster.monitoringRoutines[daemon] = &clusterHealth{
-					internalCtx:    internalCtx,
-					internalCancel: internalCancel,
+				cluster.monitoringRoutines.Store(daemon, &opcontroller.ClusterHealth{
+					InternalCtx:    internalCtx,
+					InternalCancel: internalCancel,
+				})
+
+				// We can't use mon.isFloatingMon(cluster.mons, daemon) because the mon ID is not available.
+				if daemon == "mon" && cluster.Spec.Mon.FloatingMon.Name != "" {
+					log.NamespacedInfo(cluster.Namespace, logger, "skip mon health check since floating mon %q is configured", daemon)
+					continue
 				}
 
 				// Run the go routine
@@ -80,19 +86,19 @@ func (c *ClusterController) startMonitoringCheck(cluster *cluster, clusterInfo *
 	switch daemon {
 	case "mon":
 		healthChecker := mon.NewHealthChecker(cluster.mons)
-		logger.Infof("enabling ceph %s monitoring goroutine for cluster %q", daemon, cluster.Namespace)
-		go healthChecker.Check(cluster.monitoringRoutines[daemon].internalCtx)
+		log.NamespacedInfo(cluster.Namespace, logger, "enabling ceph %s monitoring goroutine", daemon)
+		go healthChecker.Check(&cluster.monitoringRoutines, daemon)
 
 	case "osd":
 		if !cluster.Spec.External.Enable {
-			c.osdChecker = osd.NewOSDHealthMonitor(c.context, clusterInfo, cluster.Spec.RemoveOSDsIfOutAndSafeToRemove, cluster.Spec.HealthCheck)
-			logger.Infof("enabling ceph %s monitoring goroutine for cluster %q", daemon, cluster.Namespace)
-			go c.osdChecker.Start(cluster.monitoringRoutines[daemon].internalCtx)
+			osdChecker := osd.NewOSDHealthMonitor(c.context, clusterInfo, cluster.Spec.RemoveOSDsIfOutAndSafeToRemove, cluster.Spec.HealthCheck, *cluster.Spec, c.rookImage)
+			log.NamespacedInfo(cluster.Namespace, logger, "enabling ceph %s monitoring goroutine", daemon)
+			go osdChecker.Start(&cluster.monitoringRoutines, daemon)
 		}
 
 	case "status":
 		cephChecker := newCephStatusChecker(c.context, clusterInfo, cluster.Spec)
-		logger.Infof("enabling ceph %s monitoring goroutine for cluster %q", daemon, cluster.Namespace)
-		go cephChecker.checkCephStatus(cluster.monitoringRoutines[daemon].internalCtx)
+		log.NamespacedInfo(cluster.Namespace, logger, "enabling ceph %s monitoring goroutine", daemon)
+		go cephChecker.checkCephStatus(&cluster.monitoringRoutines, daemon)
 	}
 }

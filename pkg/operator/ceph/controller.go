@@ -33,7 +33,6 @@ import (
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util"
 	v1 "k8s.io/api/core/v1"
-	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -52,7 +51,7 @@ type ReconcileConfig struct {
 // Add creates a new Operator configuration Controller and adds it to the Manager. The Manager will set fields on the Controller
 // and Start it when the Manager is Started.
 func Add(mgr manager.Manager, context *clusterd.Context, opManagerContext context.Context, opConfig opcontroller.OperatorConfig) error {
-	return add(mgr, newReconciler(mgr, context, opManagerContext, opConfig))
+	return add(opManagerContext, context, mgr, newReconciler(mgr, context, opManagerContext, opConfig))
 }
 
 // newReconciler returns a new reconcile.Reconciler
@@ -65,7 +64,7 @@ func newReconciler(mgr manager.Manager, context *clusterd.Context, opManagerCont
 	}
 }
 
-func add(mgr manager.Manager, r reconcile.Reconciler) error {
+func add(ctx context.Context, context *clusterd.Context, mgr manager.Manager, r reconcile.Reconciler) error {
 	// Create a new controller
 	c, err := controller.New(controllerName, mgr, controller.Options{Reconciler: r})
 	if err != nil {
@@ -74,15 +73,14 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	logger.Infof("%s successfully started", controllerName)
 
 	// Watch for ConfigMap (operator config)
-	err = c.Watch(&source.Kind{
-		Type: &v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}}}, &handler.EnqueueRequestForObject{}, predicateController(mgr.GetClient()))
-	if err != nil {
-		return err
-	}
-
-	// Watch for Secret (admission controller secret)
-	err = c.Watch(&source.Kind{
-		Type: &v1.Secret{TypeMeta: metav1.TypeMeta{Kind: "Secret", APIVersion: v1.SchemeGroupVersion.String()}}}, &handler.EnqueueRequestForObject{}, predicateController(mgr.GetClient()))
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&v1.ConfigMap{TypeMeta: metav1.TypeMeta{Kind: "ConfigMap", APIVersion: v1.SchemeGroupVersion.String()}},
+			&handler.TypedEnqueueRequestForObject[*v1.ConfigMap]{},
+			operatorSettingConfigMapPredicate(),
+		),
+	)
 	if err != nil {
 		return err
 	}
@@ -90,11 +88,11 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	return nil
 }
 
-// Reconcile reads that state of the cluster for a CephClient object and makes changes based on the state read
-// and what is in the CephClient.Spec
+// Reconcile reads the state of the operator config map and makes changes based on the state read
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileConfig) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	reconcileResponse, err := r.reconcile(request)
 	if err != nil {
@@ -106,49 +104,42 @@ func (r *ReconcileConfig) Reconcile(context context.Context, request reconcile.R
 
 func (r *ReconcileConfig) reconcile(request reconcile.Request) (reconcile.Result, error) {
 	// Fetch the operator's configmap
-	opConfig := &v1.ConfigMap{}
 	logger.Debugf("reconciling %s", request.NamespacedName)
-	err := r.client.Get(r.opManagerContext, request.NamespacedName, opConfig)
-	if err != nil {
-		if kerrors.IsNotFound(err) {
-			logger.Debug("operator's configmap resource not found. will use default value or env var.")
-		} else {
-			// Error reading the object - requeue the request.
-			return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to get operator's configmap")
+	if request.Name == opcontroller.OperatorSettingConfigMapName {
+		if err := k8sutil.ApplyOperatorSettingsConfigmap(r.opManagerContext, r.context.Clientset); err != nil {
+			return opcontroller.ImmediateRetryResult, errors.Wrap(err, "failed to get operator setting configmap")
 		}
-	} else {
-		// Populate the operator's config
-		r.config.Parameters = opConfig.Data
 	}
-
-	// Reconcile Ceph CLI timeout, since the clusterd context is passed to by pointer to all CRD
+	// Reconcile Ceph CLI timeout, since the clusterd context is passed by pointer to all CRD
 	// controllers they will receive the update
-	opcontroller.SetCephCommandsTimeout(r.config.Parameters)
+	opcontroller.SetCephCommandsTimeout()
 
 	// Reconcile Operator's logging level
-	reconcileOperatorLogLevel(opConfig.Data)
+	reconcileOperatorLogLevel()
 
 	// Reconcile discovery daemon
-	err = r.reconcileDiscoveryDaemon()
+	err := r.reconcileDiscoveryDaemon()
 	if err != nil {
 		return opcontroller.ImmediateRetryResult, err
 	}
 
-	// Reconcile webhook secret
-	// This is done in the predicate function
+	opcontroller.SetAllowLoopDevices()
+	opcontroller.SetEnforceHostNetwork()
+	opcontroller.SetRevisionHistoryLimit()
+	opcontroller.SetObcAllowAdditionalConfigFields()
 
 	logger.Infof("%s done reconciling", controllerName)
 	return reconcile.Result{}, nil
 }
 
-func reconcileOperatorLogLevel(data map[string]string) {
-	rookLogLevel := k8sutil.GetValue(data, "ROOK_LOG_LEVEL", util.DefaultLogLevel.String())
+func reconcileOperatorLogLevel() {
+	rookLogLevel := k8sutil.GetOperatorSetting("ROOK_LOG_LEVEL", util.DefaultLogLevel.String())
 	util.SetGlobalLogLevel(rookLogLevel, logger)
 }
 
 func (r *ReconcileConfig) reconcileDiscoveryDaemon() error {
 	rookDiscover := discover.New(r.context.Clientset)
-	if opcontroller.DiscoveryDaemonEnabled(r.config.Parameters) {
+	if opcontroller.DiscoveryDaemonEnabled() {
 		if err := rookDiscover.Start(r.opManagerContext, r.config.OperatorNamespace, r.config.Image, r.config.ServiceAccount, true); err != nil {
 			return errors.Wrap(err, "failed to start device discovery daemonset")
 		}

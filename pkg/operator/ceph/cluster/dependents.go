@@ -30,22 +30,24 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
-var (
-	// must use plural kinds
-	cephClusterDependentListKinds []string = []string{
-		"CephBlockPoolList",
-		"CephRBDMirrorList",
-		"CephFilesystemList",
-		"CephFilesystemMirrorList",
-		"CephObjectStoreList",
-		"CephObjectStoreUserList",
-		"CephObjectZoneList",
-		"CephObjectZoneGroupList",
-		"CephObjectRealmList",
-		"CephNFSList",
-		"CephClientList",
-	}
-)
+// must use plural kinds
+var cephClusterDependentListKinds []string = []string{
+	"CephBlockPoolList",
+	"CephRBDMirrorList",
+	"CephFilesystemList",
+	"CephFilesystemMirrorList",
+	"CephObjectStoreList",
+	"CephObjectStoreUserList",
+	"CephObjectZoneList",
+	"CephObjectZoneGroupList",
+	"CephObjectRealmList",
+	"CephNFSList",
+	"CephClientList",
+	"CephBucketTopic",
+	"CephBucketNotification",
+	"CephFilesystemSubVolumeGroup",
+	"CephBlockPoolRadosNamespace",
+}
 
 // CephClusterDependents returns a DependentList of dependents of a CephCluster in the namespace.
 func CephClusterDependents(c *clusterd.Context, namespace string) (*dependents.DependentList, error) {
@@ -67,10 +69,8 @@ func CephClusterDependents(c *clusterd.Context, namespace string) (*dependents.D
 			errs = append(errs, errors.Wrapf(err, "failed to get %s", listKind))
 			continue
 		}
-		if len(list.Items) > 0 {
-			for _, obj := range list.Items {
-				dependents.Add(listKindToSingularKind(listKind), obj.GetName())
-			}
+		for _, obj := range list.Items {
+			dependents.Add(listKindToSingularKind(listKind), obj.GetName())
 		}
 	}
 	// returns a nil error if there are no errors in the list

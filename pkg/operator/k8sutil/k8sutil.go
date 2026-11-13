@@ -26,13 +26,10 @@ import (
 	"time"
 
 	"github.com/coreos/pkg/capnslog"
-	"github.com/pkg/errors"
 	rookversion "github.com/rook/rook/pkg/version"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
-	"k8s.io/apimachinery/pkg/util/version"
-	"k8s.io/client-go/kubernetes"
 )
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-k8sutil")
@@ -54,30 +51,14 @@ const (
 	PodNamespaceEnvVar = "POD_NAMESPACE"
 	// NodeNameEnvVar is the env variable for getting the node via downward api
 	NodeNameEnvVar = "NODE_NAME"
-
 	// RookVersionLabelKey is the key used for reporting the Rook version which last created or
 	// modified a resource.
 	RookVersionLabelKey = "rook-version"
+	// DefaultServiceAccount is a service-account used for components that do not specify a dedicated service-account.
+	DefaultServiceAccount = "rook-ceph-default"
 )
 
-// GetK8SVersion gets the version of the running K8S cluster
-func GetK8SVersion(clientset kubernetes.Interface) (*version.Version, error) {
-	serverVersion, err := clientset.Discovery().ServerVersion()
-	if err != nil {
-		return nil, fmt.Errorf("error getting server version: %v", err)
-	}
-
-	// make sure the kubernetes version is parseable
-	index := strings.Index(serverVersion.GitVersion, "+")
-	if index != -1 {
-		newVersion := serverVersion.GitVersion[:index]
-		logger.Debugf("returning version %s instead of %s", newVersion, serverVersion.GitVersion)
-		serverVersion.GitVersion = newVersion
-	}
-	return version.MustParseSemantic(serverVersion.GitVersion), nil
-}
-
-// Hash stableName computes a stable pseudorandom string suitable for inclusion in a Kubernetes object name from the given seed string.
+// Hash computes a stable pseudorandom string suitable for inclusion in a Kubernetes object name from the given seed string.
 // Do **NOT** edit this function in a way that would change its output as it needs to
 // provide consistent mappings from string to hash across versions of rook.
 func Hash(s string) string {
@@ -85,7 +66,18 @@ func Hash(s string) string {
 	return hex.EncodeToString(h[:16])
 }
 
-// TruncateNodeName hashes the nodeName in case it would case the name to be longer than 63 characters
+// TruncateNodeNameForJob hashes the nodeName in case it would cause the name to be longer than 63 characters
+// and avoids a K8s 1.22 bug in the job pod name generation. If the job name contains a . or - in a certain
+// position, the pod will fail to create.
+func TruncateNodeNameForJob(format, nodeName string) string {
+	// In k8s 1.22, the job name is truncated an additional 10 characters which can cause an issue
+	// in the generated pod name if it then ends in a non-alphanumeric character. In that case,
+	// we more aggressively generate a hashed job name.
+	jobNameShortenLength := 10
+	return truncateNodeName(format, nodeName, validation.DNS1035LabelMaxLength-jobNameShortenLength)
+}
+
+// TruncateNodeName hashes the nodeName in case it would cause the name to be longer than 63 characters
 // WARNING If your format and nodeName as a hash, are longer than 63 chars it won't be truncated!
 // Your format alone should only be 31 chars at max because of MD5 hash being 32 chars.
 // For more information, see the following resources:
@@ -94,9 +86,14 @@ func Hash(s string) string {
 // Do **NOT** edit this function in a way that would change its output as it needs to
 // provide consistent mappings from string to hash across versions of rook.
 func TruncateNodeName(format, nodeName string) string {
-	if len(nodeName)+len(fmt.Sprintf(format, "")) > validation.DNS1035LabelMaxLength {
+	return truncateNodeName(format, nodeName, validation.DNS1035LabelMaxLength)
+}
+
+// truncateNodeName takes the max length desired for a string and hashes the value if needed to shorten it.
+func truncateNodeName(format, nodeName string, maxLength int) string {
+	if len(nodeName)+len(fmt.Sprintf(format, "")) > maxLength {
 		hashed := Hash(nodeName)
-		logger.Infof("format and nodeName longer than %d chars, nodeName %s will be %s", validation.DNS1035LabelMaxLength, nodeName, hashed)
+		logger.Infof("format and nodeName longer than %d chars, nodeName %s will be %s", maxLength, nodeName, hashed)
 		nodeName = hashed
 	}
 	return fmt.Sprintf(format, nodeName)
@@ -124,7 +121,7 @@ func deleteResourceAndWait(namespace, name, resourceType string,
 
 	// wait for the resource to be deleted
 	sleepTime := 2 * time.Second
-	for i := 0; i < 45; i++ {
+	for i := range 45 {
 		// check for the existence of the resource
 		err = getAction()
 		if err != nil {
@@ -157,18 +154,6 @@ func addRookVersionLabel(labels map[string]string) {
 	labels[RookVersionLabelKey] = value
 }
 
-// RookVersionLabelMatchesCurrent returns true if the Rook version on the resource label matches the
-// current Rook version running. It returns false if the label does not match. It returns an error
-// if the label does not exist.
-func RookVersionLabelMatchesCurrent(labels map[string]string) (bool, error) {
-	v, ok := labels[RookVersionLabelKey]
-	if !ok {
-		return false, fmt.Errorf("failed to find Rook version label %q", RookVersionLabelKey)
-	}
-	expectedVersion := validateLabelValue(rookversion.Version)
-	return (v == expectedVersion), nil
-}
-
 // validateLabelValue replaces any invalid characters
 // in the input string with a replacement character,
 // and enforces other limitations for k8s label values.
@@ -187,15 +172,4 @@ func validateLabelValue(value string) string {
 		sanitized = sanitized[:maxlen]
 	}
 	return sanitized
-}
-
-func UsePDBV1Beta1Version(Clientset kubernetes.Interface) (bool, error) {
-	k8sVersion, err := GetK8SVersion(Clientset)
-	if err != nil {
-		return false, errors.Wrap(err, "failed to fetch k8s version")
-	}
-	logger.Debugf("kubernetes version fetched %v", k8sVersion)
-	// minimum k8s version required for v1 PodDisruptionBudget is 'v1.21.0'. Apply v1 if k8s version is at least 'v1.21.0', else apply v1beta1 PodDisruptionBudget.
-	minVersionForPDBV1 := "1.21.0"
-	return k8sVersion.LessThan(version.MustParseSemantic(minVersionForPDBV1)), nil
 }

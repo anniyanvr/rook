@@ -19,9 +19,12 @@ package exec
 import (
 	"os/exec"
 	"testing"
+	"time"
 
 	"github.com/pkg/errors"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	kexec "k8s.io/utils/exec"
@@ -76,26 +79,38 @@ func TestExtractExitCode(t *testing.T) {
 		want     int
 		wantErr  bool
 	}{
-		{"*exec.ExitError",
+		{
+			"*exec.ExitError",
 			mockExecExitError(3),
-			3, noError},
+			3, noError,
+		},
 		/* {"exec.ExitError", // non-pointer case is impossible (won't compile) */
-		{"*kexec.CodeExitError (pointer)",
+		{
+			"*kexec.CodeExitError (pointer)",
 			&kexec.CodeExitError{Err: errors.New("some error"), Code: 4},
-			4, noError},
-		{"kexec.CodeExitError (non-pointer)",
+			4, noError,
+		},
+		{
+			"kexec.CodeExitError (non-pointer)",
 			kexec.CodeExitError{Err: errors.New("some error"), Code: 5},
-			5, noError},
-		{"*kerrors.StatusError",
+			5, noError,
+		},
+		{
+			"*kerrors.StatusError",
 			&kerrors.StatusError{ErrStatus: metav1.Status{Code: 6}},
-			6, noError},
+			6, noError,
+		},
 		/* {"kerrors.StatusError", // non-pointer case is impossible (won't compile) */
-		{"unknown error type with error code extractable from error message",
+		{
+			"unknown error type with error code extractable from error message",
 			errors.New("command terminated with exit code 7"),
-			7, noError},
-		{"unknown error type with no extractable error code",
+			7, noError,
+		},
+		{
+			"unknown error type with no extractable error code",
 			errors.New("command with no extractable error code even with an int here: 8"),
-			-1, expectError},
+			-1, expectError,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -109,4 +124,103 @@ func TestExtractExitCode(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFakeTimeoutError(t *testing.T) {
+	assert.True(t, IsTimeout(exectest.FakeTimeoutError("blah")))
+	assert.True(t, IsTimeout(exectest.FakeTimeoutError("")))
+}
+
+func TestExecuteCommandWithTimeout(t *testing.T) {
+	type args struct {
+		timeout time.Duration
+		command string
+		stdin   *string
+		arg     []string
+	}
+	testString := "hello"
+	tests := []struct {
+		name    string
+		args    args
+		want    string
+		wantErr bool
+	}{
+		{
+			name: "test stdin",
+			args: args{
+				timeout: 2 * time.Second,
+				command: "cat",
+				stdin:   &testString,
+				arg:     []string{},
+			},
+			want:    testString,
+			wantErr: false,
+		},
+		{
+			name: "test nil stdin",
+			args: args{
+				timeout: 2 * time.Second,
+				command: "echo",
+				stdin:   nil,
+				arg:     []string{testString},
+			},
+			want:    testString,
+			wantErr: false,
+		},
+		{
+			name: "test err return",
+			args: args{
+				timeout: 2 * time.Second,
+				command: "false",
+				stdin:   nil,
+				arg:     []string{},
+			},
+			want:    "",
+			wantErr: true,
+		},
+		{
+			name: "test timeout",
+			args: args{
+				timeout: 5 * time.Millisecond,
+				command: "sleep",
+				stdin:   &testString,
+				arg:     []string{"2"},
+			},
+			want:    "",
+			wantErr: true,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := executeCommandWithTimeout(tt.args.timeout, tt.args.command, tt.args.stdin, tt.args.arg...)
+			if (err != nil) != tt.wantErr {
+				t.Errorf("executeCommandWithTimeout() error = %v, wantErr %v", err, tt.wantErr)
+				return
+			}
+			if got != tt.want {
+				t.Errorf("executeCommandWithTimeout() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestExecuteCommandWithTimeoutKillPath exercises the timeout branch where the
+// command ignores the interrupt signal and must be killed, while it keeps
+// writing to stdout. The output buffer must only be read after cmd.Wait()
+// returns; otherwise the read races with the goroutines that copy the command's
+// output into the buffer. Run with `-race` to catch a regression.
+func TestExecuteCommandWithTimeoutKillPath(t *testing.T) {
+	// The child ignores SIGINT and continuously writes to stdout, so the
+	// interrupt is sent first and the kill path is taken while writers are active.
+	// The per-phase timeout must be generous enough that sh installs its SIGINT
+	// trap before the interrupt arrives on a loaded runner; otherwise sh dies on
+	// the interrupt and the kill path under test is never exercised.
+	stdin := ""
+	_, err := executeCommandWithTimeout(
+		500*time.Millisecond,
+		"sh", &stdin,
+		"-c", "trap '' INT; while true; do echo x; done",
+	)
+	require.Error(t, err)
+	assert.True(t, IsTimeout(err))
 }

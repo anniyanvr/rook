@@ -19,6 +19,7 @@ package osd
 import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
+	oposd "github.com/rook/rook/pkg/operator/ceph/cluster/osd"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/osd/config"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 )
@@ -29,29 +30,34 @@ const (
 
 // OsdAgent represents the OSD struct of an agent
 type OsdAgent struct {
-	clusterInfo    *cephclient.ClusterInfo
-	nodeName       string
-	forceFormat    bool
-	devices        []DesiredDevice
-	metadataDevice string
-	storeConfig    config.StoreConfig
-	kv             *k8sutil.ConfigMapKVStore
-	pvcBacked      bool
+	clusterInfo                  *cephclient.ClusterInfo
+	nodeName                     string
+	forceFormat                  bool
+	devices                      []DesiredDevice
+	metadataDevice               string
+	storeConfig                  config.StoreConfig
+	kv                           *k8sutil.ConfigMapKVStore
+	pvcBacked                    bool
+	migrateOSD                   *oposd.OSDInfo
+	wipeDevicesFromOtherClusters bool
 }
 
 // NewAgent is the instantiation of the OSD agent
 func NewAgent(context *clusterd.Context, devices []DesiredDevice, metadataDevice string, forceFormat bool,
-	storeConfig config.StoreConfig, clusterInfo *cephclient.ClusterInfo, nodeName string, kv *k8sutil.ConfigMapKVStore, pvcBacked bool) *OsdAgent {
-
+	storeConfig config.StoreConfig, clusterInfo *cephclient.ClusterInfo, nodeName string, kv *k8sutil.ConfigMapKVStore,
+	migrateOSD *oposd.OSDInfo, pvcBacked, wipDevicesFromOtherClusters bool,
+) *OsdAgent {
 	return &OsdAgent{
-		devices:        devices,
-		metadataDevice: metadataDevice,
-		forceFormat:    forceFormat,
-		storeConfig:    storeConfig,
-		clusterInfo:    clusterInfo,
-		nodeName:       nodeName,
-		kv:             kv,
-		pvcBacked:      pvcBacked,
+		devices:                      devices,
+		metadataDevice:               metadataDevice,
+		forceFormat:                  forceFormat,
+		storeConfig:                  storeConfig,
+		clusterInfo:                  clusterInfo,
+		nodeName:                     nodeName,
+		kv:                           kv,
+		pvcBacked:                    pvcBacked,
+		migrateOSD:                   migrateOSD,
+		wipeDevicesFromOtherClusters: wipDevicesFromOtherClusters,
 	}
 }
 
@@ -63,4 +69,13 @@ func getDeviceLVPath(context *clusterd.Context, deviceName string) string {
 	}
 	logger.Debugf("logical volume path for device %q is %q", deviceName, output)
 	return output
+}
+
+// getMigrateOSDId returns the OSD ID based on the device name
+func (a *OsdAgent) getMigrateOSDId(device string) int {
+	if device == a.migrateOSD.BlockPath {
+		return a.migrateOSD.ID
+	}
+
+	return -1
 }

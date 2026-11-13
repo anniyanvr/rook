@@ -35,10 +35,11 @@ type TestClient struct {
 	BucketClient     *BucketOperation
 	UserClient       *ClientOperation
 	RBDMirrorClient  *RBDMirrorOperation
+	TopicClient      *TopicOperation
 	k8sh             *utils.K8sHelper
 }
 
-// CreateTestClient creates new instance of test client for a platform
+// CreateTestClient creates a new instance of test client for a platform
 func CreateTestClient(k8sHelper *utils.K8sHelper, manifests installer.CephManifests) *TestClient {
 	return &TestClient{
 		CreateBlockOperation(k8sHelper, manifests),
@@ -50,6 +51,7 @@ func CreateTestClient(k8sHelper *utils.K8sHelper, manifests installer.CephManife
 		CreateBucketOperation(k8sHelper, manifests),
 		CreateClientOperation(k8sHelper, manifests),
 		CreateRBDMirrorOperation(k8sHelper, manifests),
+		CreateTopicOperation(k8sHelper, manifests),
 		k8sHelper,
 	}
 }
@@ -57,7 +59,7 @@ func CreateTestClient(k8sHelper *utils.K8sHelper, manifests installer.CephManife
 // Status returns rook status details
 func (c TestClient) Status(namespace string) (client.CephStatus, error) {
 	context := c.k8sh.MakeContext()
-	clusterInfo := client.AdminClusterInfo(namespace)
+	clusterInfo := client.AdminTestClusterInfo(namespace)
 	status, err := client.Status(context, clusterInfo)
 	if err != nil {
 		return client.CephStatus{}, fmt.Errorf("failed to get status: %+v", err)

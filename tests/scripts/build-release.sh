@@ -5,7 +5,7 @@ set -ex
 # FUNCTIONS #
 #############
 
-MAKE='build/run make --debug=v --output-sync'
+MAKE='make --debug=v --output-sync'
 
 function  build() {
     $MAKE build.all
@@ -13,32 +13,57 @@ function  build() {
     $MAKE mod.check
 }
 
-function publish() {
+function publish_images_and_docs() {
     build
     $MAKE -C build/release build BRANCH_NAME=${BRANCH_NAME} TAG_WITH_SUFFIX=${TAG_WITH_SUFFIX} GIT_API_TOKEN=${GIT_API_TOKEN}
     git status &
     git diff &
-    $MAKE -C build/release publish BRANCH_NAME=${BRANCH_NAME} TAG_WITH_SUFFIX=${TAG_WITH_SUFFIX} AWS_ACCESS_KEY_ID=${AWS_USR} AWS_SECRET_ACCESS_KEY=${AWS_PSW} GIT_API_TOKEN=${GIT_API_TOKEN}
+    $MAKE -C build/release publish BRANCH_NAME=${BRANCH_NAME} TAG_WITH_SUFFIX=${TAG_WITH_SUFFIX} AWS_ACCESS_KEY_ID=${AWS_USR} AWS_SECRET_ACCESS_KEY=${AWS_PSW} GIT_API_TOKEN=${GIT_API_TOKEN} TAGGED_RELEASE=${TAGGED_RELEASE}
 }
 
-function promote() {
-    # automatically promote the master builds
-    echo "Promoting from branch ${BRANCH_NAME}"
-    $MAKE -C build/release promote BRANCH_NAME=${BRANCH_NAME} TAG_WITH_SUFFIX=${TAG_WITH_SUFFIX} CHANNEL=${CHANNEL} AWS_ACCESS_KEY_ID=${AWS_USR} AWS_SECRET_ACCESS_KEY=${AWS_PSW}
+function publish_charts() {
+    echo "Publishing helm charts for release build"
+    $MAKE -C build/release promote BRANCH_NAME=${BRANCH_NAME} TAG_WITH_SUFFIX=${TAG_WITH_SUFFIX} AWS_ACCESS_KEY_ID=${AWS_USR} AWS_SECRET_ACCESS_KEY=${AWS_PSW}
 }
 
 #############
 # MAIN      #
 #############
 
-SHOULD_PROMOTE=true
+# Load dot env file if available
+if [ -f .env ]; then
+    # shellcheck disable=SC2046
+    export $(grep -v '^#' .env | xargs -d '\n')
+fi
+
+# Use Git access token for accessing the docs repo if set
+# shellcheck disable=SC2034
+export DOCS_GIT_REPO="${DOCS_GIT_REPO:-git@github.com:rook/rook.github.io.git}"
+if [ -n "${GIT_API_TOKEN}" ]; then
+    # Use a plain HTTPS remote with no credentials embedded in the URL.
+    DOCS_GIT_REPO="${DOCS_GIT_REPO//git@/}"
+    DOCS_GIT_REPO="${DOCS_GIT_REPO//:/\/}"
+    export DOCS_GIT_REPO="https://${DOCS_GIT_REPO}"
+
+    # Authenticate with an http.extraheader rather than embedding the token in
+    # the remote URL. GitHub redirects the gh-pages push endpoint (e.g.
+    # rook.github.io.git -> rook.github.io.git/), and git drops URL-embedded
+    # credentials across that redirect, causing "could not read Username". An
+    # extraheader is matched by host and re-sent to same-host redirect targets,
+    # so it survives the redirect. Disable xtrace so the encoded credential is
+    # not written to the build log (GitHub only masks the raw secret).
+    { set +x; } 2>/dev/null
+    git config --global "http.https://github.com/.extraheader" \
+        "AUTHORIZATION: basic $(printf 'x-access-token:%s' "${GIT_API_TOKEN}" | base64 | tr -d '\n')"
+    { set -x; } 2>/dev/null
+fi
+
+TAGGED_RELEASE=false
 if [[ ${GITHUB_REF} =~ master ]]; then
     echo "Publishing from master"
-    CHANNEL=master
 else
     echo "Tagging with suffix for release and tagged builds"
     TAG_WITH_SUFFIX=true
-    CHANNEL=release
 
     # If a tag, find the source release branch
     if [[ $BRANCH_NAME = v* ]]; then
@@ -49,15 +74,15 @@ else
             exit 1
         fi
         echo "Publishing tag ${TAG_NAME} in branch ${BRANCH_NAME}"
+        TAGGED_RELEASE=true
     else
         echo "Publishing from release branch ${BRANCH_NAME}"
-        SHOULD_PROMOTE=false
     fi
 fi
 
 
-publish
+publish_images_and_docs
 
-if [[ "$SHOULD_PROMOTE" = true ]]; then
-  promote
+if [[ "$TAGGED_RELEASE" = true ]]; then
+  publish_charts
 fi

@@ -26,37 +26,29 @@ import (
 )
 
 const (
-	rookModuleName         = "rook"
-	orchestratorOldCLIName = "orchestrator"
-	orchestratorNewCLIName = "orch"
+	rookModuleName = "rook"
 )
 
-var (
-	orchestratorInitWaitTime = 5 * time.Second
-	orchestratorCLIName      = orchestratorOldCLIName
-)
+var orchestratorInitWaitTime = 5 * time.Second
 
-// Ceph docs about the orchestrator modules: http://docs.ceph.com/docs/master/mgr/orchestrator_cli/
+// Ceph docs about the orchestrator modules: https://docs.ceph.com/en/latest/mgr/orchestrator/
 func (c *Cluster) configureOrchestratorModules() error {
 	if err := client.MgrEnableModule(c.context, c.clusterInfo, rookModuleName, true); err != nil {
 		return errors.Wrap(err, "failed to enable mgr rook module")
 	}
-	if err := c.setRookOrchestratorBackend(); err != nil {
+	if err := c.setOrchestratorBackend(rookModuleName); err != nil {
 		return errors.Wrap(err, "failed to set rook orchestrator backend")
 	}
 	return nil
 }
 
-func (c *Cluster) setRookOrchestratorBackend() error {
-	if c.clusterInfo.CephVersion.IsAtLeastOctopus() {
-		orchestratorCLIName = orchestratorNewCLIName
-	}
+func (c *Cluster) setOrchestratorBackend(name string) error {
 	// retry a few times in the case that the mgr module is not ready to accept commands
 	_, err := client.ExecuteCephCommandWithRetry(func() (string, []byte, error) {
-		args := []string{orchestratorCLIName, "set", "backend", "rook"}
+		args := []string{"orch", "set", "backend", name}
 		output, err := client.NewCephCommand(c.context, c.clusterInfo, args).RunWithTimeout(exec.CephCommandsTimeout)
 		return "set rook backend", output, err
-	}, c.exitCode, 5, invalidArgErrorCode, orchestratorInitWaitTime)
+	}, 5, orchestratorInitWaitTime)
 	if err != nil {
 		return errors.Wrap(err, "failed to set rook as the orchestrator backend")
 	}

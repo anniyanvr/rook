@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,25 +19,54 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	apiscephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	versioned "github.com/rook/rook/pkg/client/clientset/versioned"
 	internalinterfaces "github.com/rook/rook/pkg/client/informers/externalversions/internalinterfaces"
-	v1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
+	cephrookiov1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephObjectRealmInformer provides access to a shared informer and lister for
-// CephObjectRealms.
+// CephObjectRealms. Prefer using the type-safe variant (see [TypedCephObjectRealmInformer]).
 type CephObjectRealmInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.CephObjectRealmLister
+	Lister() cephrookiov1.CephObjectRealmLister
 }
+
+// TypedCephObjectRealmInformer provides access to a shared informer and lister for
+// CephObjectRealms, including the type-safe TypedInformer variant.
+// It is a superset of CephObjectRealmInformer.
+type TypedCephObjectRealmInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() CephObjectRealmIndexInformer
+	Lister() cephrookiov1.CephObjectRealmLister
+}
+
+// CephObjectRealmIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type CephObjectRealmIndexInformer cache.TypedSharedIndexInformer[*apiscephrookiov1.CephObjectRealm]
+
+// CephObjectRealmHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for CephObjectRealm.
+type CephObjectRealmHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*apiscephrookiov1.CephObjectRealm]
+
+// CephObjectRealmDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for CephObjectRealm.
+type CephObjectRealmDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*apiscephrookiov1.CephObjectRealm]
+
+// CephObjectRealmFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for CephObjectRealm.
+type CephObjectRealmFilteringHandler = cache.TypedFilteringResourceEventHandler[*apiscephrookiov1.CephObjectRealm]
+
+// CephObjectRealmIndexers is a specialization of [cache.TypedIndexers] for CephObjectRealm.
+type CephObjectRealmIndexers = cache.TypedIndexers[*apiscephrookiov1.CephObjectRealm]
+
+// DeletedCephObjectRealm is a specialization of [cache.DeletedObject] for CephObjectRealm.
+type DeletedCephObjectRealm = cache.DeletedObject[*apiscephrookiov1.CephObjectRealm]
 
 type cephObjectRealmInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +77,132 @@ type cephObjectRealmInformer struct {
 // NewCephObjectRealmInformer constructs a new informer for CephObjectRealm type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephObjectRealmInformer]).
 func NewCephObjectRealmInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredCephObjectRealmInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewCephObjectRealmInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedCephObjectRealmInformer constructs a new informer for CephObjectRealm type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephObjectRealmInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephObjectRealmIndexers) CephObjectRealmIndexInformer {
+	return NewTypedCephObjectRealmInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredCephObjectRealmInformer constructs a new informer for CephObjectRealm type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredCephObjectRealmInformer]).
 func NewFilteredCephObjectRealmInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+	return NewTypedCephObjectRealmInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredCephObjectRealmInformer constructs a new informer for CephObjectRealm type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredCephObjectRealmInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephObjectRealmIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) CephObjectRealmIndexInformer {
+	return NewTypedCephObjectRealmInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewCephObjectRealmInformerWithOptions constructs a new informer for CephObjectRealm type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephObjectRealmInformerWithOptions]).
+func NewCephObjectRealmInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedCephObjectRealmInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedCephObjectRealmInformerWithOptions constructs a new informer for CephObjectRealm type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephObjectRealmInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) CephObjectRealmIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "ceph.rook.io", Version: "v1", Resource: "cephobjectrealms"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephObjectRealm](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephObjectRealms(namespace).List(context.TODO(), options)
+				return client.CephV1().CephObjectRealms(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephObjectRealms(namespace).Watch(context.TODO(), options)
+				return client.CephV1().CephObjectRealms(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephObjectRealms(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephObjectRealms(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&apiscephrookiov1.CephObjectRealm{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&cephrookiov1.CephObjectRealm{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *cephObjectRealmInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredCephObjectRealmInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedCephObjectRealmInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *cephObjectRealmInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&cephrookiov1.CephObjectRealm{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *cephObjectRealmInformer) Lister() v1.CephObjectRealmLister {
-	return v1.NewCephObjectRealmLister(f.Informer().GetIndexer())
+func (f *cephObjectRealmInformer) TypedInformer() CephObjectRealmIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephObjectRealm](f.factory.InformerFor(&apiscephrookiov1.CephObjectRealm{}, f.defaultInformer))
+}
+
+func (f *cephObjectRealmInformer) Lister() cephrookiov1.CephObjectRealmLister {
+	return cephrookiov1.NewCephObjectRealmLister(f.Informer().GetIndexer())
+}
+
+// ToTypedCephObjectRealmInformer converts an untyped informer into a TypedCephObjectRealmInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephObjectRealm. If that is not the case, calling type-safe methods of the returned
+// TypedCephObjectRealmInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedCephObjectRealmInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedCephObjectRealmInformer(informer CephObjectRealmInformer) TypedCephObjectRealmInformer {
+	if informer, ok := informer.(TypedCephObjectRealmInformer); ok {
+		return informer
+	}
+	return &cephObjectRealmTypedInformerAdapter{informer}
+}
+
+type cephObjectRealmTypedInformerAdapter struct {
+	CephObjectRealmInformer
+}
+
+func (a *cephObjectRealmTypedInformerAdapter) TypedInformer() CephObjectRealmIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephObjectRealm](a.Informer())
+}
+
+// ToCephObjectRealmIndexInformer converts an untyped informer into a CephObjectRealmIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephObjectRealm. If that is not the case, calling type-safe methods of the returned
+// CephObjectRealmIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a CephObjectRealmIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToCephObjectRealmIndexInformer(informer cache.SharedIndexInformer) CephObjectRealmIndexInformer {
+	if informer, ok := informer.(CephObjectRealmIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephObjectRealm](informer)
 }

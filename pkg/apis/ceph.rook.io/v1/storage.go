@@ -15,6 +15,18 @@ limitations under the License.
 */
 package v1
 
+import "fmt"
+
+type StoreType string
+
+const (
+	// StoreTypeBlueStore is the bluestore backend storage for OSDs
+	StoreTypeBlueStore StoreType = "bluestore"
+
+	// StoreTypeBlueStoreRDR is the bluestore-rdr backed storage for OSDs
+	StoreTypeBlueStoreRDR StoreType = "bluestore-rdr"
+)
+
 // AnyUseAllDevices gets whether to use all devices
 func (s *StorageScopeSpec) AnyUseAllDevices() bool {
 	if s.Selection.GetUseAllDevices() {
@@ -87,7 +99,7 @@ func (s *StorageScopeSpec) resolveNodeSelection(node *Node) {
 			node.Selection.UseAllDevices = s.Selection.UseAllDevices
 		} else {
 			// neither node nor cluster have a value set for use all devices, use the default value.
-			node.Selection.UseAllDevices = newBool(false)
+			node.Selection.UseAllDevices = new(false)
 		}
 	}
 
@@ -124,7 +136,7 @@ func (s *StorageScopeSpec) NodeWithNameExists(name string) bool {
 	return false
 }
 
-// GetUseAllDevices return if all devices should be used.
+// GetUseAllDevices returns whether all devices should be used.
 func (s *Selection) GetUseAllDevices() bool {
 	return s.UseAllDevices != nil && *(s.UseAllDevices)
 }
@@ -137,10 +149,6 @@ func resolveString(setting *string, parent, defaultVal string) {
 			*setting = defaultVal
 		}
 	}
-}
-
-func newBool(val bool) *bool {
-	return &val
 }
 
 // NodesByName implements an interface to sort nodes by name
@@ -167,4 +175,20 @@ func (s *StorageScopeSpec) IsOnPVCEncrypted() bool {
 	}
 
 	return false
+}
+
+// GetOSDStore returns osd backend store type provided in the cluster spec
+func (s *StorageScopeSpec) GetOSDStore() string {
+	if s.Store.Type == "" {
+		return string(StoreTypeBlueStore)
+	}
+	return s.Store.Type
+}
+
+// GetOSDStoreFlag returns osd backend store type prefixed with "--"
+func (s *StorageScopeSpec) GetOSDStoreFlag() string {
+	if s.Store.Type == "" {
+		return fmt.Sprintf("--%s", StoreTypeBlueStore)
+	}
+	return fmt.Sprintf("--%s", s.Store.Type)
 }

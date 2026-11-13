@@ -18,9 +18,11 @@ package osd
 
 import (
 	"fmt"
+	"maps"
 	"strconv"
 	"strings"
 
+	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
 )
 
@@ -35,32 +37,42 @@ const (
 	OSDOverPVCLabelKey = "ceph.rook.io/pvc"
 	// TopologyLocationLabel is the crush location label added to OSD deployments
 	TopologyLocationLabel = "topology-location-%s"
+	// CephImageLabelKey is the ceph image version label added to PVC
+	CephImageLabelKey = "ceph.rook.io/cephImageAtCreation"
+	// RookImageLabelKey is the rook image version label added to PVC
+	RookImageLabelKey = "ceph.rook.io/rookImageAtCreation"
 )
 
-func makeStorageClassDeviceSetPVCLabel(storageClassDeviceSetName, pvcStorageClassDeviceSetPVCId string, setIndex int) map[string]string {
+func makeStorageClassDeviceSetPVCLabel(storageClassDeviceSetName, pvcStorageClassDeviceSetPVCId string, setIndex int, cephImage string, rookImage string) map[string]string {
 	return map[string]string{
 		CephDeviceSetLabelKey:      storageClassDeviceSetName,
 		CephSetIndexLabelKey:       fmt.Sprintf("%d", setIndex),
 		CephDeviceSetPVCIDLabelKey: pvcStorageClassDeviceSetPVCId,
+		CephImageLabelKey:          cephImage,
+		RookImageLabelKey:          rookImage,
 	}
 }
 
 func (c *Cluster) getOSDLabels(osd OSDInfo, failureDomainValue string, portable bool) map[string]string {
 	stringID := fmt.Sprintf("%d", osd.ID)
-	labels := controller.CephDaemonAppLabels(AppName, c.clusterInfo.Namespace, "osd", stringID, true)
+	labels := controller.CephDaemonAppLabels(AppName, c.clusterInfo.Namespace, config.OsdType, stringID, c.clusterInfo.NamespacedName().Name, "cephclusters.ceph.rook.io", true)
 	labels[OsdIdLabelKey] = stringID
 	labels[FailureDomainKey] = failureDomainValue
 	labels[portableKey] = strconv.FormatBool(portable)
-	for k, v := range getOSDTopologyLocationLabels(osd.Location) {
-		labels[k] = v
+	labels[deviceClass] = osd.DeviceClass
+	labels[osdStore] = osd.Store
+	if osd.DeviceType != "" {
+		labels[deviceType] = osd.DeviceType
 	}
+
+	maps.Copy(labels, getOSDTopologyLocationLabels(osd.Location))
 	return labels
 }
 
 func getOSDTopologyLocationLabels(topologyLocation string) map[string]string {
 	labels := map[string]string{}
-	locations := strings.Split(topologyLocation, " ")
-	for _, location := range locations {
+	locations := strings.SplitSeq(topologyLocation, " ")
+	for location := range locations {
 		loc := strings.Split(location, "=")
 		if len(loc) == 2 {
 			labels[fmt.Sprintf(TopologyLocationLabel, loc[0])] = loc[1]

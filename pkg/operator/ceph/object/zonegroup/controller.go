@@ -24,7 +24,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -42,6 +41,7 @@ import (
 	"github.com/rook/rook/pkg/operator/ceph/object"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/exec"
+	"github.com/rook/rook/pkg/util/log"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -54,17 +54,15 @@ const (
 
 var waitForRequeueIfObjectRealmNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
 
-var logger = capnslog.NewPackageLogger("github.com/rook/rook", controllerName)
-
-var cephObjectZoneGroupKind = reflect.TypeOf(cephv1.CephObjectZoneGroup{}).Name()
+var logger = capnslog.NewPackageLogger("github.com/rook/rook", "zonegroup-controller")
 
 // Sets the type meta for the controller main object
 var controllerTypeMeta = metav1.TypeMeta{
-	Kind:       cephObjectZoneGroupKind,
+	Kind:       reflect.TypeFor[cephv1.CephObjectZoneGroup]().Name(),
 	APIVersion: fmt.Sprintf("%s/%s", cephv1.CustomResourceGroup, cephv1.Version),
 }
 
-// ReconcileObjectZoneGroup reconciles a ObjectZoneGroup object
+// ReconcileObjectZoneGroup reconciles an ObjectZoneGroup object
 type ReconcileObjectZoneGroup struct {
 	client           client.Client
 	scheme           *runtime.Scheme
@@ -98,7 +96,14 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	logger.Info("successfully started")
 
 	// Watch for changes on the CephObjectZoneGroup CRD object
-	err = c.Watch(&source.Kind{Type: &cephv1.CephObjectZoneGroup{TypeMeta: controllerTypeMeta}}, &handler.EnqueueRequestForObject{}, opcontroller.WatchControllerPredicate())
+	err = c.Watch(
+		source.Kind(
+			mgr.GetCache(),
+			&cephv1.CephObjectZoneGroup{TypeMeta: controllerTypeMeta},
+			&handler.TypedEnqueueRequestForObject[*cephv1.CephObjectZoneGroup]{},
+			opcontroller.WatchControllerPredicate[*cephv1.CephObjectZoneGroup](mgr.GetScheme()),
+		),
+	)
 	if err != nil {
 		return err
 	}
@@ -106,15 +111,16 @@ func add(mgr manager.Manager, r reconcile.Reconciler) error {
 	return nil
 }
 
-// Reconcile reads that state of the cluster for a CephObjectZoneGroup object and makes changes based on the state read
+// Reconcile reads the state of the cluster for a CephObjectZoneGroup object and makes changes based on the state read
 // and what is in the CephObjectZoneGroup.Spec
 // The Controller will requeue the Request to be processed again if the returned error is non-nil or
 // Result.Requeue is true, otherwise upon completion it will remove the work from the queue.
 func (r *ReconcileObjectZoneGroup) Reconcile(context context.Context, request reconcile.Request) (reconcile.Result, error) {
+	defer opcontroller.RecoverAndLogException()
 	// workaround because the rook logging mechanism is not compatible with the controller-runtime logging interface
 	reconcileResponse, err := r.reconcile(request)
 	if err != nil {
-		logger.Errorf("failed to reconcile: %v", err)
+		log.NamedError(request.NamespacedName, logger, "failed to reconcile: %v", err)
 	}
 
 	return reconcileResponse, err
@@ -126,20 +132,24 @@ func (r *ReconcileObjectZoneGroup) reconcile(request reconcile.Request) (reconci
 	err := r.client.Get(r.opManagerContext, request.NamespacedName, cephObjectZoneGroup)
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			logger.Debug("CephObjectZoneGroup resource not found. Ignoring since object must be deleted.")
+			log.NamedDebug(request.NamespacedName, logger, "CephObjectZoneGroup resource not found. Ignoring since object must be deleted.")
 			return reconcile.Result{}, nil
 		}
 		// Error reading the object - requeue the request.
 		return reconcile.Result{}, errors.Wrap(err, "failed to get CephObjectZoneGroup")
 	}
+	// update observedGeneration local variable with current generation value,
+	// because generation can be changed before reconcile got completed
+	// CR status will be updated at end of reconcile, so to reflect the reconcile has finished
+	observedGeneration := cephObjectZoneGroup.ObjectMeta.Generation
 
 	// The CR was just created, initializing status fields
 	if cephObjectZoneGroup.Status == nil {
-		r.updateStatus(r.client, request.NamespacedName, k8sutil.EmptyStatus)
+		r.updateStatus(k8sutil.ObservedGenerationNotAvailable, request.NamespacedName, k8sutil.EmptyStatus)
 	}
 
 	// Make sure a CephCluster is present otherwise do nothing
-	_, isReadyToReconcile, cephClusterExists, reconcileResponse := opcontroller.IsReadyToReconcile(r.opManagerContext, r.client, request.NamespacedName, controllerName)
+	cephCluster, isReadyToReconcile, cephClusterExists, reconcileResponse := opcontroller.IsReadyToReconcile(r.opManagerContext, r.client, request.NamespacedName, controllerName)
 	if !isReadyToReconcile {
 		// This handles the case where the Ceph Cluster is gone and we want to delete that CR
 		if !cephObjectZoneGroup.GetDeletionTimestamp().IsZero() && !cephClusterExists {
@@ -151,14 +161,14 @@ func (r *ReconcileObjectZoneGroup) reconcile(request reconcile.Request) (reconci
 
 	// DELETE: the CR was deleted
 	if !cephObjectZoneGroup.GetDeletionTimestamp().IsZero() {
-		logger.Debugf("deleting zone group CR %q", cephObjectZoneGroup.Name)
+		log.NamedDebug(request.NamespacedName, logger, "deleting zone group CR %q", cephObjectZoneGroup.Name)
 
 		// Return and do not requeue. Successful deletion.
 		return reconcile.Result{}, nil
 	}
 
 	// Populate clusterInfo during each reconcile
-	r.clusterInfo, _, _, err = mon.LoadClusterInfo(r.context, r.opManagerContext, request.NamespacedName.Namespace)
+	r.clusterInfo, _, _, err = opcontroller.LoadClusterInfo(r.context, r.opManagerContext, request.NamespacedName.Namespace, &cephCluster.Spec)
 	if err != nil {
 		return reconcile.Result{}, errors.Wrap(err, "failed to populate cluster info")
 	}
@@ -166,12 +176,12 @@ func (r *ReconcileObjectZoneGroup) reconcile(request reconcile.Request) (reconci
 	// validate the zone group settings
 	err = validateZoneGroup(cephObjectZoneGroup)
 	if err != nil {
-		r.updateStatus(r.client, request.NamespacedName, k8sutil.ReconcileFailedStatus)
+		r.updateStatus(k8sutil.ObservedGenerationNotAvailable, request.NamespacedName, k8sutil.ReconcileFailedStatus)
 		return reconcile.Result{}, errors.Wrapf(err, "invalid CephObjectZoneGroup CR %q", cephObjectZoneGroup.Name)
 	}
 
 	// Start object reconciliation, updating status for this
-	r.updateStatus(r.client, request.NamespacedName, k8sutil.ReconcilingStatus)
+	r.updateStatus(k8sutil.ObservedGenerationNotAvailable, request.NamespacedName, k8sutil.ReconcilingStatus)
 
 	// Make sure an ObjectRealm Resource is present
 	reconcileResponse, err = r.reconcileObjectRealm(cephObjectZoneGroup)
@@ -188,19 +198,21 @@ func (r *ReconcileObjectZoneGroup) reconcile(request reconcile.Request) (reconci
 	// Create/Update Ceph Zone Group
 	_, err = r.createCephZoneGroup(cephObjectZoneGroup)
 	if err != nil {
-		return r.setFailedStatus(request.NamespacedName, "failed to create ceph zone group", err)
+		return r.setFailedStatus(k8sutil.ObservedGenerationNotAvailable, request.NamespacedName, "failed to create ceph zone group", err)
 	}
 
+	// update ObservedGeneration in status at the end of reconcile
 	// Set Ready status, we are done reconciling
-	r.updateStatus(r.client, request.NamespacedName, k8sutil.ReadyStatus)
+	r.updateStatus(observedGeneration, request.NamespacedName, k8sutil.ReadyStatus)
 
 	// Return and do not requeue
-	logger.Debug("zone group done reconciling")
+	log.NamedDebug(request.NamespacedName, logger, "zone group done reconciling")
 	return reconcile.Result{}, nil
 }
 
 func (r *ReconcileObjectZoneGroup) createCephZoneGroup(zoneGroup *cephv1.CephObjectZoneGroup) (reconcile.Result, error) {
-	logger.Infof("creating object zone group %q in realm %q", zoneGroup.Name, zoneGroup.Spec.Realm)
+	nsName := opcontroller.NsName(zoneGroup.Namespace, zoneGroup.Name)
+	log.NamedInfo(nsName, logger, "creating object zone group %q in realm %q", zoneGroup.Name, zoneGroup.Spec.Realm)
 
 	realmArg := fmt.Sprintf("--rgw-realm=%s", zoneGroup.Spec.Realm)
 	zoneGroupArg := fmt.Sprintf("--rgw-zonegroup=%s", zoneGroup.Name)
@@ -234,7 +246,7 @@ func (r *ReconcileObjectZoneGroup) createCephZoneGroup(zoneGroup *cephv1.CephObj
 	}
 
 	if code, ok := exec.ExitStatus(err); ok && code == int(syscall.ENOENT) {
-		logger.Debugf("ceph zone group %q not found, running `radosgw-admin zonegroup create`", zoneGroup.Name)
+		log.NamedDebug(nsName, logger, "ceph zone group %q not found, running `radosgw-admin zonegroup create`", zoneGroup.Name)
 		args := []string{
 			"zonegroup",
 			"create",
@@ -259,6 +271,8 @@ func (r *ReconcileObjectZoneGroup) createCephZoneGroup(zoneGroup *cephv1.CephObj
 }
 
 func (r *ReconcileObjectZoneGroup) reconcileObjectRealm(zoneGroup *cephv1.CephObjectZoneGroup) (reconcile.Result, error) {
+	nsName := opcontroller.NsName(zoneGroup.Namespace, zoneGroup.Name)
+
 	// Verify the object realm API object actually exists
 	cephObjectRealm := &cephv1.CephObjectRealm{}
 	err := r.client.Get(r.opManagerContext, types.NamespacedName{Name: zoneGroup.Spec.Realm, Namespace: zoneGroup.Namespace}, cephObjectRealm)
@@ -269,11 +283,12 @@ func (r *ReconcileObjectZoneGroup) reconcileObjectRealm(zoneGroup *cephv1.CephOb
 		return waitForRequeueIfObjectRealmNotReady, errors.Wrapf(err, "error finding CephObjectRealm %s", zoneGroup.Spec.Realm)
 	}
 
-	logger.Infof("CephObjectRealm %q found for CephObjectZoneGroup %q", zoneGroup.Spec.Realm, zoneGroup.Name)
+	log.NamedInfo(nsName, logger, "CephObjectRealm %q found for CephObjectZoneGroup", zoneGroup.Spec.Realm)
 	return reconcile.Result{}, nil
 }
 
 func (r *ReconcileObjectZoneGroup) reconcileCephRealm(zoneGroup *cephv1.CephObjectZoneGroup) (reconcile.Result, error) {
+	nsName := opcontroller.NsName(zoneGroup.Namespace, zoneGroup.Name)
 	realmArg := fmt.Sprintf("--rgw-realm=%s", zoneGroup.Spec.Realm)
 	objContext := object.NewContext(r.context, r.clusterInfo, zoneGroup.Name)
 
@@ -286,24 +301,24 @@ func (r *ReconcileObjectZoneGroup) reconcileCephRealm(zoneGroup *cephv1.CephObje
 		}
 	}
 
-	logger.Infof("Realm %q found in Ceph cluster to create ceph zone group %q", zoneGroup.Spec.Realm, zoneGroup.Name)
+	log.NamedInfo(nsName, logger, "Realm %q found in Ceph cluster to create ceph zone group", zoneGroup.Spec.Realm)
 	return reconcile.Result{}, nil
 }
 
-func (r *ReconcileObjectZoneGroup) setFailedStatus(name types.NamespacedName, errMessage string, err error) (reconcile.Result, error) {
-	r.updateStatus(r.client, name, k8sutil.ReconcileFailedStatus)
+func (r *ReconcileObjectZoneGroup) setFailedStatus(observedGeneration int64, name types.NamespacedName, errMessage string, err error) (reconcile.Result, error) {
+	r.updateStatus(observedGeneration, name, k8sutil.ReconcileFailedStatus)
 	return reconcile.Result{}, errors.Wrapf(err, "%s", errMessage)
 }
 
-// updateStatus updates an zone group with a given status
-func (r *ReconcileObjectZoneGroup) updateStatus(client client.Client, name types.NamespacedName, status string) {
+// updateStatus updates a zone group with a given status
+func (r *ReconcileObjectZoneGroup) updateStatus(observedGeneration int64, name types.NamespacedName, status string) {
 	objectZoneGroup := &cephv1.CephObjectZoneGroup{}
-	if err := client.Get(r.opManagerContext, name, objectZoneGroup); err != nil {
+	if err := r.client.Get(r.opManagerContext, name, objectZoneGroup); err != nil {
 		if kerrors.IsNotFound(err) {
-			logger.Debug("CephObjectZoneGroup resource not found. Ignoring since object must be deleted.")
+			log.NamedDebug(name, logger, "CephObjectZoneGroup resource not found. Ignoring since object must be deleted.")
 			return
 		}
-		logger.Warningf("failed to retrieve object zone group %q to update status to %q. %v", name, status, err)
+		log.NamedWarning(name, logger, "failed to retrieve object zone group %q to update status to %q. %v", name, status, err)
 		return
 	}
 	if objectZoneGroup.Status == nil {
@@ -311,9 +326,12 @@ func (r *ReconcileObjectZoneGroup) updateStatus(client client.Client, name types
 	}
 
 	objectZoneGroup.Status.Phase = status
-	if err := reporting.UpdateStatus(client, objectZoneGroup); err != nil {
-		logger.Errorf("failed to set object zone group %q status to %q. %v", name, status, err)
+	if observedGeneration != k8sutil.ObservedGenerationNotAvailable {
+		objectZoneGroup.Status.ObservedGeneration = observedGeneration
+	}
+	if err := reporting.UpdateStatus(r.client, objectZoneGroup); err != nil {
+		log.NamedError(name, logger, "failed to set object zone group %q status to %q. %v", name, status, err)
 		return
 	}
-	logger.Debugf("object zone group %q status updated to %q", name, status)
+	log.NamedDebug(name, logger, "object zone group %q status updated to %q", name, status)
 }

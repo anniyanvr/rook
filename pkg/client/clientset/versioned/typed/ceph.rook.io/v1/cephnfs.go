@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,15 +19,14 @@ limitations under the License.
 package v1
 
 import (
-	"context"
-	"time"
+	context "context"
 
-	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	scheme "github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	types "k8s.io/apimachinery/pkg/types"
 	watch "k8s.io/apimachinery/pkg/watch"
-	rest "k8s.io/client-go/rest"
+	gentype "k8s.io/client-go/gentype"
 )
 
 // CephNFSesGetter has a method to return a CephNFSInterface.
@@ -38,141 +37,32 @@ type CephNFSesGetter interface {
 
 // CephNFSInterface has methods to work with CephNFS resources.
 type CephNFSInterface interface {
-	Create(ctx context.Context, cephNFS *v1.CephNFS, opts metav1.CreateOptions) (*v1.CephNFS, error)
-	Update(ctx context.Context, cephNFS *v1.CephNFS, opts metav1.UpdateOptions) (*v1.CephNFS, error)
+	Create(ctx context.Context, cephNFS *cephrookiov1.CephNFS, opts metav1.CreateOptions) (*cephrookiov1.CephNFS, error)
+	Update(ctx context.Context, cephNFS *cephrookiov1.CephNFS, opts metav1.UpdateOptions) (*cephrookiov1.CephNFS, error)
 	Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error
 	DeleteCollection(ctx context.Context, opts metav1.DeleteOptions, listOpts metav1.ListOptions) error
-	Get(ctx context.Context, name string, opts metav1.GetOptions) (*v1.CephNFS, error)
-	List(ctx context.Context, opts metav1.ListOptions) (*v1.CephNFSList, error)
+	Get(ctx context.Context, name string, opts metav1.GetOptions) (*cephrookiov1.CephNFS, error)
+	List(ctx context.Context, opts metav1.ListOptions) (*cephrookiov1.CephNFSList, error)
 	Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error)
-	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *v1.CephNFS, err error)
+	Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *cephrookiov1.CephNFS, err error)
 	CephNFSExpansion
 }
 
 // cephNFSes implements CephNFSInterface
 type cephNFSes struct {
-	client rest.Interface
-	ns     string
+	*gentype.ClientWithList[*cephrookiov1.CephNFS, *cephrookiov1.CephNFSList]
 }
 
 // newCephNFSes returns a CephNFSes
 func newCephNFSes(c *CephV1Client, namespace string) *cephNFSes {
 	return &cephNFSes{
-		client: c.RESTClient(),
-		ns:     namespace,
+		gentype.NewClientWithList[*cephrookiov1.CephNFS, *cephrookiov1.CephNFSList](
+			"cephnfses",
+			c.RESTClient(),
+			scheme.ParameterCodec,
+			namespace,
+			func() *cephrookiov1.CephNFS { return &cephrookiov1.CephNFS{} },
+			func() *cephrookiov1.CephNFSList { return &cephrookiov1.CephNFSList{} },
+		),
 	}
-}
-
-// Get takes name of the cephNFS, and returns the corresponding cephNFS object, and an error if there is any.
-func (c *cephNFSes) Get(ctx context.Context, name string, options metav1.GetOptions) (result *v1.CephNFS, err error) {
-	result = &v1.CephNFS{}
-	err = c.client.Get().
-		Namespace(c.ns).
-		Resource("cephnfses").
-		Name(name).
-		VersionedParams(&options, scheme.ParameterCodec).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// List takes label and field selectors, and returns the list of CephNFSes that match those selectors.
-func (c *cephNFSes) List(ctx context.Context, opts metav1.ListOptions) (result *v1.CephNFSList, err error) {
-	var timeout time.Duration
-	if opts.TimeoutSeconds != nil {
-		timeout = time.Duration(*opts.TimeoutSeconds) * time.Second
-	}
-	result = &v1.CephNFSList{}
-	err = c.client.Get().
-		Namespace(c.ns).
-		Resource("cephnfses").
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Timeout(timeout).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// Watch returns a watch.Interface that watches the requested cephNFSes.
-func (c *cephNFSes) Watch(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
-	var timeout time.Duration
-	if opts.TimeoutSeconds != nil {
-		timeout = time.Duration(*opts.TimeoutSeconds) * time.Second
-	}
-	opts.Watch = true
-	return c.client.Get().
-		Namespace(c.ns).
-		Resource("cephnfses").
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Timeout(timeout).
-		Watch(ctx)
-}
-
-// Create takes the representation of a cephNFS and creates it.  Returns the server's representation of the cephNFS, and an error, if there is any.
-func (c *cephNFSes) Create(ctx context.Context, cephNFS *v1.CephNFS, opts metav1.CreateOptions) (result *v1.CephNFS, err error) {
-	result = &v1.CephNFS{}
-	err = c.client.Post().
-		Namespace(c.ns).
-		Resource("cephnfses").
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Body(cephNFS).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// Update takes the representation of a cephNFS and updates it. Returns the server's representation of the cephNFS, and an error, if there is any.
-func (c *cephNFSes) Update(ctx context.Context, cephNFS *v1.CephNFS, opts metav1.UpdateOptions) (result *v1.CephNFS, err error) {
-	result = &v1.CephNFS{}
-	err = c.client.Put().
-		Namespace(c.ns).
-		Resource("cephnfses").
-		Name(cephNFS.Name).
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Body(cephNFS).
-		Do(ctx).
-		Into(result)
-	return
-}
-
-// Delete takes name of the cephNFS and deletes it. Returns an error if one occurs.
-func (c *cephNFSes) Delete(ctx context.Context, name string, opts metav1.DeleteOptions) error {
-	return c.client.Delete().
-		Namespace(c.ns).
-		Resource("cephnfses").
-		Name(name).
-		Body(&opts).
-		Do(ctx).
-		Error()
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *cephNFSes) DeleteCollection(ctx context.Context, opts metav1.DeleteOptions, listOpts metav1.ListOptions) error {
-	var timeout time.Duration
-	if listOpts.TimeoutSeconds != nil {
-		timeout = time.Duration(*listOpts.TimeoutSeconds) * time.Second
-	}
-	return c.client.Delete().
-		Namespace(c.ns).
-		Resource("cephnfses").
-		VersionedParams(&listOpts, scheme.ParameterCodec).
-		Timeout(timeout).
-		Body(&opts).
-		Do(ctx).
-		Error()
-}
-
-// Patch applies the patch and returns the patched cephNFS.
-func (c *cephNFSes) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts metav1.PatchOptions, subresources ...string) (result *v1.CephNFS, err error) {
-	result = &v1.CephNFS{}
-	err = c.client.Patch(pt).
-		Namespace(c.ns).
-		Resource("cephnfses").
-		Name(name).
-		SubResource(subresources...).
-		VersionedParams(&opts, scheme.ParameterCodec).
-		Body(data).
-		Do(ctx).
-		Into(result)
-	return
 }

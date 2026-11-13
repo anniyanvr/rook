@@ -25,8 +25,7 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-var (
-	fakecrash = `[
+var fakecrash = `[
     		{
 				"crash_id": "2020-11-09_13:58:08.230130Z_ca918f58-c078-444d-a91a-bd972c14c155",
 				"timestamp": "2020-11-09 13:58:08.230130Z",
@@ -34,7 +33,6 @@ var (
 				"entity_name": "osd.0"
 		    }
 	    ]`
-)
 
 func TestCephCrash(t *testing.T) {
 	executor := &exectest.MockExecutor{}
@@ -46,7 +44,7 @@ func TestCephCrash(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
-	crash, err := GetCrashList(context, AdminClusterInfo("mycluster"))
+	crash, err := GetCrashList(context, AdminTestClusterInfo("mycluster"))
 	assert.NoError(t, err)
 	assert.Equal(t, 1, len(crash))
 }

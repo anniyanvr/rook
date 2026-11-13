@@ -39,12 +39,12 @@ type OwnerInfo struct {
 	ownerRefNamespace string
 }
 
-// NewOwnerInfo create a new ownerInfo to set ownerReference by controllerutil
+// NewOwnerInfo creates a new ownerInfo to set ownerReference by controllerutil
 func NewOwnerInfo(owner metav1.Object, scheme *runtime.Scheme) *OwnerInfo {
 	return &OwnerInfo{owner: owner, scheme: scheme}
 }
 
-// NewOwnerInfoWithOwnerRef create a new ownerInfo to set ownerReference by rook itself
+// NewOwnerInfoWithOwnerRef creates a new ownerInfo to set ownerReference by rook itself
 func NewOwnerInfoWithOwnerRef(ownerRef *metav1.OwnerReference, namespace string) *OwnerInfo {
 	return &OwnerInfo{ownerRef: ownerRef, ownerRefNamespace: namespace}
 }
@@ -57,7 +57,6 @@ func (info *OwnerInfo) validateOwner(object metav1.Object) error {
 	if objectNamespace == "" {
 		return fmt.Errorf("cluster-scoped resource %q must not have a namespaced resource %q in namespace %q",
 			object.GetName(), info.ownerRef.Name, info.ownerRefNamespace)
-
 	}
 	if info.ownerRefNamespace != objectNamespace {
 		return fmt.Errorf("cross-namespaced owner references are disallowed. resource %q is in namespace %q, owner %q is in %q",
@@ -74,7 +73,7 @@ func (info *OwnerInfo) validateController(object metav1.Object) error {
 	return nil
 }
 
-// SetOwnerReference set the owner reference of object
+// SetOwnerReference sets the owner reference of an object
 func (info *OwnerInfo) SetOwnerReference(object metav1.Object) error {
 	if info.owner != nil {
 		return controllerutil.SetOwnerReference(info.owner, object, info.scheme)
@@ -112,7 +111,7 @@ func referSameObject(a, b metav1.OwnerReference) bool {
 	return groupVersionA.Group == groupVersionB.Group && a.Kind == b.Kind && a.Name == b.Name
 }
 
-// SetControllerReference set the controller reference of object
+// SetControllerReference sets the controller reference of an object
 func (info *OwnerInfo) SetControllerReference(object metav1.Object) error {
 	if info.owner != nil {
 		return controllerutil.SetControllerReference(info.owner, object, info.scheme)
@@ -129,7 +128,7 @@ func (info *OwnerInfo) SetControllerReference(object metav1.Object) error {
 		return err
 	}
 
-	// Do not override the BlockOwnerDeletion is already set
+	// Do not override the BlockOwnerDeletion if already set
 	if info.ownerRef.BlockOwnerDeletion == nil {
 		blockOwnerDeletion := true
 		info.ownerRef.BlockOwnerDeletion = &blockOwnerDeletion
@@ -144,41 +143,26 @@ func (info *OwnerInfo) SetControllerReference(object metav1.Object) error {
 
 // GetUID gets the UID of the owner
 func (info *OwnerInfo) GetUID() types.UID {
-	return info.owner.GetUID()
+	if info.owner != nil {
+		return info.owner.GetUID()
+	}
+	if info.ownerRef != nil {
+		return info.ownerRef.UID
+	}
+	return types.UID("")
 }
 
 func MergeResourceRequirements(first, second v1.ResourceRequirements) v1.ResourceRequirements {
-	// if the first has a value not set check if second has and set it in first
-	if _, ok := first.Limits[v1.ResourceCPU]; !ok {
-		if _, ok = second.Limits[v1.ResourceCPU]; ok {
-			if first.Limits == nil {
-				first.Limits = v1.ResourceList{}
-			}
-			first.Limits[v1.ResourceCPU] = second.Limits[v1.ResourceCPU]
+	// if the first has no limits set, apply the second limits if any are specified
+	if len(first.Limits) == 0 {
+		if len(second.Limits) > 0 {
+			first.Limits = second.Limits
 		}
 	}
-	if _, ok := first.Limits[v1.ResourceMemory]; !ok {
-		if _, ok = second.Limits[v1.ResourceMemory]; ok {
-			if first.Limits == nil {
-				first.Limits = v1.ResourceList{}
-			}
-			first.Limits[v1.ResourceMemory] = second.Limits[v1.ResourceMemory]
-		}
-	}
-	if _, ok := first.Requests[v1.ResourceCPU]; !ok {
-		if _, ok = second.Requests[v1.ResourceCPU]; ok {
-			if first.Requests == nil {
-				first.Requests = v1.ResourceList{}
-			}
-			first.Requests[v1.ResourceCPU] = second.Requests[v1.ResourceCPU]
-		}
-	}
-	if _, ok := first.Requests[v1.ResourceMemory]; !ok {
-		if _, ok = second.Requests[v1.ResourceMemory]; ok {
-			if first.Requests == nil {
-				first.Requests = v1.ResourceList{}
-			}
-			first.Requests[v1.ResourceMemory] = second.Requests[v1.ResourceMemory]
+	// if the first has no requests set, apply the second requests if any are specified
+	if len(first.Requests) == 0 {
+		if len(second.Requests) > 0 {
+			first.Requests = second.Requests
 		}
 	}
 	return first
@@ -208,9 +192,9 @@ type ContainerResource struct {
 	Resource v1.ResourceRequirements `json:"resource"`
 }
 
-// YamlToContainerResource takes raw YAML string and converts it to array of
+// YamlToContainerResourceArray takes a raw YAML string and converts it to an array of
 // ContainerResource
-func YamlToContainerResource(raw string) ([]ContainerResource, error) {
+func YamlToContainerResourceArray(raw string) ([]ContainerResource, error) {
 	resources := []ContainerResource{}
 	if raw == "" {
 		return resources, nil
@@ -224,4 +208,25 @@ func YamlToContainerResource(raw string) ([]ContainerResource, error) {
 		return resources, err
 	}
 	return resources, nil
+}
+
+type resourcesRequirements struct {
+	Resources v1.ResourceRequirements `json:"resources"`
+}
+
+// YamlToContainerResource takes a raw YAML string and converts it to a v1.ResourceRequirements
+func YamlToContainerResource(raw string) (v1.ResourceRequirements, error) {
+	resources := resourcesRequirements{}
+	if raw == "" {
+		return resources.Resources, nil
+	}
+	rawJSON, err := yaml.ToJSON([]byte(raw))
+	if err != nil {
+		return resources.Resources, err
+	}
+	err = json.Unmarshal(rawJSON, &resources)
+	if err != nil {
+		return resources.Resources, err
+	}
+	return resources.Resources, nil
 }

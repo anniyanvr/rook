@@ -28,27 +28,27 @@ const rgwPort = 80
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook/tests", "clients")
 
-// ObjectOperation is wrapper for k8s rook object operations
+// ObjectOperation is a wrapper for k8s rook object operations
 type ObjectOperation struct {
 	k8sh      *utils.K8sHelper
 	manifests installer.CephManifests
 }
 
-// CreateObjectOperation creates new rook object client
+// CreateObjectOperation creates a new rook object client
 func CreateObjectOperation(k8sh *utils.K8sHelper, manifests installer.CephManifests) *ObjectOperation {
 	return &ObjectOperation{k8sh, manifests}
 }
 
-// ObjectCreate Function to create a object store in rook
-func (o *ObjectOperation) Create(namespace, storeName string, replicaCount int32, tlsEnable bool) error {
-
+// ObjectCreate Function to create an object store in rook
+func (o *ObjectOperation) Create(namespace, storeName string, replicaCount int32, tlsEnable bool, swiftAndKeystone bool) error {
 	logger.Info("creating the object store via CRD")
-	if err := o.k8sh.ResourceOperation("apply", o.manifests.GetObjectStore(storeName, int(replicaCount), rgwPort, tlsEnable)); err != nil {
+
+	if err := o.k8sh.ResourceOperation("apply", o.manifests.GetObjectStore(storeName, int(replicaCount), rgwPort, tlsEnable, swiftAndKeystone)); err != nil {
 		return err
 	}
 
 	// Starting an object store takes longer than the average operation, so add more retries
-	err := o.k8sh.WaitForLabeledPodsToRunWithRetries(fmt.Sprintf("rook_object_store=%s", storeName), namespace, 40)
+	err := o.k8sh.WaitForLabeledPodsToRunWithRetries(fmt.Sprintf("rook_object_store=%s", storeName), namespace, 80)
 	if err != nil {
 		return fmt.Errorf("rgw did not start via crd. %+v", err)
 	}
@@ -58,7 +58,6 @@ func (o *ObjectOperation) Create(namespace, storeName string, replicaCount int32
 }
 
 func (o *ObjectOperation) Delete(namespace, storeName string) error {
-
 	logger.Infof("Deleting the object store via CRD")
 	if err := o.k8sh.DeleteResource("-n", namespace, "CephObjectStore", storeName); err != nil {
 		return err
@@ -68,14 +67,4 @@ func (o *ObjectOperation) Delete(namespace, storeName string) error {
 		return fmt.Errorf("rgw did not stop via crd")
 	}
 	return nil
-}
-
-// Need to improve the below function for better error handling
-func (o *ObjectOperation) GetEndPointUrl(namespace string, storeName string) (string, error) {
-	args := []string{"get", "svc", "-n", namespace, "-l", fmt.Sprintf("rgw=%s", storeName), "-o", "jsonpath={.items[*].spec.clusterIP}"}
-	EndPointUrl, err := o.k8sh.Kubectl(args...)
-	if err != nil {
-		return "", fmt.Errorf("Unable to find rgw end point-- %s", err)
-	}
-	return fmt.Sprintf("%s:%d", EndPointUrl, rgwPort), nil
 }

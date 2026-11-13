@@ -17,14 +17,16 @@ limitations under the License.
 package peermap
 
 import (
-	"context"
+	"bytes"
+	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
-	"strings"
-
+	"github.com/coreos/pkg/capnslog"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
@@ -129,7 +131,7 @@ func TestAddPoolIDMapping(t *testing.T) {
 	m.addClusterIDMapping(clusterMap1)
 	assert.Equal(t, 1, len(*m))
 
-	// Add two Pool ID mapping
+	// Add two Pool ID mappings
 	poolIDMap1 := map[string]string{"1": "2"}
 	poolIDMap2 := map[string]string{"2": "3"}
 
@@ -160,13 +162,13 @@ const (
 	ns = "rook-ceph-primary"
 )
 
-// #nosec G101 fake token for peer cluster "peer1"
+//nolint:gosec // fake token for peer cluster "peer1"
 var fakeTokenPeer1 = "eyJmc2lkIjoiOWY1MjgyZGItYjg5OS00NTk2LTgwOTgtMzIwYzFmYzM5NmYzIiwiY2xpZW50X2lkIjoicmJkLW1pcnJvci1wZWVyIiwia2V5IjoiQVFBUnczOWQwdkhvQmhBQVlMM1I4RmR5dHNJQU50bkFTZ0lOTVE9PSIsIm1vbl9ob3N0IjoiW3YyOjE5Mi4xNjguMS4zOjY4MjAsdjE6MTkyLjE2OC4xLjM6NjgyMV0iLCAibmFtZXNwYWNlIjogInBlZXIxIn0="
 
-// #nosec G101 fake token for peer cluster "peer2"
+//nolint:gosec // fake token for peer cluster "peer2"
 var fakeTokenPeer2 = "eyJmc2lkIjoiOWY1MjgyZGItYjg5OS00NTk2LTgwOTgtMzIwYzFmYzM5NmYzIiwiY2xpZW50X2lkIjoicmJkLW1pcnJvci1wZWVyIiwia2V5IjoiQVFBUnczOWQwdkhvQmhBQVlMM1I4RmR5dHNJQU50bkFTZ0lOTVE9PSIsIm1vbl9ob3N0IjoiW3YyOjE5Mi4xNjguMS4zOjY4MjAsdjE6MTkyLjE2OC4xLjM6NjgyMV0iLCAibmFtZXNwYWNlIjogInBlZXIyIn0="
 
-// #nosec G101 fake token for peer cluster "peer3"
+//nolint:gosec // fake token for peer cluster "peer3"
 var fakeTokenPeer3 = "eyJmc2lkIjoiOWY1MjgyZGItYjg5OS00NTk2LTgwOTgtMzIwYzFmYzM5NmYzIiwiY2xpZW50X2lkIjoicmJkLW1pcnJvci1wZWVyIiwia2V5IjoiQVFBUnczOWQwdkhvQmhBQVlMM1I4RmR5dHNJQU50bkFTZ0lOTVE9PSIsIm1vbl9ob3N0IjoiW3YyOjE5Mi4xNjguMS4zOjY4MjAsdjE6MTkyLjE2OC4xLjM6NjgyMV0iLCAibmFtZXNwYWNlIjogInBlZXIzIn0="
 
 var peer1Secret = corev1.Secret{
@@ -204,11 +206,13 @@ var fakeSinglePeerCephBlockPool = cephv1.CephBlockPool{
 		Name:      "mirrorPool1",
 		Namespace: ns,
 	},
-	Spec: cephv1.PoolSpec{
-		Mirroring: cephv1.MirroringSpec{
-			Peers: &cephv1.MirroringPeerSpec{
-				SecretNames: []string{
-					"peer1Secret",
+	Spec: cephv1.NamedBlockPoolSpec{
+		PoolSpec: cephv1.PoolSpec{
+			Mirroring: cephv1.MirroringSpec{
+				Peers: &cephv1.MirroringPeerSpec{
+					SecretNames: []string{
+						"peer1Secret",
+					},
 				},
 			},
 		},
@@ -220,17 +224,36 @@ var fakeMultiPeerCephBlockPool = cephv1.CephBlockPool{
 		Name:      "mirrorPool1",
 		Namespace: ns,
 	},
-	Spec: cephv1.PoolSpec{
-		Mirroring: cephv1.MirroringSpec{
-			Peers: &cephv1.MirroringPeerSpec{
-				SecretNames: []string{
-					"peer1Secret",
-					"peer2Secret",
-					"peer3Secret",
+	Spec: cephv1.NamedBlockPoolSpec{
+		PoolSpec: cephv1.PoolSpec{
+			Mirroring: cephv1.MirroringSpec{
+				Peers: &cephv1.MirroringPeerSpec{
+					SecretNames: []string{
+						"peer1Secret",
+						"peer2Secret",
+						"peer3Secret",
+					},
 				},
 			},
 		},
 	},
+}
+
+func saveMockDataInTempFile(data, filePattern string) error {
+	matches, _ := filepath.Glob(fmt.Sprintf("%s/%s*", os.TempDir(), filePattern))
+	for _, m := range matches {
+		file, err := os.OpenFile(m, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		if err != nil {
+			return fmt.Errorf("failed to open file %q. %v", m, err)
+		}
+
+		defer file.Close()
+		_, err = file.WriteString(data)
+		if err != nil {
+			return fmt.Errorf("failed to write data to the file %q. %v", m, err)
+		}
+	}
+	return nil
 }
 
 var mockExecutor = &exectest.MockExecutor{
@@ -238,35 +261,61 @@ var mockExecutor = &exectest.MockExecutor{
 		logger.Infof("Command: %s %v", command, args)
 		// Fake pool details for "rook-ceph-primary" cluster
 		if args[0] == "osd" && args[1] == "pool" && args[2] == "get" && strings.HasSuffix(args[6], ns) {
-			if args[3] == "mirrorPool1" {
+			switch args[3] {
+			case "mirrorPool1":
 				return `{"pool_id": 1}`, nil
-			} else if args[3] == "mirrorPool2" {
+			case "mirrorPool2":
 				return `{"pool_id": 2}`, nil
 			}
-
 		}
 		return "", nil
 	},
 	MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, args ...string) (string, error) {
 		logger.Infof("Command: %s %v", command, args)
 		if args[0] == "osd" && args[1] == "pool" && args[2] == "get" && strings.HasSuffix(args[5], "peer1") {
-			if args[3] == "mirrorPool1" {
+			switch args[3] {
+			case "mirrorPool1":
+				err := saveMockDataInTempFile(`{"pool_id": 2}`, peerPoolTempFile)
+				if err != nil {
+					return "", err
+				}
 				return `{"pool_id": 2}`, nil
-			} else if args[3] == "mirrorPool2" {
+			case "mirrorPool2":
+				err := saveMockDataInTempFile(`{"pool_id": 3}`, peerPoolTempFile)
+				if err != nil {
+					return "", err
+				}
 				return `{"pool_id": 3}`, nil
 			}
 		}
 		if args[0] == "osd" && args[1] == "pool" && args[2] == "get" && strings.HasSuffix(args[5], "peer2") {
-			if args[3] == "mirrorPool1" {
+			switch args[3] {
+			case "mirrorPool1":
+				err := saveMockDataInTempFile(`{"pool_id": 3}`, peerPoolTempFile)
+				if err != nil {
+					return "", err
+				}
 				return `{"pool_id": 3}`, nil
-			} else if args[3] == "mirrorPool2" {
+			case "mirrorPool2":
+				err := saveMockDataInTempFile(`{"pool_id": 4}`, peerPoolTempFile)
+				if err != nil {
+					return "", err
+				}
 				return `{"pool_id": 4}`, nil
 			}
 		}
 		if args[0] == "osd" && args[1] == "pool" && args[2] == "get" && strings.HasSuffix(args[5], "peer3") {
-			if args[3] == "mirrorPool1" {
-				return `{"pool_id": 4}`, nil
-			} else if args[3] == "mirrorPool2" {
+			switch args[3] {
+			case "mirrorPool1":
+				err := saveMockDataInTempFile(`{"pool_id": 4}`, peerPoolTempFile)
+				if err != nil {
+					return "", err
+				}
+			case "mirrorPool2":
+				err := saveMockDataInTempFile(`{"pool_id": 5}`, peerPoolTempFile)
+				if err != nil {
+					return "", err
+				}
 				return `{"pool_id": 5}`, nil
 			}
 		}
@@ -275,17 +324,17 @@ var mockExecutor = &exectest.MockExecutor{
 }
 
 func TestSinglePeerMappings(t *testing.T) {
-	clusterInfo := cephclient.AdminClusterInfo(ns)
+	clusterInfo := cephclient.AdminTestClusterInfo(ns)
 	fakeContext := &clusterd.Context{
 		Executor:  mockExecutor,
 		Clientset: test.New(t, 3),
 	}
 
 	// create fake secret with "peer1" cluster token
-	_, err := fakeContext.Clientset.CoreV1().Secrets(ns).Create(context.TODO(), &peer1Secret, metav1.CreateOptions{})
+	_, err := fakeContext.Clientset.CoreV1().Secrets(ns).Create(t.Context(), &peer1Secret, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
-	//expected: &[{ClusterIDMapping:{peer1:rook-ceph-primary}. RBDPoolIDMapping:[{2:1}]}]
+	// expected: &[{ClusterIDMapping:{peer1:rook-ceph-primary}. RBDPoolIDMapping:[{2:1}]}]
 	actualMappings, err := getClusterPoolIDMap(
 		fakeContext,
 		clusterInfo,
@@ -299,22 +348,22 @@ func TestSinglePeerMappings(t *testing.T) {
 }
 
 func TestMultiPeerMappings(t *testing.T) {
-	clusterInfo := cephclient.AdminClusterInfo(ns)
+	clusterInfo := cephclient.AdminTestClusterInfo(ns)
 	fakeContext := &clusterd.Context{
 		Executor:  mockExecutor,
 		Clientset: test.New(t, 3),
 	}
 
 	// create fake secret with "peer1" cluster token
-	_, err := fakeContext.Clientset.CoreV1().Secrets(ns).Create(context.TODO(), &peer1Secret, metav1.CreateOptions{})
+	_, err := fakeContext.Clientset.CoreV1().Secrets(ns).Create(t.Context(), &peer1Secret, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	// create fake secret with "peer2" cluster token
-	_, err = fakeContext.Clientset.CoreV1().Secrets(ns).Create(context.TODO(), &peer2Secret, metav1.CreateOptions{})
+	_, err = fakeContext.Clientset.CoreV1().Secrets(ns).Create(t.Context(), &peer2Secret, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	// create fake secret with "peer3" cluster token
-	_, err = fakeContext.Clientset.CoreV1().Secrets(ns).Create(context.TODO(), &peer3Secret, metav1.CreateOptions{})
+	_, err = fakeContext.Clientset.CoreV1().Secrets(ns).Create(t.Context(), &peer3Secret, metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	actualMappings, err := getClusterPoolIDMap(
@@ -358,11 +407,26 @@ func TestDecodePeerToken(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestDecodePeerTokenDoesNotLogSecret(t *testing.T) {
+	// The peer token embeds the peer cluster's cephx auth key, which must never
+	// be written to the operator logs, even at debug level.
+	logBuf := bytes.NewBuffer([]byte{})
+	capnslog.SetFormatter(capnslog.NewLogFormatter(logBuf, "", 0))
+	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
+
+	decodedToken, err := decodePeerToken(fakeTokenPeer1)
+	assert.NoError(t, err)
+
+	logOutput := logBuf.String()
+	assert.NotEmpty(t, decodedToken.Key)
+	assert.NotContains(t, logOutput, decodedToken.Key)
+	// The non-sensitive fields are still useful for diagnostics.
+	assert.Contains(t, logOutput, decodedToken.Namespace)
+}
+
 func TestCreateOrUpdateConfig(t *testing.T) {
-	os.Setenv("POD_NAME", "rook-ceph-operator")
-	defer os.Setenv("POD_NAME", "")
-	os.Setenv("POD_NAMESPACE", ns)
-	defer os.Setenv("POD_NAMESPACE", "")
+	t.Setenv("POD_NAME", "rook-ceph-operator")
+	t.Setenv("POD_NAMESPACE", ns)
 
 	scheme := scheme.Scheme
 	err := cephv1.AddToScheme(scheme)
@@ -381,15 +445,15 @@ func TestCreateOrUpdateConfig(t *testing.T) {
 	}
 
 	// Create fake pod
-	_, err = fakeContext.Clientset.CoreV1().Pods(ns).Create(context.TODO(), test.FakeOperatorPod(ns), metav1.CreateOptions{})
+	_, err = fakeContext.Clientset.CoreV1().Pods(ns).Create(t.Context(), test.FakeOperatorPod(ns), metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	// Create fake replicaset
-	_, err = fakeContext.Clientset.AppsV1().ReplicaSets(ns).Create(context.TODO(), test.FakeReplicaSet(ns), metav1.CreateOptions{})
+	_, err = fakeContext.Clientset.AppsV1().ReplicaSets(ns).Create(t.Context(), test.FakeReplicaSet(ns), metav1.CreateOptions{})
 	assert.NoError(t, err)
 
 	// Create empty ID mapping configMap
-	err = CreateOrUpdateConfig(fakeContext, &PeerIDMappings{})
+	err = CreateOrUpdateConfig(t.Context(), fakeContext, &PeerIDMappings{})
 	assert.NoError(t, err)
 	validateConfig(t, fakeContext, PeerIDMappings{})
 
@@ -405,11 +469,11 @@ func TestCreateOrUpdateConfig(t *testing.T) {
 		},
 	}
 
-	err = CreateOrUpdateConfig(fakeContext, actualMappings)
+	err = CreateOrUpdateConfig(t.Context(), fakeContext, actualMappings)
 	assert.NoError(t, err)
-	//validateConfig(t, fakeContext, actualMappings)
+	// validateConfig(t, fakeContext, actualMappings)
 
-	//Update existing mapping config
+	// Update existing mapping config
 	mappings := *actualMappings
 	mappings = append(mappings, PeerIDMapping{
 		ClusterIDMapping: map[string]string{"peer2": ns},
@@ -420,14 +484,14 @@ func TestCreateOrUpdateConfig(t *testing.T) {
 		},
 	})
 
-	err = CreateOrUpdateConfig(fakeContext, &mappings)
+	err = CreateOrUpdateConfig(t.Context(), fakeContext, &mappings)
 	assert.NoError(t, err)
 	validateConfig(t, fakeContext, mappings)
 }
 
 func validateConfig(t *testing.T, c *clusterd.Context, mappings PeerIDMappings) {
 	cm := &corev1.ConfigMap{}
-	err := c.Client.Get(context.TODO(), types.NamespacedName{Name: mappingConfigName, Namespace: ns}, cm)
+	err := c.Client.Get(t.Context(), types.NamespacedName{Name: mappingConfigName, Namespace: ns}, cm)
 	assert.NoError(t, err)
 
 	data := cm.Data[mappingConfigkey]

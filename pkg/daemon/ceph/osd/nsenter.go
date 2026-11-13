@@ -33,9 +33,7 @@ const (
 	rootFSPath = "/rootfs"
 )
 
-var (
-	binPathsToCheck = []string{"/usr/sbin", "/sbin/"}
-)
+var binPathsToCheck = []string{"/usr/sbin", "/sbin/", "/run/current-system/sw/bin", "/run/current-system/sw/sbin"}
 
 // NSEnter is an nsenter object
 type NSEnter struct {
@@ -78,8 +76,8 @@ func (ne *NSEnter) checkIfBinaryExistsOnHost() error {
 		err := ne.callNsEnter(binPath)
 		if err != nil {
 			logger.Debugf("failed to call nsenter. %v", err)
-			// If nsenter failed, let's try with the rootfs directly but only lookup the binary and do not execute it
-			// This avoids mismatch libraries between the container and the host while executing
+			// If nsenter failed, let's try with the rootfs directly but only look up the binary and do not execute it
+			// This avoids mismatched libraries between the container and the host while executing
 			rootFSBinPath := filepath.Join(rootFSPath, binPath)
 			_, err := os.Stat(rootFSBinPath)
 			if err != nil {

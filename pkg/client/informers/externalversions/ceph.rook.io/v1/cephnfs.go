@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,25 +19,54 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	apiscephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	versioned "github.com/rook/rook/pkg/client/clientset/versioned"
 	internalinterfaces "github.com/rook/rook/pkg/client/informers/externalversions/internalinterfaces"
-	v1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
+	cephrookiov1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephNFSInformer provides access to a shared informer and lister for
-// CephNFSes.
+// CephNFSes. Prefer using the type-safe variant (see [TypedCephNFSInformer]).
 type CephNFSInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.CephNFSLister
+	Lister() cephrookiov1.CephNFSLister
 }
+
+// TypedCephNFSInformer provides access to a shared informer and lister for
+// CephNFSes, including the type-safe TypedInformer variant.
+// It is a superset of CephNFSInformer.
+type TypedCephNFSInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() CephNFSIndexInformer
+	Lister() cephrookiov1.CephNFSLister
+}
+
+// CephNFSIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type CephNFSIndexInformer cache.TypedSharedIndexInformer[*apiscephrookiov1.CephNFS]
+
+// CephNFSHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for CephNFS.
+type CephNFSHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*apiscephrookiov1.CephNFS]
+
+// CephNFSDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for CephNFS.
+type CephNFSDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*apiscephrookiov1.CephNFS]
+
+// CephNFSFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for CephNFS.
+type CephNFSFilteringHandler = cache.TypedFilteringResourceEventHandler[*apiscephrookiov1.CephNFS]
+
+// CephNFSIndexers is a specialization of [cache.TypedIndexers] for CephNFS.
+type CephNFSIndexers = cache.TypedIndexers[*apiscephrookiov1.CephNFS]
+
+// DeletedCephNFS is a specialization of [cache.DeletedObject] for CephNFS.
+type DeletedCephNFS = cache.DeletedObject[*apiscephrookiov1.CephNFS]
 
 type cephNFSInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +77,132 @@ type cephNFSInformer struct {
 // NewCephNFSInformer constructs a new informer for CephNFS type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephNFSInformer]).
 func NewCephNFSInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredCephNFSInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewCephNFSInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedCephNFSInformer constructs a new informer for CephNFS type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephNFSInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephNFSIndexers) CephNFSIndexInformer {
+	return NewTypedCephNFSInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredCephNFSInformer constructs a new informer for CephNFS type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredCephNFSInformer]).
 func NewFilteredCephNFSInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+	return NewTypedCephNFSInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredCephNFSInformer constructs a new informer for CephNFS type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredCephNFSInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephNFSIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) CephNFSIndexInformer {
+	return NewTypedCephNFSInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewCephNFSInformerWithOptions constructs a new informer for CephNFS type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephNFSInformerWithOptions]).
+func NewCephNFSInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedCephNFSInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedCephNFSInformerWithOptions constructs a new informer for CephNFS type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephNFSInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) CephNFSIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "ceph.rook.io", Version: "v1", Resource: "cephnfss"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephNFS](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephNFSes(namespace).List(context.TODO(), options)
+				return client.CephV1().CephNFSes(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephNFSes(namespace).Watch(context.TODO(), options)
+				return client.CephV1().CephNFSes(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephNFSes(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephNFSes(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&apiscephrookiov1.CephNFS{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&cephrookiov1.CephNFS{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *cephNFSInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredCephNFSInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedCephNFSInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *cephNFSInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&cephrookiov1.CephNFS{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *cephNFSInformer) Lister() v1.CephNFSLister {
-	return v1.NewCephNFSLister(f.Informer().GetIndexer())
+func (f *cephNFSInformer) TypedInformer() CephNFSIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephNFS](f.factory.InformerFor(&apiscephrookiov1.CephNFS{}, f.defaultInformer))
+}
+
+func (f *cephNFSInformer) Lister() cephrookiov1.CephNFSLister {
+	return cephrookiov1.NewCephNFSLister(f.Informer().GetIndexer())
+}
+
+// ToTypedCephNFSInformer converts an untyped informer into a TypedCephNFSInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephNFS. If that is not the case, calling type-safe methods of the returned
+// TypedCephNFSInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedCephNFSInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedCephNFSInformer(informer CephNFSInformer) TypedCephNFSInformer {
+	if informer, ok := informer.(TypedCephNFSInformer); ok {
+		return informer
+	}
+	return &cephNFSTypedInformerAdapter{informer}
+}
+
+type cephNFSTypedInformerAdapter struct {
+	CephNFSInformer
+}
+
+func (a *cephNFSTypedInformerAdapter) TypedInformer() CephNFSIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephNFS](a.Informer())
+}
+
+// ToCephNFSIndexInformer converts an untyped informer into a CephNFSIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephNFS. If that is not the case, calling type-safe methods of the returned
+// CephNFSIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a CephNFSIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToCephNFSIndexInformer(informer cache.SharedIndexInformer) CephNFSIndexInformer {
+	if informer, ok := informer.(CephNFSIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephNFS](informer)
 }

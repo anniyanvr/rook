@@ -17,29 +17,23 @@
 
 override GOOS=linux
 
-ifeq ($(origin DOCKERCMD),undefined)
-DOCKERCMD?=$(shell docker version >/dev/null 2>&1 && echo docker)
-ifeq ($(DOCKERCMD),)
-DOCKERCMD=$(shell podman version >/dev/null 2>&1 && echo podman)
-endif
-endif
-
 # include the common make file
 SELF_DIR := $(dir $(lastword $(MAKEFILE_LIST)))
 include $(SELF_DIR)/../build/makelib/common.mk
 
+# common.mk may define targets (e.g., directory creation). Since GNU Make uses the first target
+# it sees as the default goal, this behavior may unintentionally mask the intended default goal
+# of all (AKA build).
+# Explicitly set the default goal for image builds to override this masking.
+.DEFAULT_GOAL := all
+
 # the registry used for cached images
 CACHE_REGISTRY := cache
 
-# the base image to use
-OSBASE ?= centos:7
-
 ifeq ($(GOARCH),amd64)
 PLATFORM_ARCH = x86_64
-OSBASEIMAGE = $(OSBASE)
 else ifeq ($(GOARCH),arm64)
 PLATFORM_ARCH = aarch64
-OSBASEIMAGE = arm64v8/$(OSBASE)
 else
 $(error Unknown go architecture $(GOARCH))
 endif
@@ -81,9 +75,16 @@ BUILD_BASE_ARGS += $(BUILD_ARGS)
 all: build
 
 build: do.build ## Build images for the host platform.
-	@$(MAKE) cache.images
+	@if [ "$(BUILD_CONTAINER_IMAGE)" != "false" ] && $(DOCKERCMD) version >/dev/null 2>&1; then \
+		$(MAKE) cache.images; \
+	fi
 
-clean: clean.build ## Remove all images created from the current build.
+clean: ## Remove all images created from the current build.
+	@if $(DOCKERCMD) version >/dev/null 2>&1; then \
+		$(MAKE) clean.build; \
+	else \
+		echo "=== skipping image cleanup because no usable container runtime was found"; \
+	fi
 
 prune: cache.prune ## Prunes orphaned and cached images at the host level.
 

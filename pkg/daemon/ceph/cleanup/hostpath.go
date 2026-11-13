@@ -17,18 +17,18 @@ limitations under the License.
 package cleanup
 
 import (
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/pkg/errors"
-	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 )
 
 // StartHostPathCleanup is the main entrypoint function to clean up dataDirHostPath and monitor store
 func StartHostPathCleanup(namespaceDir, dataDirHostPath, monSecret string) {
-	cleanupDirPath := path.Join(dataDirHostPath, namespaceDir)
+	cleanupDirPath := filepath.Join(dataDirHostPath, namespaceDir)
 	if err := os.RemoveAll(cleanupDirPath); err != nil {
 		logger.Errorf("failed to clean up %q directory. %v", cleanupDirPath, err)
 	} else {
@@ -36,6 +36,47 @@ func StartHostPathCleanup(namespaceDir, dataDirHostPath, monSecret string) {
 	}
 
 	cleanMonDirs(dataDirHostPath, monSecret)
+	cleanExporterDir(dataDirHostPath)
+	cleanCSIDirs(dataDirHostPath)
+}
+
+func cleanCSIDirs(dataDirHostPath string) {
+	entries, err := os.ReadDir(dataDirHostPath)
+	if err != nil {
+		logger.Errorf("failed to read directory %q. %v", dataDirHostPath, err)
+		return
+	}
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			name := entry.Name()
+			if strings.HasSuffix(name, ".csi.ceph.com") {
+				fullPath := filepath.Join(dataDirHostPath, name)
+				if err := os.RemoveAll(fullPath); err != nil {
+					logger.Errorf("failed to remove CSI directory %q. %v", fullPath, err)
+				} else {
+					logger.Infof("successfully removed CSI directory %q", fullPath)
+				}
+			}
+		}
+	}
+}
+
+func cleanExporterDir(dataDirHostPath string) {
+	exporterDir := filepath.Join(dataDirHostPath, "exporter")
+
+	// Check if the exporter directory exists
+	if _, err := os.Stat(exporterDir); os.IsNotExist(err) {
+		logger.Infof("exporter directory %q does not exist, skipping cleanup", exporterDir)
+		return
+	}
+
+	// Attempt to delete it
+	if err := os.RemoveAll(exporterDir); err != nil {
+		logger.Errorf("failed to clean up exporter directory %q. %v", exporterDir, err)
+	} else {
+		logger.Infof("successfully cleaned up exporter directory %q", exporterDir)
+	}
 }
 
 func cleanMonDirs(dataDirHostPath, monSecret string) {
@@ -70,15 +111,15 @@ func cleanMonDirs(dataDirHostPath, monSecret string) {
 }
 
 func secretKeyMatch(monDir, monSecret string) (bool, error) {
-	keyringDirPath := path.Join(monDir, "/data/keyring")
+	keyringDirPath := filepath.Join(monDir, "/data/keyring")
 	if _, err := os.Stat(keyringDirPath); os.IsNotExist(err) {
 		return false, errors.Wrapf(err, "failed to read keyring %q for the mon directory %q", keyringDirPath, monDir)
 	}
-	contents, err := ioutil.ReadFile(filepath.Clean(keyringDirPath))
+	contents, err := os.ReadFile(filepath.Clean(keyringDirPath))
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to read keyring %q for the mon directory %q", keyringDirPath, monDir)
 	}
-	extractedKey, err := mon.ExtractKey(string(contents))
+	extractedKey, err := opcontroller.ExtractKey(string(contents))
 	if err != nil {
 		return false, errors.Wrapf(err, "failed to extract secret key from the keyring %q for the mon directory %q", keyringDirPath, monDir)
 	}

@@ -20,12 +20,12 @@ import (
 	"strings"
 )
 
-// grep finds the *first* line that matches, rather than multiple lines
+// Grep finds the *first* line that matches, rather than multiple lines
 func Grep(input, searchFor string) string {
 	if input == "" || searchFor == "" {
 		return ""
 	}
-	for _, line := range strings.Split(input, "\n") {
+	for line := range strings.SplitSeq(input, "\n") {
 		if matched, _ := regexp.MatchString(searchFor, line); matched {
 			return line
 		}

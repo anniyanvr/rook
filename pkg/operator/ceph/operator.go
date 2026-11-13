@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-// Package operator to manage Kubernetes storage.
+// Package operator manages Kubernetes storage.
 package operator
 
 import (
@@ -38,7 +38,7 @@ import (
 var (
 	logger = capnslog.NewPackageLogger("github.com/rook/rook", "operator")
 
-	// ImmediateRetryResult Return this for a immediate retry of the reconciliation loop with the same request object.
+	// ImmediateRetryResult is returned for an immediate retry of the reconciliation loop with the same request object.
 	ImmediateRetryResult = reconcile.Result{Requeue: true}
 
 	// ShutdownSignals signals to watch for to terminate the operator gracefully
@@ -47,7 +47,7 @@ var (
 
 	// Placeholder for the CRD manager life cycle, first we have the context to manage cancellation
 	// of the manager.
-	// Then we have the cancel function that we can call anything to terminate the context
+	// Then we have the cancel function that we can call at any time to terminate the context
 	// Finally the channel to receive errors from the manager from within the go routine
 	opManagerContext context.Context
 	opManagerStop    context.CancelFunc
@@ -81,7 +81,7 @@ func New(context *clusterd.Context, rookImage, serviceAccount string) *Operator 
 	return o
 }
 
-// Run the operator instance
+// Run runs the operator instance
 func (o *Operator) Run() error {
 	// Initialize signal handler and context for the operator process life cycle
 	// This context is used to handle the graceful termination of the operator
@@ -113,6 +113,9 @@ func (o *Operator) Run() error {
 			// Stop the operator CRD manager
 			opManagerStop()
 
+			// Short sleep to quickly work around https://github.com/rook/rook/issues/18112
+			time.Sleep(5 * time.Second)
+
 			// Run the operator CRD manager again
 			o.runCRDManager()
 
@@ -129,12 +132,18 @@ func (o *Operator) runCRDManager() {
 	// Create the context and the cancellation function
 	opManagerContext, opManagerStop = context.WithCancel(context.Background())
 
+	// Initialize the operator settings from the configmap
+	if err := k8sutil.ApplyOperatorSettingsConfigmap(opManagerContext, o.context.Clientset); err != nil {
+		panic("failed to load operator settings configmap. " + err.Error())
+	}
+
 	// The operator config manager is also watching for changes here so if the operator config map
 	// content changes for ROOK_CURRENT_NAMESPACE_ONLY we must reload the operator CRD manager
-	o.namespaceToWatch(opManagerContext)
+	o.namespaceToWatch()
 
 	// Pass the parent context to the cluster controller so that the monitoring go routines can
 	// consume it to terminate gracefully
+	logger.Info("swapping clusterController context") // debug https://github.com/rook/rook/issues/18112
 	o.clusterController.OpManagerCtx = opManagerContext
 
 	// Run the operator CRD manager
@@ -148,11 +157,11 @@ func (o *Operator) runCRDManager() {
 	}()
 }
 
-func (o *Operator) namespaceToWatch(context context.Context) {
-	currentNamespaceOnly, _ := k8sutil.GetOperatorSetting(opManagerContext, o.context.Clientset, opcontroller.OperatorSettingConfigMapName, "ROOK_CURRENT_NAMESPACE_ONLY", "true")
+func (o *Operator) namespaceToWatch() {
+	currentNamespaceOnly := k8sutil.GetOperatorSetting("ROOK_CURRENT_NAMESPACE_ONLY", "true")
 	if currentNamespaceOnly == "true" {
 		o.config.NamespaceToWatch = o.config.OperatorNamespace
-		logger.Infof("watching the current namespace %q for a Ceph CRs", o.config.OperatorNamespace)
+		logger.Infof("watching the current namespace %q for Ceph CRs", o.config.OperatorNamespace)
 	} else {
 		o.config.NamespaceToWatch = v1.NamespaceAll
 		logger.Infof("watching all namespaces for Ceph CRs")

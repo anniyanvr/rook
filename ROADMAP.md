@@ -5,28 +5,27 @@ The features and themes included in each milestone are optimistic in the sense t
 Community and contributor involvement is vital for successfully implementing all desired items for each release.
 We hope that the items listed below will inspire further engagement from the community to keep Rook progressing and shipping exciting and valuable features.
 
-Any dates listed below and the specific issues that will ship in a given milestone are subject to change but should give a general idea of what we are planning.
-See the [Github project boards](https://github.com/rook/rook/projects) for the most up-to-date issues and their status.
+Any dates listed below and the specific issues that will ship in a given milestone are subject to change but give a general idea of what we are planning.
+See the [GitHub project boards](https://github.com/rook/rook/projects) for the most up-to-date issues and their status.
 
-## Rook Ceph 1.8
+## Rook Ceph 1.21
 
-The following high level features are targeted for Rook v1.8 (December 2021). For more detailed project tracking see the [v1.8 board](https://github.com/rook/rook/projects/23).
+The following high level features are targeted for Rook v1.21 (September 2026). For more detailed project tracking see the [v1.21 board](https://github.com/orgs/rook/projects/14).
 
-* Configure bucket notifications with a CRD ([design doc](https://github.com/rook/rook/blob/master/design/ceph/object/ceph-bucket-notification-crd.md))
-* Disaster Recovery (DR): CSI solution for application failover in the event of cluster failure
-* OSD encryption key rotation [#7925](https://github.com/rook/rook/issues/7925)
-* Kubernetes authentication for cluster-wide encryption with Vault KMS
-* Provide a conversion tool for FlexVolumes to CSI and remove the FlexVolume driver support [#4043](https://github.com/rook/rook/issues/4043)
-* Remove support for Nautilus, focusing on support for Octopus and Pacific [#7908](https://github.com/rook/rook/issues/7908)
+* Add support for Ceph Umbrella v21
+* CSI Driver
+  * Added cgroup v2 QoS support for RBD volumes [#17887](https://github.com/rook/rook/pull/17887)
+  * Integrate Ceph-CSI [v3.18](https://github.com/ceph/ceph-csi/milestones)
+* Object store
+  * Option to update RGW capabilities for an account [#17940](https://github.com/rook/rook/pull/17940)
+* OSDs
+  * Replace a single OSD when a metadataDevice is configured with multiple OSDs [#13240](https://github.com/rook/rook/issues/13240)
+  * Support creation of Ceph OSDs with Ceph seastore when available in raw mode [#16678](https://github.com/rook/rook/issues/16678)
+* Disable msgr1 protocol by default [#17081](https://github.com/rook/rook/issues/17081)
+* NMVe-oF: Declare GA [#18053](https://github.com/rook/rook/issues/18053)
+* Configure a TLS certificate for the Ceph dashboard [#17984](https://github.com/rook/rook/issues/17984)
 
-## Themes
+## Kubectl Plugin
 
-The general areas for improvements include the following, though may not be committed to a release.
-
-* Add alpha support for COSI (Container object storage interface) with K8s 1.22 [#7843](https://github.com/rook/rook/issues/7843)
-* iSCSI gateway deployment [#4334](https://github.com/rook/rook/issues/4334)
-* Enable the admission controller by default [#6242](https://github.com/rook/rook/issues/6242)
-* Dashboard-driven configuration after minimal CR install
-* Simplify metadata backup and disaster recovery
-* CSI Driver improvements tracked in the [CSI repo](https://github.com/ceph/ceph-csi)
-  * Support for Windows nodes
+Features are planned for the [Kubectl Plugin](https://github.com/rook/kubectl-rook-ceph), though without a committed timeline.
+* Collect details to help troubleshoot the csi driver [#69](https://github.com/rook/kubectl-rook-ceph/issues/69)

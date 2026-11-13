@@ -21,15 +21,17 @@ import (
 	"fmt"
 
 	"github.com/pkg/errors"
-	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
-	"github.com/rook/rook/pkg/operator/ceph/config"
+	cephconfig "github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util/log"
 	apps "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 )
 
 const (
@@ -37,19 +39,23 @@ const (
 	// MDS cache memory limit should be set to 50-60% of RAM reserved for the MDS container
 	// MDS uses approximately 125% of the value of mds_cache_memory_limit in RAM.
 	// Eventually we will tune this automatically: http://tracker.ceph.com/issues/36663
-	mdsCacheMemoryLimitFactor    = 0.5
-	mdsCacheMemoryResourceFactor = 0.8
+	mdsCacheMemoryLimitFactor   = 0.5
+	mdsCacheMemoryRequestFactor = 0.8
 )
 
-func (c *Cluster) makeDeployment(mdsConfig *mdsConfig, namespace string) (*apps.Deployment, error) {
-
-	mdsContainer := c.makeMdsDaemonContainer(mdsConfig)
-	mdsContainer = config.ConfigureLivenessProbe(cephv1.KeyMds, mdsContainer, c.clusterSpec.HealthCheck)
+func (c *Cluster) makeDeployment(mdsConfig *mdsConfig, fsNamespacedname types.NamespacedName) (*apps.Deployment, error) {
+	mdsContainer := c.makeMdsDaemonContainer(mdsConfig, fsNamespacedname.Name)
+	// MDS has no startup probe of its own, so one requested in the CR runs the liveness check.
+	if p := c.fs.Spec.MetadataServer.StartupProbe; p != nil && p.Probe != nil {
+		mdsContainer.StartupProbe = mdsContainer.LivenessProbe.DeepCopy()
+	}
+	mdsContainer = cephconfig.ConfigureStartupProbe(mdsContainer, c.fs.Spec.MetadataServer.StartupProbe)
+	mdsContainer = cephconfig.ConfigureLivenessProbe(mdsContainer, c.fs.Spec.MetadataServer.LivenessProbe)
 
 	podSpec := v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      mdsConfig.ResourceName,
-			Namespace: namespace,
+			Namespace: fsNamespacedname.Namespace,
 			Labels:    c.podLabels(mdsConfig, true),
 		},
 		Spec: v1.PodSpec{
@@ -59,10 +65,12 @@ func (c *Cluster) makeDeployment(mdsConfig *mdsConfig, namespace string) (*apps.
 			Containers: []v1.Container{
 				mdsContainer,
 			},
-			RestartPolicy:     v1.RestartPolicyAlways,
-			Volumes:           controller.DaemonVolumes(mdsConfig.DataPathMap, mdsConfig.ResourceName),
-			HostNetwork:       c.clusterSpec.Network.IsHost(),
-			PriorityClassName: c.fs.Spec.MetadataServer.PriorityClassName,
+			RestartPolicy:      v1.RestartPolicyAlways,
+			Volumes:            controller.DaemonVolumes(mdsConfig.DataPathMap, mdsConfig.ResourceName, c.clusterSpec.DataDirHostPath),
+			HostNetwork:        c.clusterSpec.Network.IsHost(),
+			PriorityClassName:  c.fs.Spec.MetadataServer.PriorityClassName,
+			SecurityContext:    &v1.PodSecurityContext{},
+			ServiceAccountName: k8sutil.DefaultServiceAccount,
 		},
 	}
 
@@ -73,7 +81,7 @@ func (c *Cluster) makeDeployment(mdsConfig *mdsConfig, namespace string) (*apps.
 	if c.clusterSpec.LogCollector.Enabled {
 		shareProcessNamespace := true
 		podSpec.Spec.ShareProcessNamespace = &shareProcessNamespace
-		podSpec.Spec.Containers = append(podSpec.Spec.Containers, *controller.LogCollectorContainer(fmt.Sprintf("ceph-mds.%s", mdsConfig.DaemonID), c.clusterInfo.Namespace, *c.clusterSpec))
+		podSpec.Spec.Containers = append(podSpec.Spec.Containers, *controller.LogCollectorContainer(fmt.Sprintf("ceph-mds.%s", mdsConfig.DaemonID), c.clusterInfo.Namespace, *c.clusterSpec, nil))
 	}
 
 	c.fs.Spec.MetadataServer.Annotations.ApplyToObjectMeta(&podSpec.ObjectMeta)
@@ -91,8 +99,9 @@ func (c *Cluster) makeDeployment(mdsConfig *mdsConfig, namespace string) (*apps.
 			Selector: &metav1.LabelSelector{
 				MatchLabels: c.podLabels(mdsConfig, false),
 			},
-			Template: podSpec,
-			Replicas: &replicas,
+			RevisionHistoryLimit: controller.RevisionHistoryLimit(),
+			Template:             podSpec,
+			Replicas:             &replicas,
 			Strategy: apps.DeploymentStrategy{
 				Type: apps.RecreateDeploymentStrategyType,
 			},
@@ -102,7 +111,7 @@ func (c *Cluster) makeDeployment(mdsConfig *mdsConfig, namespace string) (*apps.
 	if c.clusterSpec.Network.IsHost() {
 		d.Spec.Template.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	} else if c.clusterSpec.Network.IsMultus() {
-		if err := k8sutil.ApplyMultus(c.clusterSpec.Network, &podSpec.ObjectMeta); err != nil {
+		if err := k8sutil.ApplyMultus(c.clusterInfo.Namespace, &c.clusterSpec.Network, &podSpec.ObjectMeta); err != nil {
 			return nil, err
 		}
 	}
@@ -119,22 +128,26 @@ func (c *Cluster) makeChownInitContainer(mdsConfig *mdsConfig) v1.Container {
 	return controller.ChownCephDataDirsInitContainer(
 		*mdsConfig.DataPathMap,
 		c.clusterSpec.CephVersion.Image,
-		controller.DaemonVolumeMounts(mdsConfig.DataPathMap, mdsConfig.ResourceName),
+		controller.GetContainerImagePullPolicy(c.clusterSpec.CephVersion.ImagePullPolicy),
+		controller.DaemonVolumeMounts(mdsConfig.DataPathMap, mdsConfig.ResourceName, c.clusterSpec.DataDirHostPath),
 		c.fs.Spec.MetadataServer.Resources,
-		controller.PodSecurityContext(),
+		controller.RootContainerSecurityContext(),
+		"",
 	)
 }
 
-func (c *Cluster) makeMdsDaemonContainer(mdsConfig *mdsConfig) v1.Container {
+func (c *Cluster) makeMdsDaemonContainer(mdsConfig *mdsConfig, fsName string) v1.Container {
 	args := append(
 		controller.DaemonFlags(c.clusterInfo, c.clusterSpec, mdsConfig.DaemonID),
 		"--foreground",
 	)
 
-	if !c.clusterSpec.Network.IsHost() {
+	if !c.clusterSpec.Network.IsHost() && !c.clusterSpec.Network.IsMultus() {
 		args = append(args,
-			config.NewFlag("public-addr", controller.ContainerEnvVarReference(podIPEnvVar)))
+			cephconfig.NewFlag("public-addr", controller.ContainerEnvVarReference(podIPEnvVar)))
 	}
+
+	args = append(args, controller.Msgr1BindingFlags(c.clusterInfo, c.clusterSpec)...)
 
 	container := v1.Container{
 		Name: "mds",
@@ -143,36 +156,37 @@ func (c *Cluster) makeMdsDaemonContainer(mdsConfig *mdsConfig) v1.Container {
 		},
 		Args:            args,
 		Image:           c.clusterSpec.CephVersion.Image,
-		VolumeMounts:    controller.DaemonVolumeMounts(mdsConfig.DataPathMap, mdsConfig.ResourceName),
-		Env:             append(controller.DaemonEnvVars(c.clusterSpec.CephVersion.Image), k8sutil.PodIPEnvVar(podIPEnvVar)),
+		ImagePullPolicy: controller.GetContainerImagePullPolicy(c.clusterSpec.CephVersion.ImagePullPolicy),
+		VolumeMounts:    controller.DaemonVolumeMounts(mdsConfig.DataPathMap, mdsConfig.ResourceName, c.clusterSpec.DataDirHostPath),
+		Env:             append(controller.DaemonEnvVars(c.clusterSpec), k8sutil.PodIPEnvVar(podIPEnvVar)),
 		Resources:       c.fs.Spec.MetadataServer.Resources,
-		SecurityContext: controller.PodSecurityContext(),
-		LivenessProbe:   controller.GenerateLivenessProbeExecDaemon(config.MdsType, mdsConfig.DaemonID),
-		WorkingDir:      config.VarLogCephDir,
+		SecurityContext: controller.DefaultContainerSecurityContext(),
+		// StartupProbe time for MDS is covered by liveness probe
+		LivenessProbe: generateMDSLivenessProbeExecDaemon(mdsConfig.DaemonID, fsName, keyring.VolumeMount().KeyringFilePath()),
+		WorkingDir:    cephconfig.VarLogCephDir,
 	}
 
 	return container
 }
 
 func (c *Cluster) podLabels(mdsConfig *mdsConfig, includeNewLabels bool) map[string]string {
-	labels := controller.CephDaemonAppLabels(AppName, c.fs.Namespace, "mds", mdsConfig.DaemonID, includeNewLabels)
+	labels := controller.CephDaemonAppLabels(AppName, c.fs.Namespace, cephconfig.MdsType, mdsConfig.DaemonID, c.fs.Name, "cephfilesystems.ceph.rook.io", includeNewLabels)
 	labels["rook_file_system"] = c.fs.Name
 	return labels
 }
 
-func getMdsDeployments(context *clusterd.Context, namespace, fsName string) (*apps.DeploymentList, error) {
+func getMdsDeployments(ctx context.Context, context *clusterd.Context, namespace, fsName string) (*apps.DeploymentList, error) {
 	fsLabelSelector := fmt.Sprintf("rook_file_system=%s", fsName)
-	deps, err := k8sutil.GetDeployments(context.Clientset, namespace, fsLabelSelector)
+	deps, err := k8sutil.GetDeployments(ctx, context.Clientset, namespace, fsLabelSelector)
 	if err != nil {
 		return nil, errors.Wrapf(err, "could not get deployments for filesystem %s (matching label selector %q)", fsName, fsLabelSelector)
 	}
 	return deps, nil
 }
 
-func deleteMdsDeployment(clusterdContext *clusterd.Context, namespace string, deployment *apps.Deployment) error {
-	ctx := context.TODO()
+func deleteMdsDeployment(ctx context.Context, clusterdContext *clusterd.Context, namespace string, deployment *apps.Deployment) error {
 	// Delete the mds deployment
-	logger.Infof("deleting mds deployment %s", deployment.Name)
+	log.NamedInfo(controller.NsName(namespace, deployment.Name), logger, "deleting mds deployment")
 	var gracePeriod int64
 	propagation := metav1.DeletePropagationForeground
 	options := &metav1.DeleteOptions{GracePeriodSeconds: &gracePeriod, PropagationPolicy: &propagation}
@@ -182,10 +196,9 @@ func deleteMdsDeployment(clusterdContext *clusterd.Context, namespace string, de
 	return nil
 }
 
-func scaleMdsDeployment(clusterdContext *clusterd.Context, namespace string, deployment *apps.Deployment, replicas int32) error {
-	ctx := context.TODO()
+func scaleMdsDeployment(ctx context.Context, clusterdContext *clusterd.Context, namespace string, deployment *apps.Deployment, replicas int32) error {
 	// scale mds deployment
-	logger.Infof("scaling mds deployment %q to %d replicas", deployment.Name, replicas)
+	log.NamedInfo(controller.NsName(namespace, deployment.Name), logger, "scaling mds deployment to %d replicas", replicas)
 	d, err := clusterdContext.Clientset.AppsV1().Deployments(namespace).Get(ctx, deployment.GetName(), metav1.GetOptions{})
 	if err != nil {
 		if replicas != 0 && kerrors.IsNotFound(err) {

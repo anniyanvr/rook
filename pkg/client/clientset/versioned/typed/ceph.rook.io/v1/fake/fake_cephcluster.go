@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,112 +19,30 @@ limitations under the License.
 package fake
 
 import (
-	"context"
-
-	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	labels "k8s.io/apimachinery/pkg/labels"
-	schema "k8s.io/apimachinery/pkg/runtime/schema"
-	types "k8s.io/apimachinery/pkg/types"
-	watch "k8s.io/apimachinery/pkg/watch"
-	testing "k8s.io/client-go/testing"
+	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	cephrookiov1 "github.com/rook/rook/pkg/client/clientset/versioned/typed/ceph.rook.io/v1"
+	gentype "k8s.io/client-go/gentype"
 )
 
-// FakeCephClusters implements CephClusterInterface
-type FakeCephClusters struct {
+// fakeCephClusters implements CephClusterInterface
+type fakeCephClusters struct {
+	*gentype.FakeClientWithList[*v1.CephCluster, *v1.CephClusterList]
 	Fake *FakeCephV1
-	ns   string
 }
 
-var cephclustersResource = schema.GroupVersionResource{Group: "ceph.rook.io", Version: "v1", Resource: "cephclusters"}
-
-var cephclustersKind = schema.GroupVersionKind{Group: "ceph.rook.io", Version: "v1", Kind: "CephCluster"}
-
-// Get takes name of the cephCluster, and returns the corresponding cephCluster object, and an error if there is any.
-func (c *FakeCephClusters) Get(ctx context.Context, name string, options v1.GetOptions) (result *cephrookiov1.CephCluster, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewGetAction(cephclustersResource, c.ns, name), &cephrookiov1.CephCluster{})
-
-	if obj == nil {
-		return nil, err
+func newFakeCephClusters(fake *FakeCephV1, namespace string) cephrookiov1.CephClusterInterface {
+	return &fakeCephClusters{
+		gentype.NewFakeClientWithList[*v1.CephCluster, *v1.CephClusterList](
+			fake.Fake,
+			namespace,
+			v1.SchemeGroupVersion.WithResource("cephclusters"),
+			v1.SchemeGroupVersion.WithKind("CephCluster"),
+			func() *v1.CephCluster { return &v1.CephCluster{} },
+			func() *v1.CephClusterList { return &v1.CephClusterList{} },
+			func(dst, src *v1.CephClusterList) { dst.ListMeta = src.ListMeta },
+			func(list *v1.CephClusterList) []*v1.CephCluster { return gentype.ToPointerSlice(list.Items) },
+			func(list *v1.CephClusterList, items []*v1.CephCluster) { list.Items = gentype.FromPointerSlice(items) },
+		),
+		fake,
 	}
-	return obj.(*cephrookiov1.CephCluster), err
-}
-
-// List takes label and field selectors, and returns the list of CephClusters that match those selectors.
-func (c *FakeCephClusters) List(ctx context.Context, opts v1.ListOptions) (result *cephrookiov1.CephClusterList, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewListAction(cephclustersResource, cephclustersKind, c.ns, opts), &cephrookiov1.CephClusterList{})
-
-	if obj == nil {
-		return nil, err
-	}
-
-	label, _, _ := testing.ExtractFromListOptions(opts)
-	if label == nil {
-		label = labels.Everything()
-	}
-	list := &cephrookiov1.CephClusterList{ListMeta: obj.(*cephrookiov1.CephClusterList).ListMeta}
-	for _, item := range obj.(*cephrookiov1.CephClusterList).Items {
-		if label.Matches(labels.Set(item.Labels)) {
-			list.Items = append(list.Items, item)
-		}
-	}
-	return list, err
-}
-
-// Watch returns a watch.Interface that watches the requested cephClusters.
-func (c *FakeCephClusters) Watch(ctx context.Context, opts v1.ListOptions) (watch.Interface, error) {
-	return c.Fake.
-		InvokesWatch(testing.NewWatchAction(cephclustersResource, c.ns, opts))
-
-}
-
-// Create takes the representation of a cephCluster and creates it.  Returns the server's representation of the cephCluster, and an error, if there is any.
-func (c *FakeCephClusters) Create(ctx context.Context, cephCluster *cephrookiov1.CephCluster, opts v1.CreateOptions) (result *cephrookiov1.CephCluster, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewCreateAction(cephclustersResource, c.ns, cephCluster), &cephrookiov1.CephCluster{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*cephrookiov1.CephCluster), err
-}
-
-// Update takes the representation of a cephCluster and updates it. Returns the server's representation of the cephCluster, and an error, if there is any.
-func (c *FakeCephClusters) Update(ctx context.Context, cephCluster *cephrookiov1.CephCluster, opts v1.UpdateOptions) (result *cephrookiov1.CephCluster, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewUpdateAction(cephclustersResource, c.ns, cephCluster), &cephrookiov1.CephCluster{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*cephrookiov1.CephCluster), err
-}
-
-// Delete takes name of the cephCluster and deletes it. Returns an error if one occurs.
-func (c *FakeCephClusters) Delete(ctx context.Context, name string, opts v1.DeleteOptions) error {
-	_, err := c.Fake.
-		Invokes(testing.NewDeleteAction(cephclustersResource, c.ns, name), &cephrookiov1.CephCluster{})
-
-	return err
-}
-
-// DeleteCollection deletes a collection of objects.
-func (c *FakeCephClusters) DeleteCollection(ctx context.Context, opts v1.DeleteOptions, listOpts v1.ListOptions) error {
-	action := testing.NewDeleteCollectionAction(cephclustersResource, c.ns, listOpts)
-
-	_, err := c.Fake.Invokes(action, &cephrookiov1.CephClusterList{})
-	return err
-}
-
-// Patch applies the patch and returns the patched cephCluster.
-func (c *FakeCephClusters) Patch(ctx context.Context, name string, pt types.PatchType, data []byte, opts v1.PatchOptions, subresources ...string) (result *cephrookiov1.CephCluster, err error) {
-	obj, err := c.Fake.
-		Invokes(testing.NewPatchSubresourceAction(cephclustersResource, c.ns, name, pt, data, subresources...), &cephrookiov1.CephCluster{})
-
-	if obj == nil {
-		return nil, err
-	}
-	return obj.(*cephrookiov1.CephCluster), err
 }

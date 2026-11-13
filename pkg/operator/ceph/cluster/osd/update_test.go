@@ -28,16 +28,19 @@ import (
 	"github.com/rook/rook/pkg/clusterd"
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	cephclientfake "github.com/rook/rook/pkg/daemon/ceph/client/fake"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/fake"
 )
@@ -72,8 +75,10 @@ func Test_updateExistingOSDs(t *testing.T) {
 	// behavior control
 	var (
 		updateInjectFailures    k8sutil.Failures // return failures from mocked updateDeploymentAndWaitFunc
-		returnOkToStopIDs       []int            // return these IDs are ok-to-stop (or not ok to stop if empty)
+		returnOkToStopIDs       []int            // return these IDs as ok-to-stop (or not ok to stop if empty)
 		forceUpgradeIfUnhealthy bool
+		requiresHealthyPGs      bool
+		cephStatus              string
 	)
 
 	// intermediates (created from inputs)
@@ -100,17 +105,18 @@ func Test_updateExistingOSDs(t *testing.T) {
 		}
 		clusterInfo := &cephclient.ClusterInfo{
 			Namespace:   namespace,
-			CephVersion: cephver.Pacific,
-			Context:     context.TODO(),
+			CephVersion: cephver.Squid,
+			Context:     t.Context(),
 		}
 		clusterInfo.SetName("mycluster")
 		clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
 		spec := cephv1.ClusterSpec{
 			ContinueUpgradeAfterChecksEvenIfNotHealthy: forceUpgradeIfUnhealthy,
+			UpgradeOSDRequiresHealthyPGs:               requiresHealthyPGs,
 		}
 		c = New(ctx, clusterInfo, spec, "rook/rook:master")
 		config := c.newProvisionConfig()
-		updateConfig = c.newUpdateConfig(config, updateQueue, existingDeployments)
+		updateConfig = c.newUpdateConfig(config, updateQueue, existingDeployments, sets.New[string]())
 
 		// prepare outputs
 		deploymentsUpdated = []string{}
@@ -121,7 +127,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 
 	// stub out the conditionExportFunc to do nothing. we do not have a fake Rook interface that
 	// allows us to interact with a CephCluster resource like the fake K8s clientset.
-	updateConditionFunc = func(ctx context.Context, c *clusterd.Context, namespaceName types.NamespacedName, conditionType cephv1.ConditionType, status corev1.ConditionStatus, reason cephv1.ConditionReason, message string) {
+	updateConditionFunc = func(ctx context.Context, c *clusterd.Context, namespaceName types.NamespacedName, observedGeneration int64, conditionType cephv1.ConditionType, status corev1.ConditionStatus, reason cephv1.ConditionReason, message string) {
 		// do nothing
 	}
 	shouldCheckOkToStopFunc = func(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo) bool {
@@ -130,17 +136,19 @@ func Test_updateExistingOSDs(t *testing.T) {
 		return true
 	}
 
-	updateMultipleDeploymentsAndWaitFunc =
-		func(
-			clientset kubernetes.Interface,
-			deployments []*appsv1.Deployment,
-			listFunc func() (*appsv1.DeploymentList, error),
-		) k8sutil.Failures {
-			for _, d := range deployments {
-				deploymentsUpdated = append(deploymentsUpdated, d.Name)
-			}
-			return updateInjectFailures
+	updateMultipleDeploymentsAndWaitFunc = func(
+		ctx context.Context,
+		clientset kubernetes.Interface,
+		deployments []*appsv1.Deployment,
+		listFunc func() (*appsv1.DeploymentList, error),
+	) k8sutil.Failures {
+		_, err := listFunc()
+		assert.NoError(t, err)
+		for _, d := range deployments {
+			deploymentsUpdated = append(deploymentsUpdated, d.Name)
 		}
+		return updateInjectFailures
+	}
 
 	executor = &exectest.MockExecutor{
 		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
@@ -154,31 +162,34 @@ func Test_updateExistingOSDs(t *testing.T) {
 						return "", err
 					}
 					if len(returnOkToStopIDs) > 0 {
-						return cephclientfake.OsdOkToStopOutput(osdToBeQueried, returnOkToStopIDs, true), nil
+						return cephclientfake.OsdOkToStopOutput(osdToBeQueried, returnOkToStopIDs), nil
 					}
-					return cephclientfake.OsdOkToStopOutput(osdToBeQueried, []int{}, true), errors.Errorf("induced error")
+					return cephclientfake.OsdOkToStopOutput(osdToBeQueried, []int{}), errors.Errorf("induced error")
 				}
 				if args[1] == "crush" && args[2] == "get-device-class" {
 					return cephclientfake.OSDDeviceClassOutput(args[3]), nil
 				}
+			}
+			if args[0] == "status" {
+				return cephStatus, nil
 			}
 			panic(fmt.Sprintf("unexpected command %q with args %v", command, args))
 		},
 	}
 
 	// simple wrappers to allow us to count how many OSDs on nodes/PVCs are identified
-	deploymentOnNodeFunc = func(c *Cluster, osd OSDInfo, nodeName string, config *provisionConfig) (*appsv1.Deployment, error) {
+	deploymentOnNodeFunc = func(c *Cluster, osd *OSDInfo, nodeName string, config *provisionConfig) (*appsv1.Deployment, error) {
 		osdsOnNodes = append(osdsOnNodes, osd.ID)
 		return deploymentOnNode(c, osd, nodeName, config)
 	}
-	deploymentOnPVCFunc = func(c *Cluster, osd OSDInfo, pvcName string, config *provisionConfig) (*appsv1.Deployment, error) {
+	deploymentOnPVCFunc = func(c *Cluster, osd *OSDInfo, pvcName string, config *provisionConfig) (*appsv1.Deployment, error) {
 		osdsOnPVCs = append(osdsOnPVCs, osd.ID)
 		return deploymentOnPVC(c, osd, pvcName, config)
 	}
 
 	addDeploymentOnNode := func(nodeName string, osdID int) {
 		d := getDummyDeploymentOnNode(clientset, c, nodeName, osdID)
-		_, err := clientset.AppsV1().Deployments(namespace).Create(context.TODO(), d, metav1.CreateOptions{})
+		_, err := clientset.AppsV1().Deployments(namespace).Create(t.Context(), d, metav1.CreateOptions{})
 		if err != nil {
 			panic(err)
 		}
@@ -186,14 +197,14 @@ func Test_updateExistingOSDs(t *testing.T) {
 
 	addDeploymentOnPVC := func(pvcName string, osdID int) {
 		d := getDummyDeploymentOnPVC(clientset, c, pvcName, osdID)
-		_, err := clientset.AppsV1().Deployments(namespace).Create(context.TODO(), d, metav1.CreateOptions{})
+		_, err := clientset.AppsV1().Deployments(namespace).Create(t.Context(), d, metav1.CreateOptions{})
 		if err != nil {
 			panic(err)
 		}
 	}
 
 	t.Run("no items in the update queue should be a noop", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		updateQueue = newUpdateQueueWithIDs()
 		existingDeployments = newExistenceListWithIDs(0, 2, 4, 6)
 		forceUpgradeIfUnhealthy = false
@@ -211,7 +222,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 	})
 
 	t.Run("ok to stop one OSD at a time", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		// reminder that updateQueue pops things off the queue from the front, so the leftmost item
 		// will be the one queried
 		updateQueue = newUpdateQueueWithIDs(0, 2, 4, 6)
@@ -239,7 +250,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 	})
 
 	t.Run("ok to stop 3 OSDs at a time", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		updateQueue = newUpdateQueueWithIDs(0, 2, 4, 6)
 		existingDeployments = newExistenceListWithIDs(0, 2, 4, 6)
 		forceUpgradeIfUnhealthy = false
@@ -277,7 +288,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 	})
 
 	t.Run("ok to stop more OSDs than are in the update queue", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		updateQueue = newUpdateQueueWithIDs(2, 0)
 		existingDeployments = newExistenceListWithIDs(6, 4, 2, 0)
 		forceUpgradeIfUnhealthy = false
@@ -305,7 +316,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 	})
 
 	t.Run("ok to stop OSDS not in existence list (newly-created OSDs)", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		updateQueue = newUpdateQueueWithIDs(2, 0)
 		existingDeployments = newExistenceListWithIDs(2, 0)
 		forceUpgradeIfUnhealthy = false
@@ -333,7 +344,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 	})
 
 	t.Run("not ok to stop OSD", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		updateQueue = newUpdateQueueWithIDs(2)
 		existingDeployments = newExistenceListWithIDs(0, 2, 4, 6)
 		forceUpgradeIfUnhealthy = false
@@ -359,8 +370,43 @@ func Test_updateExistingOSDs(t *testing.T) {
 		assert.Equal(t, 0, updateQueue.Len()) // the OSD should now have been removed from the queue
 	})
 
+	t.Run("PGs not clean to upgrade OSD", func(t *testing.T) {
+		clientset = fake.NewClientset()
+		updateQueue = newUpdateQueueWithIDs(2)
+		existingDeployments = newExistenceListWithIDs(2)
+		requiresHealthyPGs = true
+		cephStatus = unHealthyCephStatus
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+
+		osdToBeQueried = 2
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.ElementsMatch(t, deploymentsUpdated, []string{})
+		assert.Equal(t, 1, updateQueue.Len()) // the OSD should remain
+	})
+
+	t.Run("PGs clean to upgrade OSD", func(t *testing.T) {
+		clientset = fake.NewClientset()
+		updateQueue = newUpdateQueueWithIDs(0)
+		existingDeployments = newExistenceListWithIDs(0)
+		requiresHealthyPGs = true
+		cephStatus = healthyCephStatus
+		forceUpgradeIfUnhealthy = true // FORCE UPDATES
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+		addDeploymentOnNode("node0", 0)
+
+		osdToBeQueried = 0
+		returnOkToStopIDs = []int{0}
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.ElementsMatch(t, deploymentsUpdated, []string{deploymentName(0)})
+		assert.Equal(t, 0, updateQueue.Len()) // should be done with updates
+	})
+
 	t.Run("continueUpgradesAfterChecksEvenIfUnhealthy = true", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		updateQueue = newUpdateQueueWithIDs(2)
 		existingDeployments = newExistenceListWithIDs(0, 2, 4, 6)
 		forceUpgradeIfUnhealthy = true // FORCE UPDATES
@@ -381,7 +427,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 	})
 
 	t.Run("failures updating deployments", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		updateQueue = newUpdateQueueWithIDs(0, 2, 4, 6)
 		existingDeployments = newExistenceListWithIDs(0, 2, 4, 6)
 		forceUpgradeIfUnhealthy = false
@@ -418,7 +464,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 	})
 
 	t.Run("failure due to OSD deployment with bad info", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		updateQueue = newUpdateQueueWithIDs(0, 6)
 		existingDeployments = newExistenceListWithIDs(0, 2, 4, 6)
 		forceUpgradeIfUnhealthy = false
@@ -430,12 +476,16 @@ func Test_updateExistingOSDs(t *testing.T) {
 		addDeploymentOnPVC("pvc6", 6)
 		// give OSD 6 bad info by removing env vars from primary container
 		deploymentClient := clientset.AppsV1().Deployments(namespace)
-		d, err := deploymentClient.Get(context.TODO(), deploymentName(6), metav1.GetOptions{})
+		d, err := deploymentClient.Get(t.Context(), deploymentName(6), metav1.GetOptions{})
 		if err != nil {
 			panic(err)
 		}
-		d.Spec.Template.Spec.Containers[0].Env = []corev1.EnvVar{}
-		_, err = deploymentClient.Update(context.TODO(), d, metav1.UpdateOptions{})
+		container, err := findOSDContainer(d.Spec.Template.Spec.Containers)
+		if err != nil {
+			panic(err)
+		}
+		container.Env = []corev1.EnvVar{}
+		_, err = deploymentClient.Update(t.Context(), d, metav1.UpdateOptions{})
 		if err != nil {
 			panic(err)
 		}
@@ -452,7 +502,7 @@ func Test_updateExistingOSDs(t *testing.T) {
 	})
 
 	t.Run("do not update OSDs on nodes removed from the storage spec", func(t *testing.T) {
-		clientset = fake.NewSimpleClientset()
+		clientset = fake.NewClientset()
 		// reminder that updateQueue pops things off the queue from the front, so the leftmost item
 		// will be the one queried
 		updateQueue = newUpdateQueueWithIDs(0, 4)
@@ -479,6 +529,144 @@ func Test_updateExistingOSDs(t *testing.T) {
 
 		assert.Equal(t, 0, updateQueue.Len()) // should be done with updates
 	})
+
+	t.Run("skip osd reconcile", func(t *testing.T) {
+		clientset = fake.NewClientset()
+		updateQueue = newUpdateQueueWithIDs(0, 1)
+		existingDeployments = newExistenceListWithIDs(0)
+		forceUpgradeIfUnhealthy = true
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+		addDeploymentOnNode("node0", 0)
+
+		osdToBeQueried = 0
+		updateConfig.osdsToSkipReconcile.Insert("0")
+		updateConfig.updateExistingOSDs(errs)
+		assert.Zero(t, errs.len())
+		assert.Equal(t, 1, updateQueue.Len())
+		osdIDUpdated, ok := updateQueue.Pop()
+		assert.True(t, ok)
+		assert.Equal(t, 1, osdIDUpdated)
+		updateConfig.osdsToSkipReconcile.Delete("0")
+	})
+
+	t.Run("conflict between CR and node label skips conflicting OSD but updates others", func(t *testing.T) {
+		clientset = fake.NewClientset()
+
+		// node0 has no label (no conflict)
+		node0 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "node0",
+				Labels: map[string]string{corev1.LabelHostname: "node0"},
+			},
+		}
+		_, err := clientset.CoreV1().Nodes().Create(t.Context(), node0, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		// node1 has BOTH label and CR config (conflict)
+		node1 := &corev1.Node{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:   "node1",
+				Labels: map[string]string{corev1.LabelHostname: "node1", NodeDeviceClassLabelKey: "ssd"},
+			},
+		}
+		_, err = clientset.CoreV1().Nodes().Create(t.Context(), node1, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		updateQueue = newUpdateQueueWithIDs(0, 1)
+		existingDeployments = newExistenceListWithIDs(0, 1)
+
+		ctx = &clusterd.Context{
+			Clientset: clientset,
+			Executor:  executor,
+		}
+		clusterInfo := &cephclient.ClusterInfo{
+			Namespace:   namespace,
+			CephVersion: cephver.Squid,
+			Context:     t.Context(),
+		}
+		clusterInfo.SetName("mycluster")
+		clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
+		spec := cephv1.ClusterSpec{
+			ContinueUpgradeAfterChecksEvenIfNotHealthy: forceUpgradeIfUnhealthy,
+			UpgradeOSDRequiresHealthyPGs:               requiresHealthyPGs,
+			Storage: cephv1.StorageScopeSpec{
+				Nodes: []cephv1.Node{
+					{Name: "node0"},
+					{Name: "node1", Config: map[string]string{"deviceClass": "hdd"}},
+				},
+			},
+		}
+		c = New(ctx, clusterInfo, spec, "rook/rook:master")
+		c.ValidStorage.Nodes = spec.Storage.Nodes
+		config := c.newProvisionConfig()
+		updateConfig = c.newUpdateConfig(config, updateQueue, existingDeployments, sets.New[string]())
+
+		addDeploymentOnNode("node0", 0)
+		// Create node1's deployment manually since getDummyDeploymentOnNode would panic on conflict.
+		// In production, this deployment would have been created before the label was added.
+		d1 := getDummyDeploymentOnNode(clientset, c, "node0", 1) // use node0 to avoid panic
+		d1.Name = "rook-ceph-osd-1"
+		d1.Spec.Template.Spec.NodeSelector = map[string]string{corev1.LabelHostname: "node1"}
+		_, err = clientset.AppsV1().Deployments(namespace).Create(t.Context(), d1, metav1.CreateOptions{})
+		assert.NoError(t, err)
+
+		osdToBeQueried = 0
+		returnOkToStopIDs = []int{0, 1}
+		deploymentsUpdated = []string{}
+		errs = newProvisionErrors()
+
+		updateConfig.updateExistingOSDs(errs)
+		// OSD 1 on node1 should fail due to conflict
+		assert.Equal(t, 1, errs.len())
+		// OSD 0 on node0 should have been updated successfully
+		assert.Contains(t, deploymentsUpdated, "rook-ceph-osd-0")
+	})
+
+	t.Run("OSDs whose uuid or ceph-volume mode is invalid are skipped and others are updated", func(t *testing.T) {
+		clientset = fake.NewClientset()
+		updateQueue = newUpdateQueueWithIDs(0, 2, 4, 6)
+		existingDeployments = newExistenceListWithIDs(0, 2, 4, 6)
+		forceUpgradeIfUnhealthy = false
+		requiresHealthyPGs = false
+		updateInjectFailures = k8sutil.Failures{}
+		doSetup()
+		addDeploymentOnNode("node0", 0)
+		addDeploymentOnPVC("pvc2", 2)
+		addDeploymentOnNode("node1", 4)
+		addDeploymentOnPVC("pvc6", 6)
+
+		setOSDEnv := func(osdID int, name, value string) {
+			d, err := clientset.AppsV1().Deployments(namespace).Get(t.Context(), deploymentName(osdID), metav1.GetOptions{})
+			require.NoError(t, err)
+			osdContainer, err := findOSDContainer(d.Spec.Template.Spec.Containers)
+			require.NoError(t, err)
+			found := false
+			for i := range osdContainer.Env {
+				if osdContainer.Env[i].Name == name {
+					osdContainer.Env[i].Value = value
+					found = true
+				}
+			}
+			require.True(t, found, "env var %s not found on OSD %d", name, osdID)
+			_, err = clientset.AppsV1().Deployments(namespace).Update(t.Context(), d, metav1.UpdateOptions{})
+			require.NoError(t, err)
+		}
+		setOSDEnv(0, "ROOK_OSD_UUID", "x/../../../../../etc")
+		setOSDEnv(2, "ROOK_OSD_UUID", "x/../../../../../etc")
+		setOSDEnv(6, "ROOK_CV_MODE", "raw; true")
+
+		osdToBeQueried = 0
+		returnOkToStopIDs = []int{0, 2, 4, 6}
+		updateConfig.updateExistingOSDs(errs)
+		assert.Equal(t, 3, errs.len())
+		assert.Contains(t, errs.asMessages(), "is not a UUID in canonical form")
+		assert.Contains(t, errs.asMessages(), `ceph-volume mode "raw; true" is not "lvm" or "raw"`)
+		assert.ElementsMatch(t, deploymentsUpdated, []string{deploymentName(4)})
+		assert.ElementsMatch(t, osdsOnNodes, []int{0, 4})
+		assert.ElementsMatch(t, osdsOnPVCs, []int{2, 6})
+		assert.Equal(t, 0, updateQueue.Len())
+	})
 }
 
 func Test_getOSDUpdateInfo(t *testing.T) {
@@ -486,13 +674,13 @@ func Test_getOSDUpdateInfo(t *testing.T) {
 	cephImage := "quay.io/ceph/ceph:v15"
 
 	// NOTE: all tests share the same clientset
-	clientset := fake.NewSimpleClientset()
+	clientset := fake.NewClientset()
 	ctx := &clusterd.Context{
 		Clientset: clientset,
 	}
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   namespace,
-		CephVersion: cephver.Octopus,
+		CephVersion: cephver.Squid,
 	}
 	clusterInfo.SetName("mycluster")
 	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
@@ -518,13 +706,13 @@ func Test_getOSDUpdateInfo(t *testing.T) {
 		addTestDeployment(clientset, "non-rook-deployment", namespace, map[string]string{})
 
 		// mon.a in this namespace
-		l := controller.CephDaemonAppLabels("rook-ceph-mon", namespace, "mon", "a", true)
+		l := controller.CephDaemonAppLabels("rook-ceph-mon", namespace, "mon", "a", "rook-ceph-operator", "cephclusters.ceph.rook.io", true)
 		addTestDeployment(clientset, "rook-ceph-mon-a", namespace, l)
 
 		// osd.1 and 3 in another namespace (another Rook cluster)
 		clusterInfo2 := &cephclient.ClusterInfo{
 			Namespace:   "other-namespace",
-			CephVersion: cephver.Octopus,
+			CephVersion: cephver.Squid,
 		}
 		clusterInfo2.SetName("other-cluster")
 		clusterInfo2.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
@@ -716,4 +904,192 @@ func Test_existenceList(t *testing.T) {
 	l.Add(1)
 	assert.True(t, l.Exists(1))
 	assert.Equal(t, 4, l.Len())
+}
+
+func TestCluster_rotateCephxKey(t *testing.T) {
+	// auth rotate returns an array instead of a single object
+	rotatedKeyJson := `[{"key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="}]`
+	rotateCalledForEntity := ""
+	sharedExecutor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			t.Logf("command: %s %v", command, args)
+			if command == "ceph" && args[0] == "auth" && args[1] == "rotate" {
+				rotateCalledForEntity = args[2]
+				return rotatedKeyJson, nil
+			}
+			panic(fmt.Sprintf("unexpected command %q %v", command, args))
+		},
+	}
+
+	newTest := func(daemonCephxConfig cephv1.CephxConfig) *Cluster {
+		rotateCalledForEntity = "" // reset to empty each test
+
+		clusterd := clusterd.Context{
+			Executor: sharedExecutor,
+		}
+		clusterInfo := cephclient.ClusterInfo{
+			Context:     t.Context(),
+			Namespace:   "ns",
+			CephVersion: cephver.CephVersion{Major: 20, Minor: 2},
+		}
+		return &Cluster{
+			context:     &clusterd,
+			clusterInfo: &clusterInfo,
+			spec: cephv1.ClusterSpec{
+				Security: cephv1.ClusterSecuritySpec{
+					CephX: cephv1.ClusterCephxConfig{
+						Daemon: daemonCephxConfig,
+					},
+				},
+			},
+		}
+	}
+
+	keyring.SetAllowCephxKeyRotationForCluster("ns", true)
+
+	t.Run("empty status and config", func(t *testing.T) {
+		c := newTest(cephv1.CephxConfig{})
+		osdInfo := OSDInfo{
+			ID:          1,
+			CephxStatus: cephv1.CephxStatus{},
+		}
+
+		cephxStatus, err := c.rotateCephxKey(osdInfo)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.CephxStatus{}, cephxStatus)
+		assert.Equal(t, rotateCalledForEntity, "")
+	})
+
+	t.Run("empty status, disabled config", func(t *testing.T) { // brownfield, no rotation
+		c := newTest(cephv1.CephxConfig{
+			KeyRotationPolicy: "Disabled",
+			KeyGeneration:     3,
+		})
+		osdInfo := OSDInfo{
+			ID:          1,
+			CephxStatus: cephv1.CephxStatus{},
+		}
+
+		cephxStatus, err := c.rotateCephxKey(osdInfo)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.CephxStatus{}, cephxStatus)
+		assert.Equal(t, rotateCalledForEntity, "")
+	})
+
+	t.Run("empty status, enabled config", func(t *testing.T) { // brownfield with rotation
+		c := newTest(cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     3,
+		})
+		osdInfo := OSDInfo{
+			ID:          1,
+			CephxStatus: cephv1.CephxStatus{},
+		}
+
+		cephxStatus, err := c.rotateCephxKey(osdInfo)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.CephxStatus{KeyCephVersion: "20.2.0-0", KeyGeneration: 3}, cephxStatus)
+		assert.Equal(t, rotateCalledForEntity, "osd.1")
+	})
+
+	t.Run("undefined status, empty config", func(t *testing.T) { // greenfield, no rotation
+		c := newTest(cephv1.CephxConfig{})
+		osdInfo := OSDInfo{
+			ID:          1,
+			CephxStatus: keyring.UninitializedCephxStatus(), // shouldn't happen in reality
+		}
+
+		cephxStatus, err := c.rotateCephxKey(osdInfo)
+		assert.NoError(t, err)
+		// results in unnecessary OSD restart, but ensures that future rotations aren't blocked
+		// in the unlikely event the uninitialized status is erroneously applied to osd deployment
+		assert.Equal(t, cephv1.CephxStatus{KeyCephVersion: "20.2.0-0", KeyGeneration: 1}, cephxStatus)
+		assert.Equal(t, rotateCalledForEntity, "")
+	})
+
+	t.Run("set status, empty config", func(t *testing.T) {
+		c := newTest(cephv1.CephxConfig{})
+		osdInfo := OSDInfo{
+			ID:          1,
+			CephxStatus: cephv1.CephxStatus{KeyGeneration: 1, KeyCephVersion: "19.2.6-0"},
+		}
+
+		cephxStatus, err := c.rotateCephxKey(osdInfo)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.CephxStatus{KeyCephVersion: "19.2.6-0", KeyGeneration: 1}, cephxStatus)
+		assert.Equal(t, rotateCalledForEntity, "")
+	})
+
+	t.Run("set status, enabled config", func(t *testing.T) {
+		c := newTest(cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     4,
+		})
+		osdInfo := OSDInfo{
+			ID:          2,
+			CephxStatus: cephv1.CephxStatus{KeyGeneration: 1, KeyCephVersion: "19.2.6-0"},
+		}
+
+		cephxStatus, err := c.rotateCephxKey(osdInfo)
+		assert.NoError(t, err)
+		assert.Equal(t, cephv1.CephxStatus{KeyCephVersion: "20.2.0-0", KeyGeneration: 4}, cephxStatus)
+		assert.Equal(t, rotateCalledForEntity, "osd.2")
+	})
+
+	t.Run("auth rotate failure", func(t *testing.T) {
+		// this case shouldn't happen in code, but it could repair a botched greenfield deploy
+		c := newTest(cephv1.CephxConfig{
+			KeyRotationPolicy: "KeyGeneration",
+			KeyGeneration:     4,
+		})
+		c.context.Executor = &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, arg ...string) (string, error) {
+				rotateCalledForEntity = arg[2]
+				return "", fmt.Errorf("mock error")
+			},
+		}
+		osdInfo := OSDInfo{
+			ID:          2,
+			CephxStatus: cephv1.CephxStatus{KeyGeneration: 1, KeyCephVersion: "19.2.6-0"},
+		}
+
+		cephxStatus, err := c.rotateCephxKey(osdInfo)
+		assert.Error(t, err)
+		assert.Equal(t, cephv1.CephxStatus{KeyCephVersion: "19.2.6-0", KeyGeneration: 1}, cephxStatus)
+		assert.Equal(t, rotateCalledForEntity, "osd.2")
+	})
+}
+
+func Test_getFuncToListDeploymentsWithIDs(t *testing.T) {
+	namespace := "rook-ceph"
+	clientset := fake.NewClientset()
+	ctx := &clusterd.Context{
+		Clientset: clientset,
+	}
+	clusterInfo := &cephclient.ClusterInfo{
+		Namespace:   namespace,
+		CephVersion: cephver.Squid,
+		Context:     t.Context(),
+	}
+	clusterInfo.SetName("mycluster")
+	clusterInfo.OwnerInfo = cephclient.NewMinimumOwnerInfo(t)
+	c := New(ctx, clusterInfo, cephv1.ClusterSpec{}, "rook/rook:master")
+
+	d0 := getDummyDeploymentOnNode(clientset, c, "node0", 0)
+	createDeploymentOrPanic(clientset, d0)
+
+	t.Run("empty OSD IDs returns empty list without invalid selector error", func(t *testing.T) {
+		listFunc := c.getFuncToListDeploymentsWithIDs([]string{})
+		list, err := listFunc()
+		assert.NoError(t, err)
+		assert.Empty(t, list.Items)
+	})
+
+	t.Run("non-empty OSD IDs filters matching deployments", func(t *testing.T) {
+		listFunc := c.getFuncToListDeploymentsWithIDs([]string{"0"})
+		list, err := listFunc()
+		assert.NoError(t, err)
+		assert.Len(t, list.Items, 1)
+		assert.Equal(t, "rook-ceph-osd-0", list.Items[0].Name)
+	})
 }

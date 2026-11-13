@@ -19,7 +19,6 @@ package client
 
 import (
 	"fmt"
-	"io/ioutil"
 	"net"
 	"os"
 	"path"
@@ -42,10 +41,10 @@ import (
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "cephclient")
 
 const (
-	// DefaultKeyringFile is the default name of the file where Ceph stores its keyring info
-	DefaultKeyringFile = "keyring"
 	// Msgr2port is the listening port of the messenger v2 protocol
 	Msgr2port = 3300
+	// Msgr1port is the listening port of the messenger v1 protocol
+	Msgr1port = 6789
 )
 
 var (
@@ -92,7 +91,7 @@ func GenerateConnectionConfig(context *clusterd.Context, cluster *ClusterInfo) (
 func GenerateConnectionConfigWithSettings(context *clusterd.Context, clusterInfo *ClusterInfo, settings *CephConfig) (string, error) {
 	root := path.Join(context.ConfigDir, clusterInfo.Namespace)
 	keyringPath := path.Join(root, fmt.Sprintf("%s.keyring", clusterInfo.CephCred.Username))
-	err := writeKeyring(CephKeyring(clusterInfo.CephCred), keyringPath)
+	err := WriteKeyring(keyringPath, CephKeyring(clusterInfo.CephCred))
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to write keyring %q to %s", clusterInfo.CephCred.Username, root)
 	}
@@ -107,10 +106,9 @@ func GenerateConnectionConfigWithSettings(context *clusterd.Context, clusterInfo
 
 // generateConfigFile generates and writes a config file to disk.
 func generateConfigFile(context *clusterd.Context, clusterInfo *ClusterInfo, pathRoot, keyringPath string, globalConfig *CephConfig, clientSettings map[string]string) (string, error) {
-
 	// create the config directory
-	if err := os.MkdirAll(pathRoot, 0744); err != nil {
-		logger.Warningf("failed to create config directory at %q. %v", pathRoot, err)
+	if err := os.MkdirAll(pathRoot, 0o744); err != nil {
+		return "", errors.Wrapf(err, "failed to create config directory at %q", pathRoot)
 	}
 
 	configFile, err := createGlobalConfigFileSection(context, clusterInfo, globalConfig)
@@ -165,7 +163,7 @@ func mergeDefaultConfigWithRookConfigOverride(clusterdContext *clusterd.Context,
 	return nil
 }
 
-// prepends "client." if a user namespace is not already specified
+// getQualifiedUser prepends "client." if a user namespace is not already specified
 func getQualifiedUser(user string) string {
 	if !strings.Contains(user, ".") {
 		return fmt.Sprintf("client.%s", user)
@@ -176,7 +174,6 @@ func getQualifiedUser(user string) string {
 
 // CreateDefaultCephConfig creates a default ceph config file.
 func CreateDefaultCephConfig(context *clusterd.Context, clusterInfo *ClusterInfo) (*CephConfig, error) {
-
 	cephVersionEnv := os.Getenv("ROOK_CEPH_VERSION")
 	if cephVersionEnv != "" {
 		v, err := cephver.ExtractCephVersion(cephVersionEnv)
@@ -188,7 +185,7 @@ func CreateDefaultCephConfig(context *clusterd.Context, clusterInfo *ClusterInfo
 
 	// extract a list of just the monitor names, which will populate the "mon initial members"
 	// and "mon hosts" global config field
-	monMembers, monHosts := PopulateMonHostMembers(clusterInfo.Monitors)
+	monMembers, monHosts := PopulateMonHostMembers(clusterInfo)
 
 	conf := &CephConfig{
 		GlobalConfig: &GlobalConfig{
@@ -203,7 +200,6 @@ func CreateDefaultCephConfig(context *clusterd.Context, clusterInfo *ClusterInfo
 
 // create a config file with global settings configured, and return an ini file
 func createGlobalConfigFileSection(context *clusterd.Context, clusterInfo *ClusterInfo, userConfig *CephConfig) (*ini.File, error) {
-
 	var ceph *CephConfig
 
 	if userConfig != nil {
@@ -244,26 +240,29 @@ func addClientConfigFileSection(configFile *ini.File, clientName, keyringPath st
 
 // PopulateMonHostMembers extracts a list of just the monitor names, which will populate the "mon initial members"
 // and "mon hosts" global config field
-func PopulateMonHostMembers(monitors map[string]*MonInfo) ([]string, []string) {
-	monMembers := make([]string, len(monitors))
-	monHosts := make([]string, len(monitors))
+func PopulateMonHostMembers(clusterInfo *ClusterInfo) ([]string, []string) {
+	var monMembers []string
+	var monHosts []string
 
-	i := 0
-	for _, monitor := range monitors {
-		monMembers[i] = monitor.Name
+	for _, monitor := range clusterInfo.AllMonitors() {
+		if monitor.OutOfQuorum {
+			logger.Warningf("skipping adding mon %q to config file, detected out of quorum", monitor.Name)
+			continue
+		}
+		monMembers = append(monMembers, monitor.Name)
 		monIP := cephutil.GetIPFromEndpoint(monitor.Endpoint)
-
-		// This tries to detect the current port if the mon already exists
-		// This basically handles the transition between monitors running on 6790 to msgr2
-		// So whatever the previous monitor port was we keep it
+		// Detect the current port if the mon already exists
+		// so the same msgr1 port can be preserved if needed (6789 or 6790)
 		currentMonPort := cephutil.GetPortFromEndpoint(monitor.Endpoint)
 
-		monPorts := [2]string{strconv.Itoa(int(Msgr2port)), strconv.Itoa(int(currentMonPort))}
-		msgr2Endpoint := net.JoinHostPort(monIP, monPorts[0])
-		msgr1Endpoint := net.JoinHostPort(monIP, monPorts[1])
-
-		monHosts[i] = "[v2:" + msgr2Endpoint + ",v1:" + msgr1Endpoint + "]"
-		i++
+		if currentMonPort == Msgr2port {
+			msgr2Endpoint := net.JoinHostPort(monIP, strconv.Itoa(int(Msgr2port)))
+			monHosts = append(monHosts, "[v2:"+msgr2Endpoint+"]")
+		} else {
+			msgr2Endpoint := net.JoinHostPort(monIP, strconv.Itoa(int(Msgr2port)))
+			msgr1Endpoint := net.JoinHostPort(monIP, strconv.Itoa(int(currentMonPort)))
+			monHosts = append(monHosts, "[v2:"+msgr2Endpoint+",v1:"+msgr1Endpoint+"]")
+		}
 	}
 
 	return monMembers, monHosts
@@ -282,17 +281,18 @@ func WriteCephConfig(context *clusterd.Context, clusterInfo *ClusterInfo) error 
 	if err != nil {
 		return errors.Wrap(err, "failed to write connection config")
 	}
-	src, err := ioutil.ReadFile(filepath.Clean(confFilePath))
+	src, err := os.ReadFile(filepath.Clean(confFilePath))
 	if err != nil {
 		return errors.Wrap(err, "failed to copy connection config to /etc/ceph. failed to read the connection config")
 	}
-	err = ioutil.WriteFile(DefaultConfigFilePath(), src, 0444)
+	// #nosec G703 -- path is a constant returned by DefaultConfigFilePath, not user input
+	err = os.WriteFile(DefaultConfigFilePath(), src, 0o600)
 	if err != nil {
 		return errors.Wrapf(err, "failed to copy connection config to /etc/ceph. failed to write %q", DefaultConfigFilePath())
 	}
-	dst, err := ioutil.ReadFile(DefaultConfigFilePath())
+	dst, err := os.ReadFile(DefaultConfigFilePath())
 	if err == nil {
-		logger.Debugf("config file @ %s: %s", DefaultConfigFilePath(), dst)
+		logger.Debugf("config file @ %s:\n%s", DefaultConfigFilePath(), dst)
 	} else {
 		logger.Warningf("wrote and copied config file but failed to read it back from %s for logging. %v", DefaultConfigFilePath(), err)
 	}

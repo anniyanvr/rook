@@ -1,22 +1,16 @@
-# Major Themes
+# v1.22 Pending Release Notes
 
-v1.8...
-
-## K8s Version Support
-
-## Upgrade Guides
+Notes for the v1.22.0 release, including breaking changes and new features.
+Changes should *not* be included here if they are backported to previous releases.
 
 ## Breaking Changes
 
-- Flex driver is fully deprecated. If you are still using flex volumes, before upgrading to v1.8
-  you will need to convert them to csi volumes. See the flex conversion tool.
-- Min supported version of K8s is now 1.16. If running on an older version of K8s it is recommended
-  to update to a newer version before updating to Rook v1.8.
 
 ## Features
 
-- The Rook Operator does not use "tini" as an init process. Instead, it uses the "rook" and handles
-  signals on its own.
-- Rook adds a finalizer `ceph.rook.io/disaster-protection` to resources critical to the Ceph cluster
-  (rook-ceph-mon secrets and configmap) so that the resources will not be accidentally deleted.
-- Add support for [Kubernetes Authentication when using HashiCorp Vault Key Management Service](Documentation/ceph-kms.md##kubernetes-based-authentication).
+- `CephObjectStoreUser` gained `spec.secretTemplate`, which adds labels and annotations to the Secret that holds the
+  user's credentials, for example to opt the Secret in to a tool that copies Secrets into other namespaces. Keys that
+  Rook sets or acts on are reserved.
+- RGW SSE-S3 accepts `VAULT_TRANSIT_BACKEND_PATH` in `security.s3.connectionDetails` for a Vault transit engine that is
+  not mounted at the default `transit` path. RGW SSE-KMS with the `transit` engine accepts it in
+  `security.kms.connectionDetails` too.

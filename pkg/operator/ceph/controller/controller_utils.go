@@ -20,6 +20,8 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"runtime/debug"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -27,6 +29,7 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/exec"
+	"github.com/rook/rook/pkg/util/log"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -39,12 +42,31 @@ type OperatorConfig struct {
 	Image             string
 	ServiceAccount    string
 	NamespaceToWatch  string
-	Parameters        map[string]string
+}
+
+// ClusterHealth is passed to the various monitoring go routines to stop them when the context is cancelled
+type ClusterHealth struct {
+	InternalCtx    context.Context
+	InternalCancel context.CancelFunc
 }
 
 const (
 	// OperatorSettingConfigMapName refers to ConfigMap that configures rook ceph operator
-	OperatorSettingConfigMapName string = "rook-ceph-operator-config"
+	OperatorSettingConfigMapName   string = "rook-ceph-operator-config"
+	enforceHostNetworkSettingName  string = "ROOK_ENFORCE_HOST_NETWORK"
+	enforceHostNetworkDefaultValue string = "false"
+
+	obcAllowAdditionalConfigFieldsSettingName  string = "ROOK_OBC_ALLOW_ADDITIONAL_CONFIG_FIELDS"
+	obcAllowAdditionalConfigFieldsDefaultValue string = "maxObjects,maxSize"
+
+	revisionHistoryLimitSettingName string = "ROOK_REVISION_HISTORY_LIMIT"
+
+	// csiOperatorResourcesSettingName controls whether Rook creates the CephConnection and
+	// ClientProfile CRs consumed by the ceph-csi-operator. Clusters that use no CSI driver,
+	// such as object store only clusters, can disable this and skip installing the
+	// ceph-csi-operator and its CRDs entirely.
+	csiOperatorResourcesSettingName  string = "ROOK_CREATE_CSI_OPERATOR_RESOURCES"
+	csiOperatorResourcesDefaultValue string = "true"
 
 	// UninitializedCephConfigError refers to the error message printed by the Ceph CLI when there is no ceph configuration file
 	// This typically is raised when the operator has not finished initializing
@@ -52,15 +74,20 @@ const (
 
 	// OperatorNotInitializedMessage is the message we print when the Operator is not ready to reconcile, typically the ceph.conf has not been generated yet
 	OperatorNotInitializedMessage = "skipping reconcile since operator is still initializing"
+
+	// RaiseNofileLimitAnnotationKey is annotation key to raise the nofile soft limit to the hard limit on startup.
+	// This is an experimental feature. This API may be changed or removed without notice.
+	RaiseNofileLimitAnnotationKey = "ceph.rook.io/raise-nofile-limit"
+
+	// RaiseNofileLimitScript is the bash script that raises the nofile soft limit to the hard limit.
+	// Uses && to fail fast if ulimit commands fail.
+	// The trailing space is required to separate it from the daemon command that follows.
+	RaiseNofileLimitScript = `pod_hard_limit="$(ulimit -Hn)" && ulimit -n "$pod_hard_limit" && `
 )
 
 var (
-	// ImmediateRetryResult Return this for a immediate retry of the reconciliation loop with the same request object.
+	// ImmediateRetryResult is returned for an immediate retry of the reconciliation loop with the same request object.
 	ImmediateRetryResult = reconcile.Result{Requeue: true}
-
-	// ImmediateRetryResultNoBackoff Return this for a immediate retry of the reconciliation loop with the same request object.
-	// Override the exponential backoff behavior by setting the RequeueAfter time explicitly.
-	ImmediateRetryResultNoBackoff = reconcile.Result{Requeue: true, RequeueAfter: time.Second}
 
 	// WaitForRequeueIfCephClusterNotReady waits for the CephCluster to be ready
 	WaitForRequeueIfCephClusterNotReady = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
@@ -71,20 +98,34 @@ var (
 	// WaitForRequeueIfFinalizerBlocked waits for resources to be cleaned up before the finalizer can be removed
 	WaitForRequeueIfFinalizerBlocked = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
 
-	// WaitForRequeueIfOperatorNotInitialized waits for resources to be cleaned up before the finalizer can be removed
+	// WaitForRequeueIfOperatorNotInitialized waits for the operator to finish initializing
 	WaitForRequeueIfOperatorNotInitialized = reconcile.Result{Requeue: true, RequeueAfter: 10 * time.Second}
 
 	// OperatorCephBaseImageVersion is the ceph version in the operator image
 	OperatorCephBaseImageVersion string
+
+	// loopDevicesAllowed indicates whether loop devices are allowed to be used
+	loopDevicesAllowed          = false
+	revisionHistoryLimit *int32 = nil
+
+	// allowed OBC additional config fields
+	obcAllowAdditionalConfigFields = strings.Split(obcAllowAdditionalConfigFieldsDefaultValue, ",")
 )
 
-func DiscoveryDaemonEnabled(data map[string]string) bool {
-	return k8sutil.GetValue(data, "ROOK_ENABLE_DISCOVERY_DAEMON", "false") == "true"
+func DiscoveryDaemonEnabled() bool {
+	return k8sutil.GetOperatorSetting("ROOK_ENABLE_DISCOVERY_DAEMON", "false") == "true"
+}
+
+// CSIOperatorResourcesEnabled returns true if Rook should create and update the CephConnection
+// and ClientProfile CRs consumed by the ceph-csi-operator. Clusters that use no CSI driver can
+// disable this so the ceph-csi-operator and its CRDs are not required.
+func CSIOperatorResourcesEnabled() bool {
+	return k8sutil.GetOperatorSetting(csiOperatorResourcesSettingName, csiOperatorResourcesDefaultValue) == "true"
 }
 
 // SetCephCommandsTimeout sets the timeout value of Ceph commands which are executed from Rook
-func SetCephCommandsTimeout(data map[string]string) {
-	strTimeoutSeconds := k8sutil.GetValue(data, "ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS", "15")
+func SetCephCommandsTimeout() {
+	strTimeoutSeconds := k8sutil.GetOperatorSetting("ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS", "15")
 	timeoutSeconds, err := strconv.Atoi(strTimeoutSeconds)
 	if err != nil || timeoutSeconds < 1 {
 		logger.Warningf("ROOK_CEPH_COMMANDS_TIMEOUT is %q but it should be >= 1, set the default value 15", strTimeoutSeconds)
@@ -93,23 +134,103 @@ func SetCephCommandsTimeout(data map[string]string) {
 	exec.CephCommandsTimeout = time.Duration(timeoutSeconds) * time.Second
 }
 
-// canIgnoreHealthErrStatusInReconcile determines whether a status of HEALTH_ERR in the CephCluster can be ignored safely.
-func canIgnoreHealthErrStatusInReconcile(cephCluster cephv1.CephCluster, controllerName string) bool {
+func SetAllowLoopDevices() {
+	strLoopDevicesAllowed := k8sutil.GetOperatorSetting("ROOK_CEPH_ALLOW_LOOP_DEVICES", "false")
+	var err error
+	loopDevicesAllowed, err = strconv.ParseBool(strLoopDevicesAllowed)
+	if err != nil {
+		logger.Warningf("ROOK_CEPH_ALLOW_LOOP_DEVICES is set to an invalid value %v, set the default value false", strLoopDevicesAllowed)
+		loopDevicesAllowed = false
+	}
+}
+
+func LoopDevicesAllowed() bool {
+	return loopDevicesAllowed
+}
+
+func SetEnforceHostNetwork() {
+	strval := k8sutil.GetOperatorSetting(enforceHostNetworkSettingName, enforceHostNetworkDefaultValue)
+	val, err := strconv.ParseBool(strval)
+	if err != nil {
+		logger.Warningf("failed to parse value %q for %q. assuming false value", strval, enforceHostNetworkSettingName)
+		cephv1.SetEnforceHostNetwork(false)
+		return
+	}
+	cephv1.SetEnforceHostNetwork(val)
+}
+
+func EnforceHostNetwork() bool {
+	return cephv1.EnforceHostNetwork()
+}
+
+func SetRevisionHistoryLimit() {
+	strval := k8sutil.GetOperatorSetting(revisionHistoryLimitSettingName, "")
+	var limit int32
+	if strval == "" {
+		logger.Debugf("not parsing empty string to int for %q. assuming default value.", revisionHistoryLimitSettingName)
+		revisionHistoryLimit = nil
+		return
+	}
+	numval, err := strconv.ParseInt(strval, 10, 32)
+	if err != nil {
+		logger.Warningf("failed to parse value %q for %q. assuming default value. %v", strval, revisionHistoryLimitSettingName, err)
+		revisionHistoryLimit = nil
+		return
+	}
+	limit = int32(numval)
+	revisionHistoryLimit = &limit
+}
+
+func RevisionHistoryLimit() *int32 {
+	return revisionHistoryLimit
+}
+
+func SetObcAllowAdditionalConfigFields() {
+	strval := k8sutil.GetOperatorSetting(obcAllowAdditionalConfigFieldsSettingName, obcAllowAdditionalConfigFieldsDefaultValue)
+	obcAllowAdditionalConfigFields = strings.Split(strval, ",")
+}
+
+func ObcAdditionalConfigKeyIsAllowed(configField string) bool {
+	return slices.Contains(obcAllowAdditionalConfigFields, configField)
+}
+
+// CanIgnoreHealthErrStatusInReconcile determines whether a status of HEALTH_ERR in the CephCluster can be ignored safely.
+func CanIgnoreHealthErrStatusInReconcile(cephCluster cephv1.CephCluster, controllerName string) bool {
 	// Get a list of all the keys causing the HEALTH_ERR status.
-	var healthErrKeys = make([]string, 0)
+	healthErrKeys := make([]string, 0)
 	for key, health := range cephCluster.Status.CephStatus.Details {
 		if health.Severity == "HEALTH_ERR" {
 			healthErrKeys = append(healthErrKeys, key)
 		}
 	}
 
-	// If there is only one cause for HEALTH_ERR and it's on the allowed list of errors, ignore it.
-	var allowedErrStatus = []string{"MDS_ALL_DOWN"}
-	var ignoreHealthErr = len(healthErrKeys) == 1 && contains(allowedErrStatus, healthErrKeys[0])
-	if ignoreHealthErr {
-		logger.Debugf("%q: ignoring ceph status %q because only cause is %q (full status is %+v)", controllerName, cephCluster.Status.CephStatus.Health, healthErrKeys[0], cephCluster.Status.CephStatus)
+	// If there are no errors, the caller actually expects false to be returned so the absence
+	// of an error doesn't cause the health status to be ignored. In production, if there are no
+	// errors, we would anyway expect the health status to be ok or warning. False in this case
+	// will cover if the health status is blank.
+	if len(healthErrKeys) == 0 {
+		return false
 	}
-	return ignoreHealthErr
+
+	allowedErrStatus := map[string]struct{}{
+		"MDS_ALL_DOWN":                            {},
+		"MGR_MODULE_ERROR":                        {},
+		"AUTH_INSECURE_SERVICE_KEY_TYPE":          {}, // rook can reconcile cephx keys to clear this
+		"AUTH_INSECURE_ROTATING_SERVICE_KEY_TYPE": {}, // rook can reconcile cephx keys to clear this
+		"AUTH_INSECURE_SERVICE_TICKETS":           {}, // rook can reconcile cephx keys to clear this
+	}
+	allCanBeIgnored := true
+	for _, healthErrKey := range healthErrKeys {
+		if _, ok := allowedErrStatus[healthErrKey]; !ok {
+			allCanBeIgnored = false
+			break
+		}
+	}
+	if allCanBeIgnored {
+		logger.Debugf("%q: ignoring ceph error status (full status is %+v)", controllerName, cephCluster.Status.CephStatus)
+		return true
+	}
+	return false
 }
 
 // IsReadyToReconcile determines if a controller is ready to reconcile or not
@@ -122,43 +243,42 @@ func IsReadyToReconcile(ctx context.Context, c client.Client, namespacedName typ
 	clusterList := &cephv1.CephClusterList{}
 	err := c.List(ctx, clusterList, client.InNamespace(namespacedName.Namespace))
 	if err != nil {
-		logger.Errorf("%q: failed to fetch CephCluster %v", controllerName, err)
+		log.NamedError(namespacedName, logger, "%q: failed to fetch CephCluster %v", controllerName, err)
 		return cephCluster, false, cephClusterExists, ImmediateRetryResult
 	}
 	if len(clusterList.Items) == 0 {
-		logger.Debugf("%q: no CephCluster resource found in namespace %q", controllerName, namespacedName.Namespace)
+		log.NamedDebug(namespacedName, logger, "%q: no CephCluster resource found in namespace", controllerName)
 		return cephCluster, false, cephClusterExists, WaitForRequeueIfCephClusterNotReady
 	}
 	cephCluster = clusterList.Items[0]
-
 	// If the cluster has a cleanup policy to destroy the cluster and it has been marked for deletion, treat it as if it does not exist
 	if cephCluster.Spec.CleanupPolicy.HasDataDirCleanPolicy() && !cephCluster.DeletionTimestamp.IsZero() {
-		logger.Infof("%q: CephCluster %q has a destructive cleanup policy, allowing resources to be deleted", controllerName, namespacedName)
+		log.NamedInfo(namespacedName, logger, "%q: CephCluster has a destructive cleanup policy, allowing it to be deleted", controllerName)
 		return cephCluster, false, cephClusterExists, WaitForRequeueIfCephClusterNotReady
 	}
 
 	cephClusterExists = true
-	logger.Debugf("%q: CephCluster resource %q found in namespace %q", controllerName, cephCluster.Name, namespacedName.Namespace)
+	log.NamedDebug(namespacedName, logger, "%q: CephCluster resource found", controllerName)
 
 	// read the CR status of the cluster
 	if cephCluster.Status.CephStatus != nil {
-		var operatorDeploymentOk = cephCluster.Status.CephStatus.Health == "HEALTH_OK" || cephCluster.Status.CephStatus.Health == "HEALTH_WARN"
+		operatorDeploymentOk := cephCluster.Status.CephStatus.Health == "HEALTH_OK" || cephCluster.Status.CephStatus.Health == "HEALTH_WARN"
 
-		if operatorDeploymentOk || canIgnoreHealthErrStatusInReconcile(cephCluster, controllerName) {
-			logger.Debugf("%q: ceph status is %q, operator is ready to run ceph command, reconciling", controllerName, cephCluster.Status.CephStatus.Health)
+		if operatorDeploymentOk || CanIgnoreHealthErrStatusInReconcile(cephCluster, controllerName) {
+			log.NamedDebug(namespacedName, logger, "%q: ceph status is %q, operator is ready to run ceph command, reconciling", controllerName, cephCluster.Status.CephStatus.Health)
 			return cephCluster, true, cephClusterExists, WaitForRequeueIfCephClusterNotReady
 		}
 
 		details := cephCluster.Status.CephStatus.Details
 		message, ok := details["error"]
 		if ok && len(details) == 1 && strings.Contains(message.Message, "Error initializing cluster client") {
-			logger.Infof("%s: skipping reconcile since operator is still initializing", controllerName)
+			log.NamedInfo(namespacedName, logger, "%q: skipping reconcile since operator is still initializing", controllerName)
 		} else {
-			logger.Infof("%s: CephCluster %q found but skipping reconcile since ceph health is %+v", controllerName, cephCluster.Name, cephCluster.Status.CephStatus)
+			log.NamedInfo(namespacedName, logger, "%q: CephCluster %q found but skipping reconcile since ceph health is %+v", controllerName, cephCluster.Name, cephCluster.Status.CephStatus)
 		}
 	}
 
-	logger.Debugf("%q: CephCluster %q initial reconcile is not complete yet...", controllerName, namespacedName.Namespace)
+	log.NamedDebug(namespacedName, logger, "%q: CephCluster initial reconcile is not complete yet...", controllerName)
 	return cephCluster, false, cephClusterExists, WaitForRequeueIfCephClusterNotReady
 }
 
@@ -182,6 +302,36 @@ var ClusterResource = k8sutil.CustomResource{
 	Plural:     "cephclusters",
 	Group:      cephv1.CustomResourceGroup,
 	Version:    cephv1.Version,
-	Kind:       reflect.TypeOf(cephv1.CephCluster{}).Name(),
+	Kind:       reflect.TypeFor[cephv1.CephCluster]().Name(),
 	APIVersion: fmt.Sprintf("%s/%s", cephv1.CustomResourceGroup, cephv1.Version),
+}
+
+// RecoverAndLogException handles and logs panics from a controller Reconcile loop.
+func RecoverAndLogException() {
+	if r := recover(); r != nil {
+		logger.Errorf("Panic: %v", r)
+		logger.Errorf("Stack trace:\n%s", string(debug.Stack()))
+	}
+}
+
+func NsName(namespace, name string) types.NamespacedName {
+	return types.NamespacedName{Namespace: namespace, Name: name}
+}
+
+// ShouldRaiseNofileLimit reports whether to raise the nofile limit based on the CR
+// annotation. Defaults to false.
+func ShouldRaiseNofileLimit(annotations map[string]string) bool {
+	if annotations == nil {
+		return false
+	}
+	raw, ok := annotations[RaiseNofileLimitAnnotationKey]
+	if !ok {
+		return false
+	}
+	raise, err := strconv.ParseBool(raw)
+	if err != nil {
+		logger.Warningf("invalid value %q for annotation %q. Not raising the nofile limit", raw, RaiseNofileLimitAnnotationKey)
+		return false
+	}
+	return raise
 }

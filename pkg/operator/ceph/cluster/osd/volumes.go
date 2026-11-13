@@ -21,9 +21,9 @@ import (
 	"path"
 	"path/filepath"
 
-	"github.com/libopenstorage/secrets"
 	kms "github.com/rook/rook/pkg/daemon/ceph/osd/kms"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/util/log"
 	v1 "k8s.io/api/core/v1"
 )
 
@@ -96,7 +96,7 @@ func getDataBridgeVolumeSource(claimName, configDir, namespace string, inProvisi
 	} else {
 		// We need to use hostPath to prevent multiple OSD pods from launching the same OSD and causing corruption.
 		// Ceph avoids this problem by locking fsid file and block device file under the data bridge volume directory.
-		// These locks are released by kernel once the process is gone, so until the ceph-osd daemon alives, the other
+		// These locks are released by the kernel once the process is gone, so until the ceph-osd daemon is alive, the other
 		// pods (same OSD) will not be able to acquire them and will continue to be restarted.
 		// If we use emptyDir, this exclusive control doesn't work because the lock files aren't shared between OSD pods.
 		hostPathType := v1.HostPathDirectoryOrCreate
@@ -170,7 +170,7 @@ func getPVCOSDVolumes(osdProps *osdProperties, configDir string, namespace strin
 		volumes = append(volumes, walPVCVolume...)
 	}
 
-	logger.Debugf("volumes are %+v", volumes)
+	log.NamespacedDebug(namespace, logger, "volumes are %+v", volumes)
 
 	return volumes
 }
@@ -192,17 +192,8 @@ func getUdevVolume() (v1.Volume, v1.VolumeMount) {
 }
 
 func (c *Cluster) getEncryptionVolume(osdProps osdProperties) (v1.Volume, v1.VolumeMount) {
-	// Determine whether we have a KMS configuration
-	var isKMS bool
-	if len(c.spec.Security.KeyManagementService.ConnectionDetails) != 0 {
-		provider := kms.GetParam(c.spec.Security.KeyManagementService.ConnectionDetails, kms.Provider)
-		if provider == secrets.TypeVault {
-			isKMS = true
-		}
-	}
-
 	// Generate volume
-	var m int32 = 0400
+	var m int32 = 0o400
 	volume := v1.Volume{
 		Name: osdEncryptionVolName,
 		VolumeSource: v1.VolumeSource{
@@ -220,7 +211,7 @@ func (c *Cluster) getEncryptionVolume(osdProps osdProperties) (v1.Volume, v1.Vol
 	}
 
 	// On the KMS use case, we want the volume mount to be in memory since we pass write the KEK
-	if isKMS {
+	if c.spec.Security.KeyManagementService.IsEnabled() {
 		volume.VolumeSource.Secret = nil
 		volume.VolumeSource = v1.VolumeSource{
 			EmptyDir: &v1.EmptyDirVolumeSource{
@@ -237,7 +228,7 @@ func (c *Cluster) getEncryptionVolume(osdProps osdProperties) (v1.Volume, v1.Vol
 	}
 
 	// With KMS we must be able to write inside the directory to write the KEK
-	if isKMS {
+	if c.spec.Security.KeyManagementService.IsEnabled() {
 		volumeMounts.ReadOnly = false
 	}
 

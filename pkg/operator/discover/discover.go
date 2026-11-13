@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -30,7 +31,8 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	discoverDaemon "github.com/rook/rook/pkg/daemon/discover"
-	k8sutil "github.com/rook/rook/pkg/operator/k8sutil"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/sys"
 
 	apps "k8s.io/api/apps/v1"
@@ -53,6 +55,7 @@ const (
 	deviceInUseClusterAttr                = "rook.io/cluster"
 	discoverIntervalEnv                   = "ROOK_DISCOVER_DEVICES_INTERVAL"
 	defaultDiscoverInterval               = "60m"
+	discoverDaemonResourcesEnv            = "DISCOVER_DAEMON_RESOURCES"
 )
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-discover")
@@ -69,7 +72,7 @@ func New(clientset kubernetes.Interface) *Discover {
 	}
 }
 
-// Start the discover
+// Start creates the discover daemonset
 func (d *Discover) Start(ctx context.Context, namespace, discoverImage, securityAccount string, useCephVolume bool) error {
 	err := d.createDiscoverDaemonSet(ctx, namespace, discoverImage, securityAccount, useCephVolume)
 	if err != nil {
@@ -79,21 +82,29 @@ func (d *Discover) Start(ctx context.Context, namespace, discoverImage, security
 }
 
 func (d *Discover) createDiscoverDaemonSet(ctx context.Context, namespace, discoverImage, securityAccount string, useCephVolume bool) error {
-	privileged := true
-	discovery_parameters := []string{"discover",
-		"--discover-interval", getEnvVar(discoverIntervalEnv, defaultDiscoverInterval)}
+	discoveryInterval := k8sutil.GetOperatorSetting(discoverIntervalEnv, defaultDiscoverInterval)
+
+	discoveryParameters := []string{
+		"discover",
+		"--discover-interval", discoveryInterval,
+	}
 	if useCephVolume {
-		discovery_parameters = append(discovery_parameters, "--use-ceph-volume")
+		discoveryParameters = append(discoveryParameters, "--use-ceph-volume")
+	}
+
+	discoverDaemonResourcesRaw := k8sutil.GetOperatorSetting(discoverDaemonResourcesEnv, "")
+	discoverDaemonResources, err := k8sutil.YamlToContainerResource(discoverDaemonResourcesRaw)
+	if err != nil {
+		logger.Warningf("failed to parse.%s %v", discoverDaemonResourcesRaw, err)
 	}
 
 	ds := &apps.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: discoverDaemonsetName,
-			Labels: map[string]string{
-				"app": discoverDaemonsetName,
-			},
+			Name:   discoverDaemonsetName,
+			Labels: getLabels(),
 		},
 		Spec: apps.DaemonSetSpec{
+			RevisionHistoryLimit: opcontroller.RevisionHistoryLimit(),
 			Selector: &metav1.LabelSelector{
 				MatchLabels: map[string]string{
 					"app": discoverDaemonsetName,
@@ -104,20 +115,16 @@ func (d *Discover) createDiscoverDaemonSet(ctx context.Context, namespace, disco
 			},
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
-					Labels: map[string]string{
-						"app": discoverDaemonsetName,
-					},
+					Labels: getLabels(),
 				},
 				Spec: v1.PodSpec{
 					ServiceAccountName: securityAccount,
 					Containers: []v1.Container{
 						{
-							Name:  discoverDaemonsetName,
-							Image: discoverImage,
-							Args:  discovery_parameters,
-							SecurityContext: &v1.SecurityContext{
-								Privileged: &privileged,
-							},
+							Name:            discoverDaemonsetName,
+							Image:           discoverImage,
+							Args:            discoveryParameters,
+							SecurityContext: opcontroller.PrivilegedContext(true),
 							VolumeMounts: []v1.VolumeMount{
 								{
 									Name:      "dev",
@@ -136,10 +143,12 @@ func (d *Discover) createDiscoverDaemonSet(ctx context.Context, namespace, disco
 									ReadOnly:  true,
 								},
 							},
+							Resources: discoverDaemonResources,
 							Env: []v1.EnvVar{
 								k8sutil.NamespaceEnvVar(),
 								k8sutil.NodeEnvVar(),
 								k8sutil.NameEnvVar(),
+								{Name: discoverDaemon.DiscoverDaemonUdev, Value: os.Getenv(discoverDaemon.DiscoverDaemonUdev)},
 							},
 						},
 					},
@@ -169,14 +178,15 @@ func (d *Discover) createDiscoverDaemonSet(ctx context.Context, namespace, disco
 							},
 						},
 					},
-					HostNetwork:       false,
-					PriorityClassName: os.Getenv(discoverDaemonsetPriorityClassNameEnv),
+					HostNetwork:       opcontroller.EnforceHostNetwork(),
+					PriorityClassName: k8sutil.GetOperatorSetting(discoverDaemonsetPriorityClassNameEnv, ""),
+					SecurityContext:   &v1.PodSecurityContext{},
 				},
 			},
 		},
 	}
 	// Get the operator pod details to attach the owner reference to the discover daemon set
-	operatorPod, err := k8sutil.GetRunningPod(d.clientset)
+	operatorPod, err := k8sutil.GetRunningPod(ctx, d.clientset)
 	if err != nil {
 		logger.Errorf("failed to get operator pod. %+v", err)
 	} else {
@@ -184,26 +194,27 @@ func (d *Discover) createDiscoverDaemonSet(ctx context.Context, namespace, disco
 	}
 
 	// Add toleration if any
-	tolerationValue := os.Getenv(discoverDaemonsetTolerationEnv)
+	tolerationValue := k8sutil.GetOperatorSetting(discoverDaemonsetTolerationEnv, "")
 	if tolerationValue != "" {
 		ds.Spec.Template.Spec.Tolerations = []v1.Toleration{
 			{
 				Effect:   v1.TaintEffect(tolerationValue),
 				Operator: v1.TolerationOpExists,
-				Key:      os.Getenv(discoverDaemonsetTolerationKeyEnv),
+				Key:      k8sutil.GetOperatorSetting(discoverDaemonsetTolerationKeyEnv, ""),
 			},
 		}
 	}
 
-	tolerationsRaw := os.Getenv(discoverDaemonsetTolerationsEnv)
+	tolerationsRaw := k8sutil.GetOperatorSetting(discoverDaemonsetTolerationsEnv, "")
 	tolerations, err := k8sutil.YamlToTolerations(tolerationsRaw)
 	if err != nil {
 		logger.Warningf("failed to parse %s. %+v", tolerationsRaw, err)
 	}
+	logger.Infof("tolerations: %v", tolerations)
 	ds.Spec.Template.Spec.Tolerations = append(ds.Spec.Template.Spec.Tolerations, tolerations...)
 
 	// Add NodeAffinity if any
-	nodeAffinity := os.Getenv(discoverDaemonSetNodeAffinityEnv)
+	nodeAffinity := k8sutil.GetOperatorSetting(discoverDaemonSetNodeAffinityEnv, "")
 	if nodeAffinity != "" {
 		v1NodeAffinity, err := k8sutil.GenerateNodeAffinity(nodeAffinity)
 		if err != nil {
@@ -213,15 +224,24 @@ func (d *Discover) createDiscoverDaemonSet(ctx context.Context, namespace, disco
 				NodeAffinity: v1NodeAffinity,
 			}
 		}
+		logger.Infof("nodeAffinity: %s", v1NodeAffinity)
 	}
 
-	podLabels := os.Getenv(discoverDaemonSetPodLabelsEnv)
+	podLabels := k8sutil.GetOperatorSetting(discoverDaemonSetPodLabelsEnv, "")
 	if podLabels != "" {
 		podLabels := k8sutil.ParseStringToLabels(podLabels)
 		// Override / Set the app label even if set by the user as
 		// otherwise the DaemonSet pod selector may be broken
 		podLabels["app"] = discoverDaemonsetName
 		ds.Spec.Template.ObjectMeta.Labels = podLabels
+	}
+
+	if opcontroller.LoopDevicesAllowed() {
+		c, err := k8sutil.GetContainerByName(ds.Spec.Template.Spec.Containers, discoverDaemonsetName)
+		if err != nil {
+			return fmt.Errorf("failed to find rook-discover container in daemonset spec. %+v", err)
+		}
+		c.Env = append(c.Env, v1.EnvVar{Name: "CEPH_VOLUME_ALLOW_LOOP_DEVICES", Value: "true"})
 	}
 
 	_, err = d.clientset.AppsV1().DaemonSets(namespace).Create(ctx, ds, metav1.CreateOptions{})
@@ -238,24 +258,21 @@ func (d *Discover) createDiscoverDaemonSet(ctx context.Context, namespace, disco
 		logger.Infof("rook-discover daemonset started")
 	}
 	return nil
-
 }
 
-func getEnvVar(varName string, defaultValue string) string {
-	envValue := os.Getenv(varName)
-	if envValue != "" {
-		return envValue
-	}
-	return defaultValue
+func getLabels() map[string]string {
+	labels := make(map[string]string)
+	k8sutil.AddRecommendedLabels(labels, "rook-discover", "rook-ceph-operator", "rook-discover", "rook-discover")
+	labels["app"] = discoverDaemonsetName
+	return labels
 }
 
 // ListDevices lists all devices discovered on all nodes or specific node if node name is provided.
-func ListDevices(clusterdContext *clusterd.Context, namespace, nodeName string) (map[string][]sys.LocalDisk, error) {
-	ctx := context.TODO()
-	// convert the host name label to the k8s node name to look up the configmap  with the devices
+func ListDevices(ctx context.Context, clusterdContext *clusterd.Context, namespace, nodeName string) (map[string][]sys.LocalDisk, error) {
+	// convert the host name label to the k8s node name to look up the configmap with the devices
 	if len(nodeName) > 0 {
 		var err error
-		nodeName, err = k8sutil.GetNodeNameFromHostname(clusterdContext.Clientset, nodeName)
+		nodeName, err = k8sutil.GetNodeNameFromHostname(ctx, clusterdContext.Clientset, nodeName)
 		if err != nil {
 			logger.Warningf("failed to get node name from hostname. %+v", err)
 		}
@@ -314,8 +331,7 @@ func ListDevices(clusterdContext *clusterd.Context, namespace, nodeName string) 
 }
 
 // ListDevicesInUse lists all devices on a node that are already used by existing clusters.
-func ListDevicesInUse(clusterdContext *clusterd.Context, namespace, nodeName string) ([]sys.LocalDisk, error) {
-	ctx := context.TODO()
+func ListDevicesInUse(ctx context.Context, clusterdContext *clusterd.Context, namespace, nodeName string) ([]sys.LocalDisk, error) {
 	var devices []sys.LocalDisk
 
 	if len(nodeName) == 0 {
@@ -345,9 +361,7 @@ func ListDevicesInUse(clusterdContext *clusterd.Context, namespace, nodeName str
 			logger.Warningf("failed to unmarshal %s", deviceJson)
 			continue
 		}
-		for i := range d {
-			devices = append(devices, d[i])
-		}
+		devices = append(devices, d...)
 	}
 	logger.Debugf("devices in use %+v", devices)
 	return devices, nil
@@ -355,24 +369,18 @@ func ListDevicesInUse(clusterdContext *clusterd.Context, namespace, nodeName str
 
 func matchDeviceFullPath(devLinks, fullpath string) bool {
 	dlsArr := strings.Split(devLinks, " ")
-	for i := range dlsArr {
-		if dlsArr[i] == fullpath {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(dlsArr, fullpath)
 }
 
-// GetAvailableDevices conducts outer join using input filters with free devices that a node has. It marks the devices from join result as in-use.
-func GetAvailableDevices(clusterdContext *clusterd.Context, nodeName, clusterName string, devices []cephv1.Device, filter string, useAllDevices bool) ([]cephv1.Device, error) {
-	ctx := context.TODO()
+// GetAvailableDevices conducts an outer join using input filters with free devices that a node has. It marks the devices from the join result as in-use.
+func GetAvailableDevices(ctx context.Context, clusterdContext *clusterd.Context, nodeName, clusterName string, devices []cephv1.Device, filter string, useAllDevices bool) ([]cephv1.Device, error) {
 	results := []cephv1.Device{}
 	if len(devices) == 0 && len(filter) == 0 && !useAllDevices {
 		return results, nil
 	}
 	namespace := os.Getenv(k8sutil.PodNamespaceEnvVar)
 	// find all devices
-	allDevices, err := ListDevices(clusterdContext, namespace, nodeName)
+	allDevices, err := ListDevices(ctx, clusterdContext, namespace, nodeName)
 	if err != nil {
 		return results, err
 	}
@@ -382,7 +390,7 @@ func GetAvailableDevices(clusterdContext *clusterd.Context, nodeName, clusterNam
 		return results, fmt.Errorf("node %s has no devices", nodeName)
 	}
 	// find those in use on the node
-	devicesInUse, err := ListDevicesInUse(clusterdContext, namespace, nodeName)
+	devicesInUse, err := ListDevicesInUse(ctx, clusterdContext, namespace, nodeName)
 	if err != nil {
 		return results, err
 	}
@@ -415,9 +423,9 @@ func GetAvailableDevices(clusterdContext *clusterd.Context, nodeName, clusterNam
 				}
 			}
 		}
-	} else if len(filter) >= 0 {
+	} else if len(filter) > 0 {
 		for i := range nodeDevices {
-			//TODO support filter based on other keys
+			// TODO support filter based on other keys
 			matched, err := regexp.Match(filter, []byte(nodeDevices[i].Name))
 			if err == nil && matched {
 				d := cephv1.Device{
@@ -471,7 +479,7 @@ func GetAvailableDevices(clusterdContext *clusterd.Context, nodeName, clusterNam
 	return results, nil
 }
 
-// Stop the discover
+// Stop deletes the discover daemonset
 func (d *Discover) Stop(ctx context.Context, namespace string) error {
 	err := d.clientset.AppsV1().DaemonSets(namespace).Delete(ctx, discoverDaemonsetName, metav1.DeleteOptions{})
 	if err != nil && !k8serrors.IsNotFound(err) {

@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"context"
 	"reflect"
 	"testing"
 
@@ -38,7 +37,7 @@ func TestObjectToCRMapper(t *testing.T) {
 			Namespace: namespace,
 		},
 		TypeMeta: metav1.TypeMeta{
-			Kind: reflect.TypeOf(cephv1.CephFilesystem{}).Name(),
+			Kind: reflect.TypeFor[cephv1.CephFilesystem]().Name(),
 		},
 	}
 
@@ -62,7 +61,7 @@ func TestObjectToCRMapper(t *testing.T) {
 		{NamespacedName: client.ObjectKey{Name: "my-pool", Namespace: "rook-ceph"}},
 	}
 
-	handlerFunc, err := ObjectToCRMapper(context.TODO(), cl, objects[0], s)
+	handlerFunc, err := ObjectToCRMapper[*cephv1.CephFilesystemList, runtime.Object](t.Context(), cl, &cephv1.CephFilesystemList{}, s)
 	assert.NoError(t, err)
-	assert.ElementsMatch(t, fakeRequest, handlerFunc(fs))
+	assert.ElementsMatch(t, fakeRequest, handlerFunc(t.Context(), fs))
 }

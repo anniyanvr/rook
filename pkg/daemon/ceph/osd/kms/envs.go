@@ -19,7 +19,7 @@ package kms
 import (
 	"os"
 	"path"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/hashicorp/vault/api"
@@ -30,10 +30,11 @@ import (
 )
 
 var (
-	knownKMSPrefix = []string{"VAULT_"}
+	kmipKMSPrefix  = "KMIP_"
+	knownKMSPrefix = []string{"VAULT_", "IBM_", kmipKMSPrefix, "AZURE_"}
 )
 
-// VaultTokenEnvVarFromSecret returns the kms token secret value as an env var
+// vaultTokenEnvVarFromSecret returns the kms token secret value as an env var
 func vaultTokenEnvVarFromSecret(tokenSecretName string) v1.EnvVar {
 	return v1.EnvVar{
 		Name: api.EnvVaultToken,
@@ -48,8 +49,23 @@ func vaultTokenEnvVarFromSecret(tokenSecretName string) v1.EnvVar {
 	}
 }
 
-// vaultTLSEnvVarFromSecret translates TLS env var which are set to k8s secret name to their actual path on the fs once mounted as volume
-// See: TLSSecretVolumeAndMount() for more details
+// ibmKeyProtectServiceAPIKeyEnvVarFromSecret returns the kms token secret value as an env var
+func ibmKeyProtectServiceAPIKeyEnvVarFromSecret(tokenSecretName string) v1.EnvVar {
+	return v1.EnvVar{
+		Name: IbmKeyProtectServiceApiKey,
+		ValueFrom: &v1.EnvVarSource{
+			SecretKeyRef: &v1.SecretKeySelector{
+				LocalObjectReference: v1.LocalObjectReference{
+					Name: tokenSecretName,
+				},
+				Key: IbmKeyProtectServiceApiKey,
+			},
+		},
+	}
+}
+
+// vaultTLSEnvVarFromSecret translates TLS env vars which are set to k8s secret name to their actual path on the fs once mounted as volume
+// See: VaultSecretVolumeAndMount() for more details
 func vaultTLSEnvVarFromSecret(kmsConfig map[string]string) []v1.EnvVar {
 	vaultTLSEnvVar := []v1.EnvVar{}
 
@@ -63,37 +79,62 @@ func vaultTLSEnvVarFromSecret(kmsConfig map[string]string) []v1.EnvVar {
 	return vaultTLSEnvVar
 }
 
-// VaultConfigToEnvVar populates the kms config as env variables
-func VaultConfigToEnvVar(spec cephv1.ClusterSpec) []v1.EnvVar {
+// ConfigToEnvVar populates the kms config as env variables
+func ConfigToEnvVar(spec cephv1.ClusterSpec) []v1.EnvVar {
 	envs := []v1.EnvVar{}
-	backendPath := GetParam(spec.Security.KeyManagementService.ConnectionDetails, vault.VaultBackendPathKey)
-	// Set BACKEND_PATH to the API's default if not passed
-	if backendPath == "" {
-		spec.Security.KeyManagementService.ConnectionDetails[vault.VaultBackendPathKey] = vault.DefaultBackendPath
+
+	if spec.Security.KeyManagementService.IsVaultKMS() {
+		backendPath := GetParam(spec.Security.KeyManagementService.ConnectionDetails, vault.VaultBackendPathKey)
+		// Set BACKEND_PATH to the API's default if not passed
+		if backendPath == "" {
+			spec.Security.KeyManagementService.ConnectionDetails[vault.VaultBackendPathKey] = vault.DefaultBackendPath
+		}
 	}
+
+	if spec.Security.KeyManagementService.IsIBMKeyProtectKMS() {
+		// We don't want to leak the IBM service API key to the container environment variables even though
+		// the container is ephemeral.
+		// The IBM_KP_SERVICE_API_KEY content is mounted in the provisioner container as an
+		// environment variable from a secret
+		delete(spec.Security.KeyManagementService.ConnectionDetails, IbmKeyProtectServiceApiKey)
+		envs = append(envs, ibmKeyProtectServiceAPIKeyEnvVarFromSecret(spec.Security.KeyManagementService.TokenSecretName))
+	}
+
+	if spec.Security.KeyManagementService.IsKMIPKMS() {
+		for key, val := range spec.Security.KeyManagementService.ConnectionDetails {
+			// these token details will be mounted into the osd pod instead of being inserted as env vars.
+			if sets.NewString(kmsKMIPMandatoryTokenDetails...).Has(key) {
+				continue
+			}
+			envs = append(envs, v1.EnvVar{Name: kmipKMSPrefix + key, Value: val})
+		}
+	}
+
 	for k, v := range spec.Security.KeyManagementService.ConnectionDetails {
-		// Skip TLS and token env var to avoid env being set multiple times
-		toSkip := append(cephv1.VaultTLSConnectionDetails, api.EnvVaultToken, vault.AuthKubernetesRole)
-		if sets.NewString(toSkip...).Has(k) {
+		if spec.Security.KeyManagementService.IsVaultKMS() {
+			// Skip TLS and token env var to avoid env being set multiple times
+			toSkip := append(cephv1.VaultTLSConnectionDetails, api.EnvVaultToken)
+			if sets.NewString(toSkip...).Has(k) {
+				continue
+			}
+		}
+		if spec.Security.KeyManagementService.IsKMIPKMS() {
+			// required KMIP env vars are already set above.
 			continue
 		}
-		// We need to apply the osd role to VAULT_AUTH_KUBERNETES_ROLE
-		// This is only called from the Operator but will run inside the prepare job so it's ok to
-		// force the vault osd role
-		if k == RookOSDVaultAuthKubernetesRole {
-			envs = append(envs, v1.EnvVar{Name: vault.AuthKubernetesRole, Value: v})
-		} else {
-			envs = append(envs, v1.EnvVar{Name: k, Value: v})
+
+		envs = append(envs, v1.EnvVar{Name: k, Value: v})
+	}
+
+	if spec.Security.KeyManagementService.IsVaultKMS() {
+		// Add the VAULT_TOKEN
+		if spec.Security.KeyManagementService.IsTokenAuthEnabled() {
+			envs = append(envs, vaultTokenEnvVarFromSecret(spec.Security.KeyManagementService.TokenSecretName))
 		}
-	}
 
-	// Add the VAULT_TOKEN
-	if spec.Security.KeyManagementService.IsTokenAuthEnabled() {
-		envs = append(envs, vaultTokenEnvVarFromSecret(spec.Security.KeyManagementService.TokenSecretName))
+		// Add TLS env if any
+		envs = append(envs, vaultTLSEnvVarFromSecret(spec.Security.KeyManagementService.ConnectionDetails)...)
 	}
-
-	// Add TLS env if any
-	envs = append(envs, vaultTLSEnvVarFromSecret(spec.Security.KeyManagementService.ConnectionDetails)...)
 
 	logger.Debugf("kms envs are %v", envs)
 
@@ -101,14 +142,19 @@ func VaultConfigToEnvVar(spec cephv1.ClusterSpec) []v1.EnvVar {
 	return sortV1EnvVar(envs)
 }
 
-// ConfigEnvsToMapString returns all the env variables in map from a known KMS
+// ConfigEnvsToMapString returns all the env variables in a map from a known KMS
 func ConfigEnvsToMapString() map[string]string {
 	envs := make(map[string]string)
 	for _, e := range os.Environ() {
 		pair := strings.SplitN(e, "=", 2)
 		for _, knownKMS := range knownKMSPrefix {
 			if strings.HasPrefix(pair[0], knownKMS) || pair[0] == Provider {
-				envs[pair[0]] = os.Getenv(pair[0])
+				logger.Debugf("adding env %q", pair[0])
+				if knownKMS == kmipKMSPrefix {
+					envs[strings.TrimPrefix(pair[0], knownKMS)] = os.Getenv(pair[0])
+				} else {
+					envs[pair[0]] = os.Getenv(pair[0])
+				}
 			}
 		}
 	}
@@ -118,8 +164,10 @@ func ConfigEnvsToMapString() map[string]string {
 
 // sortV1EnvVar sorts a list of v1.EnvVar
 func sortV1EnvVar(envs []v1.EnvVar) []v1.EnvVar {
-	sort.SliceStable(envs, func(i, j int) bool {
-		return envs[i].Name < envs[j].Name
+	// ConfigToEnvVar ensures that environment variable names are unique, so a
+	// stable sort is not required.
+	slices.SortFunc(envs, func(a, b v1.EnvVar) int {
+		return strings.Compare(a.Name, b.Name)
 	})
 
 	return envs

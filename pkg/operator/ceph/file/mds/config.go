@@ -21,8 +21,11 @@ import (
 	"strconv"
 
 	"github.com/pkg/errors"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/util/log"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -41,26 +44,36 @@ func (c *Cluster) generateKeyring(m *mdsConfig) (string, error) {
 	user := fmt.Sprintf("mds.%s", m.DaemonID)
 	access := []string{"osd", "allow *", "mds", "allow", "mon", "allow profile mds"}
 
-	// At present
 	s := keyring.GetSecretStore(c.context, c.clusterInfo, c.ownerInfo)
 
-	key, err := s.GenerateKey(user, access)
+	keyType := cephv1.CephxKeyTypeUndefined // daemon key type always takes the default from setDefaultCephxKeyType()
+	key, err := s.GenerateKey(user, keyType, access)
 	if err != nil {
 		return "", err
+	}
+
+	if c.shouldRotateCephxKeys {
+		log.NamedInfo(opcontroller.NsName(c.fs.Namespace, c.fs.Name), logger, "rotating cephx key for CephFileSystem")
+		newKey, err := s.RotateKey(user, keyType)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to rotate cephx key for CephFileSystem %q", m.ResourceName)
+		} else {
+			key = newKey
+		}
 	}
 
 	// Delete legacy key store for upgrade from Rook v0.9.x to v1.0.x
 	err = c.context.Clientset.CoreV1().Secrets(c.fs.Namespace).Delete(c.clusterInfo.Context, m.ResourceName, metav1.DeleteOptions{})
 	if err != nil {
 		if kerrors.IsNotFound(err) {
-			logger.Debugf("legacy mds key %s is already removed", m.ResourceName)
+			log.NamedDebug(opcontroller.NsName(c.fs.Namespace, c.fs.Name), logger, "legacy mds key %s is already removed", m.ResourceName)
 		} else {
-			logger.Warningf("legacy mds key %q could not be removed. %v", m.ResourceName, err)
+			log.NamedWarning(opcontroller.NsName(c.fs.Namespace, c.fs.Name), logger, "legacy mds key %q could not be removed. %v", m.ResourceName, err)
 		}
 	}
 
 	keyring := fmt.Sprintf(keyringTemplate, m.DaemonID, key)
-	return keyring, s.CreateOrUpdate(m.ResourceName, keyring)
+	return s.CreateOrUpdate(m.ResourceName, keyring)
 }
 
 func (c *Cluster) setDefaultFlagsMonConfigStore(mdsID string) error {
@@ -70,17 +83,25 @@ func (c *Cluster) setDefaultFlagsMonConfigStore(mdsID string) error {
 
 	// Set mds cache memory limit to the best appropriate value
 	if !c.fs.Spec.MetadataServer.Resources.Limits.Memory().IsZero() {
-		mdsCacheMemoryLimit := float64(c.fs.Spec.MetadataServer.Resources.Limits.Memory().Value()) * mdsCacheMemoryLimitFactor
+		// Use configured factor or fall back to default
+		limitFactor := mdsCacheMemoryLimitFactor
+		if c.fs.Spec.MetadataServer.CacheMemoryLimitFactor != nil {
+			limitFactor = *c.fs.Spec.MetadataServer.CacheMemoryLimitFactor
+		}
+		mdsCacheMemoryLimit := float64(c.fs.Spec.MetadataServer.Resources.Limits.Memory().Value()) * limitFactor
 		configOptions["mds_cache_memory_limit"] = strconv.Itoa(int(mdsCacheMemoryLimit))
 	} else if !c.fs.Spec.MetadataServer.Resources.Requests.Memory().IsZero() {
-		mdsCacheMemoryRequest := float64(c.fs.Spec.MetadataServer.Resources.Requests.Memory().Value()) * mdsCacheMemoryResourceFactor
+		// Use configured factor or fall back to default
+		requestFactor := mdsCacheMemoryRequestFactor
+		if c.fs.Spec.MetadataServer.CacheMemoryRequestFactor != nil {
+			requestFactor = *c.fs.Spec.MetadataServer.CacheMemoryRequestFactor
+		}
+		mdsCacheMemoryRequest := float64(c.fs.Spec.MetadataServer.Resources.Requests.Memory().Value()) * requestFactor
 		configOptions["mds_cache_memory_limit"] = strconv.Itoa(int(mdsCacheMemoryRequest))
 	}
 
-	// Set mds_join_fs flag to force mds daemon to join a specific fs
-	if c.clusterInfo.CephVersion.IsAtLeastOctopus() {
-		configOptions["mds_join_fs"] = c.fs.Name
-	}
+	// Set the mds_join_fs flag to force the mds daemon to join a specific fs
+	configOptions["mds_join_fs"] = c.fs.Name
 
 	for flag, val := range configOptions {
 		err := monStore.Set(who, flag, val)

@@ -18,7 +18,7 @@ package kms
 
 import (
 	"context"
-	"io/ioutil"
+	"maps"
 	"os"
 	"strings"
 
@@ -36,27 +36,19 @@ const (
 	EtcVaultDir = "/etc/vault"
 	// VaultSecretEngineKey is the type of secret engine used (kv, transit)
 	VaultSecretEngineKey = "VAULT_SECRET_ENGINE"
-	// RookOperatorVaultAuthKubernetesRole is the internal Rook mapping of the Vault role that maps
-	// operator's service account and namespace to the Vault policy that allows them to read the
-	// secrets
-	RookOperatorVaultAuthKubernetesRole = "VAULT_AUTH_KUBERNETES_ROOK_OPERATOR_ROLE"
-	// RookOSDVaultAuthKubernetesRole is the internal Rook mapping of the Vault role that maps OSD's
-	// service account and namespace to the Vault policy that allows them to read the secrets
-	RookOSDVaultAuthKubernetesRole = "VAULT_AUTH_KUBERNETES_ROOK_OSD_ROLE"
+	// VaultTransitBackendPathKey is the mount path of the transit secret engine used by RGW SSE-S3 and SSE-KMS
+	VaultTransitBackendPathKey = "VAULT_TRANSIT_BACKEND_PATH"
 	// VaultKVSecretEngineKey is a kv secret engine type
 	VaultKVSecretEngineKey = "kv"
 	// VaultTransitSecretEngineKey is a transit secret engine type
 	VaultTransitSecretEngineKey = "transit"
 )
 
-var (
-	vaultMandatoryConnectionDetails              = []string{api.EnvVaultAddress}
-	vaultK8sAuthMethodMandatoryConnectionDetails = []string{RookOperatorVaultAuthKubernetesRole, RookOSDVaultAuthKubernetesRole}
-)
+var vaultMandatoryConnectionDetails = []string{api.EnvVaultAddress}
 
-// Used for unit tests mocking too as well as production code
+// Used for unit test mocking as well as production code
 var (
-	createTmpFile      = ioutil.TempFile
+	createTmpFile      = os.CreateTemp
 	getRemoveCertFiles = getRemoveCertFilesFunc
 )
 
@@ -83,18 +75,16 @@ type removeCertFilesFunction func()
 */
 
 // InitVault inits the secret store
-func InitVault(context *clusterd.Context, namespace string, config map[string]string) (secrets.Secrets, error) {
-	c := make(map[string]interface{})
+func InitVault(ctx context.Context, context *clusterd.Context, namespace string, config map[string]string) (secrets.Secrets, error) {
+	c := make(map[string]any)
 
 	// So that we don't alter the content of c.config for later iterations
 	// We just want to swap the name of the TLS config secret name --> file name for the kms lib
 	oriConfig := make(map[string]string)
-	for k, v := range config {
-		oriConfig[k] = v
-	}
+	maps.Copy(oriConfig, config)
 
 	// Populate TLS config
-	newConfigWithTLS, removeCertFiles, err := configTLS(context, namespace, oriConfig)
+	newConfigWithTLS, removeCertFiles, err := configTLS(ctx, context, namespace, oriConfig)
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to initialize vault tls configuration")
 	}
@@ -114,13 +104,12 @@ func InitVault(context *clusterd.Context, namespace string, config map[string]st
 	return v, nil
 }
 
-// configTLS returns a map of TLS config that map physical files for the TLS library to load
+// configTLS returns a map of TLS config that maps physical files for the TLS library to load
 // Also it returns a function to remove the temporary files (certs, keys)
-// The signature has named result parameters to help building 'defer' statements especially for the
+// The signature has named result parameters to help build 'defer' statements especially for the
 // content of removeCertFiles which needs to be populated by the files to remove if no errors and be
 // nil on errors
-func configTLS(clusterdContext *clusterd.Context, namespace string, config map[string]string) (newConfig map[string]string, removeCertFiles removeCertFilesFunction, retErr error) {
-	ctx := context.TODO()
+func configTLS(ctx context.Context, clusterdContext *clusterd.Context, namespace string, config map[string]string) (newConfig map[string]string, removeCertFiles removeCertFilesFunction, retErr error) {
 	var filesToRemove []*os.File
 
 	defer func() {
@@ -157,7 +146,7 @@ func configTLS(clusterdContext *clusterd.Context, namespace string, config map[s
 			}
 
 			// Write into a file
-			err = ioutil.WriteFile(file.Name(), secret.Data[tlsSecretKeyToCheck(tlsOption)], 0444)
+			err = os.WriteFile(file.Name(), secret.Data[tlsSecretKeyToCheck(tlsOption)], 0o400)
 			if err != nil {
 				return nil, removeCertFiles, errors.Wrapf(err, "failed to write k8s secret %q content to a file", tlsSecretName)
 			}
@@ -196,51 +185,7 @@ func getRemoveCertFilesFunc(filesToRemove []*os.File) removeCertFilesFunction {
 	})
 }
 
-func put(v secrets.Secrets, secretName, secretValue string, keyContext map[string]string) error {
-	// First we must see if the key entry already exists, if it does we do nothing
-	key, err := get(v, secretName, keyContext)
-	if err != nil && err != secrets.ErrInvalidSecretId {
-		return errors.Wrapf(err, "failed to get secret %q in vault", secretName)
-	}
-	if key != "" {
-		logger.Debugf("key %q already exists in vault!", secretName)
-		return nil
-	}
-
-	// Build Secret
-	data := make(map[string]interface{})
-	data[secretName] = secretValue
-
-	// #nosec G104 Write the encryption key in Vault
-	err = v.PutSecret(secretName, data, keyContext)
-	if err != nil {
-		return errors.Wrapf(err, "failed to put secret %q in vault", secretName)
-	}
-
-	return nil
-}
-
-func get(v secrets.Secrets, secretName string, keyContext map[string]string) (string, error) {
-	// #nosec G104 Write the encryption key in Vault
-	s, err := v.GetSecret(secretName, keyContext)
-	if err != nil {
-		return "", err
-	}
-
-	return s[secretName].(string), nil
-}
-
-func delete(v secrets.Secrets, secretName string, keyContext map[string]string) error {
-	// #nosec G104 Write the encryption key in Vault
-	err := v.DeleteSecret(secretName, keyContext)
-	if err != nil {
-		return errors.Wrapf(err, "failed to delete secret %q in vault", secretName)
-	}
-
-	return nil
-}
-
-func buildKeyContext(config map[string]string) map[string]string {
+func buildVaultKeyContext(config map[string]string) map[string]string {
 	// Key context is just the Vault namespace, available in the enterprise version only
 	keyContext := map[string]string{secrets.KeyVaultNamespace: config[api.EnvVaultNamespace]}
 	vaultNamespace, ok := config[api.EnvVaultNamespace]
@@ -253,37 +198,17 @@ func buildKeyContext(config map[string]string) map[string]string {
 
 // IsVault determines whether the configured KMS is Vault
 func (c *Config) IsVault() bool {
-	return c.Provider == "vault"
+	return c.Provider == secrets.TypeVault
 }
 
-func validateVaultConnectionDetails(clusterdContext *clusterd.Context, ns string, kmsConfig map[string]string) error {
-	ctx := context.TODO()
-	// If Kubernetes authentication is enabled, let's merge into mandatory details
-	isK8sAuthEnabled := GetParam(kmsConfig, vault.AuthMethod) == vault.AuthMethodKubernetes
-	if isK8sAuthEnabled {
-		vaultMandatoryConnectionDetails = append(vaultMandatoryConnectionDetails, vaultK8sAuthMethodMandatoryConnectionDetails...)
-	}
+func validateVaultConnectionDetails(ctx context.Context, clusterdContext *clusterd.Context, ns string, kmsConfig map[string]string) error {
 	for _, option := range vaultMandatoryConnectionDetails {
 		if GetParam(kmsConfig, option) == "" {
 			return errors.Errorf("failed to find connection details %q", option)
 		}
 	}
 
-	// When validating the connection details, we need to give a value to VAULT_AUTH_KUBERNETES_ROLE
-	// with the role we are currently running on. If we run from the operator we must use
-	// VAULT_AUTH_KUBERNETES_ROLE to VAULT_AUTH_KUBERNETES_ROOK_OSD_ROLE
-	// The CLI does not use the env var so VAULT_AUTH_KUBERNETES_ROLE is incorrect since it's
-	// setting the operator role.
-	if isK8sAuthEnabled {
-		// If ROOK_CRUSHMAP_ROOT is empty we are most likely running from the operator
-		if os.Getenv("ROOK_CRUSHMAP_ROOT") == "" {
-			kmsConfig[vault.AuthKubernetesRole] = kmsConfig[RookOperatorVaultAuthKubernetesRole]
-		} else {
-			kmsConfig[vault.AuthKubernetesRole] = kmsConfig[RookOSDVaultAuthKubernetesRole]
-		}
-	}
-
-	// We do not support a directory with multiple CA since we fetch a k8s Secret and read its content
+	// We do not support a directory with multiple CAs since we fetch a k8s Secret and read its content
 	// So we operate with a single CA only
 	if GetParam(kmsConfig, api.EnvVaultCAPath) != "" {
 		return errors.Errorf("failed to validate TLS connection details. %q is not supported. use %q instead", api.EnvVaultCAPath, api.EnvVaultCACert)
@@ -296,7 +221,7 @@ func validateVaultConnectionDetails(clusterdContext *clusterd.Context, ns string
 			// Fetch the secret
 			s, err := clusterdContext.Clientset.CoreV1().Secrets(ns).Get(ctx, tlsSecretName, v1.GetOptions{})
 			if err != nil {
-				return errors.Errorf("failed to find TLS connection details k8s secret %q", tlsSecretName)
+				return errors.Wrapf(err, "failed to find TLS connection details k8s secret %q", tlsSecretName)
 			}
 
 			// Check the Secret key and its content
@@ -312,11 +237,12 @@ func validateVaultConnectionDetails(clusterdContext *clusterd.Context, ns string
 }
 
 func tlsSecretKeyToCheck(tlsOption string) string {
-	if tlsOption == api.EnvVaultCACert || tlsOption == api.EnvVaultClientCert {
+	switch tlsOption {
+	case api.EnvVaultCACert, api.EnvVaultClientCert:
 		return vaultCACertSecretKeyName
-	} else if tlsOption == api.EnvVaultClientKey {
+	case api.EnvVaultClientKey:
 		return vaultKeySecretKeyName
+	default:
+		return ""
 	}
-
-	return ""
 }

@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,10 +19,10 @@ limitations under the License.
 package v1
 
 import (
-	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/tools/cache"
+	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	labels "k8s.io/apimachinery/pkg/labels"
+	listers "k8s.io/client-go/listers"
+	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephRBDMirrorLister helps list CephRBDMirrors.
@@ -30,7 +30,7 @@ import (
 type CephRBDMirrorLister interface {
 	// List lists all CephRBDMirrors in the indexer.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CephRBDMirror, err error)
+	List(selector labels.Selector) (ret []*cephrookiov1.CephRBDMirror, err error)
 	// CephRBDMirrors returns an object that can list and get CephRBDMirrors.
 	CephRBDMirrors(namespace string) CephRBDMirrorNamespaceLister
 	CephRBDMirrorListerExpansion
@@ -38,25 +38,17 @@ type CephRBDMirrorLister interface {
 
 // cephRBDMirrorLister implements the CephRBDMirrorLister interface.
 type cephRBDMirrorLister struct {
-	indexer cache.Indexer
+	listers.ResourceIndexer[*cephrookiov1.CephRBDMirror]
 }
 
 // NewCephRBDMirrorLister returns a new CephRBDMirrorLister.
 func NewCephRBDMirrorLister(indexer cache.Indexer) CephRBDMirrorLister {
-	return &cephRBDMirrorLister{indexer: indexer}
-}
-
-// List lists all CephRBDMirrors in the indexer.
-func (s *cephRBDMirrorLister) List(selector labels.Selector) (ret []*v1.CephRBDMirror, err error) {
-	err = cache.ListAll(s.indexer, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CephRBDMirror))
-	})
-	return ret, err
+	return &cephRBDMirrorLister{listers.New[*cephrookiov1.CephRBDMirror](indexer, cephrookiov1.Resource("cephrbdmirror"))}
 }
 
 // CephRBDMirrors returns an object that can list and get CephRBDMirrors.
 func (s *cephRBDMirrorLister) CephRBDMirrors(namespace string) CephRBDMirrorNamespaceLister {
-	return cephRBDMirrorNamespaceLister{indexer: s.indexer, namespace: namespace}
+	return cephRBDMirrorNamespaceLister{listers.NewNamespaced[*cephrookiov1.CephRBDMirror](s.ResourceIndexer, namespace)}
 }
 
 // CephRBDMirrorNamespaceLister helps list and get CephRBDMirrors.
@@ -64,36 +56,15 @@ func (s *cephRBDMirrorLister) CephRBDMirrors(namespace string) CephRBDMirrorName
 type CephRBDMirrorNamespaceLister interface {
 	// List lists all CephRBDMirrors in the indexer for a given namespace.
 	// Objects returned here must be treated as read-only.
-	List(selector labels.Selector) (ret []*v1.CephRBDMirror, err error)
+	List(selector labels.Selector) (ret []*cephrookiov1.CephRBDMirror, err error)
 	// Get retrieves the CephRBDMirror from the indexer for a given namespace and name.
 	// Objects returned here must be treated as read-only.
-	Get(name string) (*v1.CephRBDMirror, error)
+	Get(name string) (*cephrookiov1.CephRBDMirror, error)
 	CephRBDMirrorNamespaceListerExpansion
 }
 
 // cephRBDMirrorNamespaceLister implements the CephRBDMirrorNamespaceLister
 // interface.
 type cephRBDMirrorNamespaceLister struct {
-	indexer   cache.Indexer
-	namespace string
-}
-
-// List lists all CephRBDMirrors in the indexer for a given namespace.
-func (s cephRBDMirrorNamespaceLister) List(selector labels.Selector) (ret []*v1.CephRBDMirror, err error) {
-	err = cache.ListAllByNamespace(s.indexer, s.namespace, selector, func(m interface{}) {
-		ret = append(ret, m.(*v1.CephRBDMirror))
-	})
-	return ret, err
-}
-
-// Get retrieves the CephRBDMirror from the indexer for a given namespace and name.
-func (s cephRBDMirrorNamespaceLister) Get(name string) (*v1.CephRBDMirror, error) {
-	obj, exists, err := s.indexer.GetByKey(s.namespace + "/" + name)
-	if err != nil {
-		return nil, err
-	}
-	if !exists {
-		return nil, errors.NewNotFound(v1.Resource("cephrbdmirror"), name)
-	}
-	return obj.(*v1.CephRBDMirror), nil
+	listers.ResourceIndexer[*cephrookiov1.CephRBDMirror]
 }

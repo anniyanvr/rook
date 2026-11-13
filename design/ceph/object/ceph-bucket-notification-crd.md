@@ -24,23 +24,28 @@ kind: CephBucketTopic
 metadata:
   name: # name of the topic
   namespace: # namespace where topic belongs
-Spec:
-  endpoint: #(mandatory) URI of an endpoint to send push notification to
+spec:
   opaqueData: #(optional) opaque data is set in the topic configuration
   persistent: false #(optional) indication whether notifications to this endpoint are persistent or not (`false` by default)
-  # Endpoint specific parameters
-  http:
-    verifySSL: true #indicate whether the server certificate is validated by the client or not (`true` by default)
-  amqp:
-    ackLevel: broker # none/routable/broker, optional (default - broker)
-    amqpExchange: direct # exchanges must exist and be able to route messages based on topics
-  kafka:
-    useSSL: true # secure connection will be used for connecting with the broker (`false` by default)
-    caLocation: <filepath in rgw pod> # this specified CA will be used, instead of the default one, to authenticate the broker
-    ackLevel: broker # none/broker, optional (default - broker)
+  endpoint: #(mandatory) must contain exactly one of the following options
+    http:
+      uri: #(mandatory) URI of an endpoint to send push notification to
+      disableVerifySSL: false #(optional) indicate whether the server certificate is validated by the client or not (`false` by default)
+    amqp:
+      uri: #(mandatory) URI of an endpoint to send push notification to
+      disableVerifySSL: false #(optional) indicate whether the server certificate is validated by the client or not (`false` by default)
+      caLocation: <filepath in rgw pod> #(optional) this specified CA will be used, instead of the default one, to authenticate the broker
+      ackLevel: broker #(optional) none/routable/broker, optional (default - broker)
+      amqpExchange: direct #(mandatory) exchanges must exist and be able to route messages based on topics
+    kafka:
+      uri: #(mandatory) URI of an endpoint to send push notification to
+      disableVerifySSL: false #(optional) indicate whether the server certificate is validated by the client or not (`false` by default)
+      useSSL: true #(optional) secure connection will be used for connecting with the broker (`false` by default)
+      caLocation: <filepath in rgw pod> #(optional) this specified CA will be used, instead of the default one, to authenticate the broker
+      ackLevel: broker #(optional) none/broker, optional (default - broker)
 ```
-P.S : Endpoint can be of different format depends on the server
-- http -> `http[s]://<fqdn>[:<port]`
+P.S : URI can be of different format depends on the server
+- http -> `http[s]://<fqdn>[:<port][/resource]`
 - amqp -> `amqp://[<user>:<password>@]<fqdn>[:<port>][/<vhost>]`
 - kafka -> `kafka://[<user>:<password>@]<fqdn>[:<port]`
 
@@ -52,12 +57,9 @@ kind: CephBucketNotification
 metadata:
   name: # name of the notification
   namespace: # namespace where notification belongs
-Spec:
+spec:
   topic: #(mandatory) reference to the topic, topic_arn
-  filter: #(optional) Prefix/Suffix/Regex/Metadata/Tags, optional (default - {})
-    metadata:
-    - name: x-amz-meta-color
-      value: blue
+  filter: #(optional) Prefix/Suffix/Regex, optional (default - {})
     stringMatch:
     - name: prefix
       value: hello
@@ -66,7 +68,7 @@ Spec:
     - name: regex
       value: [a-z]*
 
-  events: # applicable values [here](https://docs.ceph.com/en/latest/radosgw/s3-notification-compatibility/#event-types), (default all)
+  events: # applicable values [here](https://docs.ceph.com/en/latest/radosgw/s3-notification-compatibility/#event-types); if omitted, only object create and remove events are configured
 ```
 The information about bucket notification can passed to OBC/BAR(from [COSI](https://github.com/kubernetes/enhancements/tree/master/keps/sig-storage/1979-object-storage-support)) as labels. It can be set using `kubectl` commands, so the name of bucket notifications need to satisfy the [label syntax](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#syntax-and-character-set). For OBC it will look like the following:
 

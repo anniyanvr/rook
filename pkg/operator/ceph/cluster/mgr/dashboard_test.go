@@ -17,6 +17,15 @@ package mgr
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
+	"syscall"
 	"testing"
 	"time"
 
@@ -29,28 +38,30 @@ import (
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	v1 "k8s.io/api/core/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	kexec "k8s.io/client-go/util/exec"
 )
 
 func TestGeneratePassword(t *testing.T) {
-	password, err := GeneratePassword(0)
+	password, err := GeneratePassword(0, DefaultKey)
 	require.Nil(t, err)
 	assert.Equal(t, "", password)
 
-	password, err = GeneratePassword(1)
+	password, err = GeneratePassword(1, DefaultKey)
 	require.Nil(t, err)
 	assert.Equal(t, 1, len(password))
 	logger.Infof("password: %s", password)
 
-	password, err = GeneratePassword(10)
+	password, err = GeneratePassword(10, DefaultKey)
 	require.Nil(t, err)
 	assert.Equal(t, 10, len(password))
 	logger.Infof("password: %s", password)
 }
 
 func TestGetOrGeneratePassword(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	clientset := test.New(t, 3)
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
 	clusterInfo := &cephclient.ClusterInfo{Namespace: "myns", OwnerInfo: ownerInfo}
@@ -77,7 +88,7 @@ func TestGetOrGeneratePassword(t *testing.T) {
 }
 
 func TestStartSecureDashboard(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	enables := 0
 	disables := 0
 	moduleRetries := 0
@@ -87,9 +98,10 @@ func TestStartSecureDashboard(t *testing.T) {
 		logger.Infof("command: %s %v", command, args)
 		exitCodeResponse = 0
 		if args[1] == "module" {
-			if args[2] == "enable" {
+			switch args[2] {
+			case "enable":
 				enables++
-			} else if args[2] == "disable" {
+			case "disable":
 				disables++
 			}
 		}
@@ -113,13 +125,14 @@ func TestStartSecureDashboard(t *testing.T) {
 	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
 	clusterInfo := &cephclient.ClusterInfo{
 		Namespace:   "myns",
-		CephVersion: cephver.Octopus,
+		CephVersion: cephver.Squid,
 		OwnerInfo:   ownerInfo,
 		Context:     ctx,
 	}
-	c := &Cluster{clusterInfo: clusterInfo, context: &clusterd.Context{Clientset: clientset, Executor: executor},
+	c := &Cluster{
+		clusterInfo: clusterInfo, context: &clusterd.Context{Clientset: clientset, Executor: executor},
 		spec: cephv1.ClusterSpec{
-			Dashboard:   cephv1.DashboardSpec{Port: dashboardPortHTTP, Enabled: true, SSL: true},
+			Dashboard:   cephv1.DashboardSpec{Port: 443, Enabled: true, SSL: true},
 			CephVersion: cephv1.CephVersionSpec{Image: "quay.io/ceph/ceph:v15"},
 		},
 	}
@@ -131,7 +144,7 @@ func TestStartSecureDashboard(t *testing.T) {
 	}
 
 	dashboardInitWaitTime = 0
-	err := c.configureDashboardService("a")
+	err := c.configureDashboardService()
 	assert.NoError(t, err)
 	err = c.configureDashboardModules()
 	assert.NoError(t, err)
@@ -143,10 +156,12 @@ func TestStartSecureDashboard(t *testing.T) {
 	svc, err := c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
 	assert.Nil(t, err)
 	assert.NotNil(t, svc)
+	assert.Equal(t, 443, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].TargetPort.IntVal))
 
 	// disable the dashboard
 	c.spec.Dashboard.Enabled = false
-	err = c.configureDashboardService("a")
+	err = c.configureDashboardService()
 	assert.Nil(t, err)
 	err = c.configureDashboardModules()
 	assert.NoError(t, err)
@@ -156,26 +171,494 @@ func TestStartSecureDashboard(t *testing.T) {
 	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
 	assert.NotNil(t, err)
 	assert.True(t, kerrors.IsNotFound(err))
-	assert.Nil(t, svc)
+	assert.Equal(t, svc, &v1.Service{})
+
+	// Set the port to something over 1024 and confirm the port and targetPort are the same
+	c.spec.Dashboard.Enabled = true
+	c.spec.Dashboard.Port = 1025
+	err = c.configureDashboardService()
+	assert.Nil(t, err)
+
+	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.NotNil(t, svc)
+	assert.Equal(t, 1025, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 1025, int(svc.Spec.Ports[0].TargetPort.IntVal))
+
+	// Set the port to exactly 1024 (the lowest non-privileged port) and confirm the port and targetPort are the same
+	c.spec.Dashboard.Enabled = true
+	c.spec.Dashboard.Port = 1024
+	err = c.configureDashboardService()
+	assert.Nil(t, err)
+
+	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.NotNil(t, svc)
+	assert.Equal(t, 1024, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 1024, int(svc.Spec.Ports[0].TargetPort.IntVal))
+
+	// Fall back to the default port
+	c.spec.Dashboard.Enabled = true
+	c.spec.Dashboard.Port = 0
+	err = c.configureDashboardService()
+	assert.Nil(t, err)
+
+	svc, err = c.context.Clientset.CoreV1().Services(clusterInfo.Namespace).Get(ctx, "rook-ceph-mgr-dashboard", metav1.GetOptions{})
+	assert.Nil(t, err)
+	assert.NotNil(t, svc)
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].Port))
+	assert.Equal(t, 8443, int(svc.Spec.Ports[0].TargetPort.IntVal))
 }
 
-func TestFileBasedPasswordSupported(t *testing.T) {
-	clusterInfo := &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 9}}
-	value := FileBasedPasswordSupported(clusterInfo)
-	assert.False(t, value)
+func TestCreateSelfSignedCertRetriesWrappedDeadlineExceeded(t *testing.T) {
+	ctx := t.Context()
+	clientset := test.New(t, 3)
+	attempts := 0
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			if arg[0] == "config-key" && arg[1] == "get" {
+				return "", dashboardConfigKeyNotFoundErr()
+			}
+			if arg[0] == "dashboard" && arg[1] == "create-self-signed-cert" {
+				attempts++
+				if attempts < 3 {
+					return "", errors.Wrap(context.DeadlineExceeded, "test timeout")
+				}
+			}
+			return "", nil
+		},
+	}
 
-	// for Ceph version Octopus 15.2.10
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 15, Minor: 2, Extra: 10}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	ownerInfo := cephclient.NewMinimumOwnerInfoWithOwnerRef()
+	clusterInfo := &cephclient.ClusterInfo{
+		Namespace: "myns",
+		OwnerInfo: ownerInfo,
+		Context:   ctx,
+	}
+	c := &Cluster{
+		clusterInfo: clusterInfo,
+		context:     &clusterd.Context{Clientset: clientset, Executor: executor},
+	}
 
-	// for Ceph version Pacific
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 16, Minor: 0, Extra: 0}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+	alreadyCreated, err := c.createSelfSignedCert(false)
+	assert.NoError(t, err)
+	assert.False(t, alreadyCreated)
+	assert.Equal(t, 3, attempts)
+}
 
-	// for Ceph version Quincy
-	clusterInfo = &cephclient.ClusterInfo{CephVersion: cephver.CephVersion{Major: 17, Minor: 0, Extra: 0}}
-	value = FileBasedPasswordSupported(clusterInfo)
-	assert.True(t, value)
+func TestCreateSelfSignedCertWithEmptyCertKey(t *testing.T) {
+	ctx := context.TODO()
+	attempts := 0
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			if arg[0] == "config-key" && arg[1] == "get" {
+				return "", nil
+			}
+			if arg[0] == "dashboard" && arg[1] == "create-self-signed-cert" {
+				attempts++
+				return "", nil
+			}
+			return "", nil
+		},
+	}
+
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+		context:     &clusterd.Context{Executor: executor},
+	}
+
+	alreadyCreated, err := c.createSelfSignedCert(false)
+	assert.NoError(t, err)
+	assert.False(t, alreadyCreated)
+	assert.Equal(t, 1, attempts)
+}
+
+func TestGetDashboardTLSRefReturnsUnexpectedError(t *testing.T) {
+	ctx := context.TODO()
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			return "", errors.New("mon quorum unavailable")
+		},
+	}
+
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+		context:     &clusterd.Context{Executor: executor},
+	}
+
+	ref, err := c.getDashboardTLSRef()
+	assert.ErrorContains(t, err, "mon quorum unavailable")
+	assert.Empty(t, ref)
+}
+
+func TestConfigureCustomSSLCertificate(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 3)
+	cert, key := generateDashboardTestCert(t, "rsa")
+	_, err := clientset.CoreV1().Secrets("myns").Create(ctx, &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dashboard-cert",
+			Namespace: "myns",
+		},
+		Type: v1.SecretTypeTLS,
+		Data: map[string][]byte{
+			v1.TLSCertKey:       cert,
+			v1.TLSPrivateKeyKey: key,
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	setCert := false
+	setKey := false
+	setRef := false
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			if arg[0] == "config-key" && arg[1] == "get" {
+				return "", dashboardConfigKeyNotFoundErr()
+			}
+			if arg[0] == "dashboard" && arg[1] == "create-self-signed-cert" {
+				t.Fatal("expected custom certificate, not self-signed certificate")
+			}
+			return "", nil
+		},
+		MockExecuteCommandWithStdin: func(timeout time.Duration, command string, stdin *string, arg ...string) error {
+			if arg[0] == "config-key" && arg[1] == "set" && arg[2] == dashboardTLSRefKey {
+				setRef = true
+				return nil
+			}
+			if arg[0] == "config-key" && arg[1] == "set" && arg[2] == "mgr/dashboard/crt" {
+				setCert = true
+				return nil
+			}
+			if arg[0] == "config-key" && arg[1] == "set" && arg[2] == "mgr/dashboard/key" {
+				setKey = true
+				return nil
+			}
+			return nil
+		},
+	}
+
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{
+			Namespace: "myns",
+			Context:   ctx,
+		},
+		context: &clusterd.Context{Clientset: clientset, Executor: executor},
+		spec: cephv1.ClusterSpec{
+			Dashboard: cephv1.DashboardSpec{SSL: true, SSLCertificateRef: "dashboard-cert"},
+		},
+	}
+
+	alreadyCreated, err := c.configureSSLCertificate()
+	assert.NoError(t, err)
+	assert.False(t, alreadyCreated)
+	assert.True(t, setCert)
+	assert.True(t, setKey)
+	assert.True(t, setRef)
+}
+
+func TestConfigureCustomSSLCertificateAlreadyConfigured(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 3)
+	cert, key := generateDashboardTestCert(t, "rsa")
+	_, err := clientset.CoreV1().Secrets("myns").Create(ctx, &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dashboard-cert",
+			Namespace: "myns",
+		},
+		Type: v1.SecretTypeTLS,
+		Data: map[string][]byte{
+			v1.TLSCertKey:       cert,
+			v1.TLSPrivateKeyKey: key,
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			if arg[0] == "config-key" && arg[1] == "get" && arg[2] == "mgr/dashboard/crt" {
+				return string(cert), nil
+			}
+			if arg[0] == "config-key" && arg[1] == "get" && arg[2] == "mgr/dashboard/key" {
+				return string(key), nil
+			}
+			if arg[0] == "config-key" && arg[1] == "get" && arg[2] == dashboardTLSRefKey {
+				return "dashboard-cert", nil
+			}
+			if arg[0] == "dashboard" {
+				t.Fatal("expected no dashboard certificate update when cert and key already match")
+			}
+			return "", nil
+		},
+	}
+
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+		context:     &clusterd.Context{Clientset: clientset, Executor: executor},
+		spec: cephv1.ClusterSpec{
+			Dashboard: cephv1.DashboardSpec{SSL: true, SSLCertificateRef: "dashboard-cert"},
+		},
+	}
+
+	alreadyCreated, err := c.configureSSLCertificate()
+	assert.NoError(t, err)
+	assert.True(t, alreadyCreated)
+}
+
+func TestConfigureSSLCertificateRevertsToSelfSignedWhenReferenceRemoved(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 3)
+	createdSelfSigned := false
+	removedRef := false
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			if arg[0] == "config-key" && arg[1] == "get" && arg[2] == dashboardTLSRefKey {
+				return "dashboard-cert", nil
+			}
+			if arg[0] == "config-key" && arg[1] == "get" && arg[2] == "mgr/dashboard/crt" {
+				return "custom cert", nil
+			}
+			if arg[0] == "dashboard" && arg[1] == "create-self-signed-cert" {
+				createdSelfSigned = true
+				return "", nil
+			}
+			if arg[0] == "config-key" && arg[1] == "rm" && arg[2] == dashboardTLSRefKey {
+				removedRef = true
+				return "", nil
+			}
+			return "", nil
+		},
+	}
+
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+		context:     &clusterd.Context{Clientset: clientset, Executor: executor},
+		spec: cephv1.ClusterSpec{
+			Dashboard: cephv1.DashboardSpec{SSL: true},
+		},
+	}
+
+	alreadyCreated, err := c.configureSSLCertificate()
+	assert.NoError(t, err)
+	assert.False(t, alreadyCreated)
+	assert.True(t, createdSelfSigned)
+	assert.True(t, removedRef)
+}
+
+func TestConfigureCustomSSLCertificateAcceptsECDSAKey(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 3)
+	cert, key := generateDashboardTestCert(t, "ecdsa")
+	_, err := clientset.CoreV1().Secrets("myns").Create(ctx, &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dashboard-cert",
+			Namespace: "myns",
+		},
+		Type: v1.SecretTypeTLS,
+		Data: map[string][]byte{
+			v1.TLSCertKey:       cert,
+			v1.TLSPrivateKeyKey: key,
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			if arg[0] == "config-key" && arg[1] == "get" {
+				return "", dashboardConfigKeyNotFoundErr()
+			}
+			return "", nil
+		},
+	}
+
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+		context:     &clusterd.Context{Clientset: clientset, Executor: executor},
+		spec: cephv1.ClusterSpec{
+			Dashboard: cephv1.DashboardSpec{SSL: true, SSLCertificateRef: "dashboard-cert"},
+		},
+	}
+
+	alreadyCreated, err := c.configureSSLCertificate()
+	assert.NoError(t, err)
+	assert.False(t, alreadyCreated)
+}
+
+func TestDashboardConfigKeyMatchesReturnsUnexpectedGetError(t *testing.T) {
+	ctx := context.TODO()
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+			return "", errors.New("mon quorum unavailable")
+		},
+	}
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+		context:     &clusterd.Context{Executor: executor},
+	}
+
+	matches, err := c.dashboardConfigKeyMatches("mgr/dashboard/crt", []byte("cert"))
+	assert.ErrorContains(t, err, "mon quorum unavailable")
+	assert.False(t, matches)
+}
+
+func dashboardConfigKeyNotFoundErr() error {
+	return kexec.CodeExitError{Err: errors.New("exit status 2"), Code: int(syscall.ENOENT)}
+}
+
+func TestConfigureCustomSSLCertificateRejectsMismatchedKey(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 3)
+	cert, _ := generateDashboardTestCert(t, "rsa")
+	_, key := generateDashboardTestCert(t, "rsa")
+	_, err := clientset.CoreV1().Secrets("myns").Create(ctx, &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dashboard-cert",
+			Namespace: "myns",
+		},
+		Type: v1.SecretTypeTLS,
+		Data: map[string][]byte{
+			v1.TLSCertKey:       cert,
+			v1.TLSPrivateKeyKey: key,
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+		context:     &clusterd.Context{Clientset: clientset},
+		spec: cephv1.ClusterSpec{
+			Dashboard: cephv1.DashboardSpec{SSL: true, SSLCertificateRef: "dashboard-cert"},
+		},
+	}
+
+	alreadyCreated, err := c.configureSSLCertificate()
+	assert.ErrorContains(t, err, "failed to parse dashboard TLS secret")
+	assert.False(t, alreadyCreated)
+}
+
+func TestConfigureCustomSSLCertificateValidatesTLSSecret(t *testing.T) {
+	ctx := context.TODO()
+	clientset := test.New(t, 3)
+	_, err := clientset.CoreV1().Secrets("myns").Create(ctx, &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "dashboard-cert",
+			Namespace: "myns",
+		},
+		Type: v1.SecretTypeOpaque,
+		Data: map[string][]byte{
+			v1.TLSCertKey:       []byte("my cert"),
+			v1.TLSPrivateKeyKey: []byte("my key"),
+		},
+	}, metav1.CreateOptions{})
+	require.NoError(t, err)
+
+	c := &Cluster{
+		clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+		context:     &clusterd.Context{Clientset: clientset},
+		spec: cephv1.ClusterSpec{
+			Dashboard: cephv1.DashboardSpec{SSL: true, SSLCertificateRef: "dashboard-cert"},
+		},
+	}
+
+	alreadyCreated, err := c.configureSSLCertificate()
+	assert.Error(t, err)
+	assert.False(t, alreadyCreated)
+}
+
+func TestConfigureCustomSSLCertificateRequiresTLSSecretKeys(t *testing.T) {
+	tests := []struct {
+		name          string
+		data          map[string][]byte
+		expectedError string
+	}{
+		{
+			name: "missing cert",
+			data: map[string][]byte{
+				v1.TLSPrivateKeyKey: []byte("my key"),
+			},
+			expectedError: "missing key \"tls.crt\"",
+		},
+		{
+			name: "missing key",
+			data: map[string][]byte{
+				v1.TLSCertKey: []byte("my cert"),
+			},
+			expectedError: "missing key \"tls.key\"",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.TODO()
+			clientset := test.New(t, 3)
+			_, err := clientset.CoreV1().Secrets("myns").Create(ctx, &v1.Secret{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "dashboard-cert",
+					Namespace: "myns",
+				},
+				Type: v1.SecretTypeTLS,
+				Data: tt.data,
+			}, metav1.CreateOptions{})
+			require.NoError(t, err)
+
+			c := &Cluster{
+				clusterInfo: &cephclient.ClusterInfo{Namespace: "myns", Context: ctx},
+				context:     &clusterd.Context{Clientset: clientset},
+				spec: cephv1.ClusterSpec{
+					Dashboard: cephv1.DashboardSpec{SSL: true, SSLCertificateRef: "dashboard-cert"},
+				},
+			}
+
+			alreadyCreated, err := c.configureSSLCertificate()
+			assert.ErrorContains(t, err, tt.expectedError)
+			assert.False(t, alreadyCreated)
+		})
+	}
+}
+
+func generateDashboardTestCert(t *testing.T, keyType string) ([]byte, []byte) {
+	t.Helper()
+
+	var privateKey interface{}
+	var publicKey interface{}
+	var keyBytes []byte
+	var keyBlockType string
+
+	switch keyType {
+	case "rsa":
+		key, err := rsa.GenerateKey(rand.Reader, 2048)
+		require.NoError(t, err)
+		privateKey = key
+		publicKey = &key.PublicKey
+		keyBytes = x509.MarshalPKCS1PrivateKey(key)
+		keyBlockType = "RSA PRIVATE KEY"
+	case "ecdsa":
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		require.NoError(t, err)
+		privateKey = key
+		publicKey = &key.PublicKey
+		keyBytes, err = x509.MarshalECPrivateKey(key)
+		require.NoError(t, err)
+		keyBlockType = "EC PRIVATE KEY"
+	default:
+		t.Fatalf("unsupported key type %q", keyType)
+	}
+
+	template := &x509.Certificate{
+		SerialNumber: big.NewInt(1),
+		Subject: pkix.Name{
+			CommonName: "ceph-dashboard-test",
+		},
+		NotBefore: time.Now(),
+		NotAfter:  time.Now().Add(time.Hour),
+		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageServerAuth,
+		},
+	}
+	certBytes, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	require.NoError(t, err)
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certBytes})
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: keyBlockType, Bytes: keyBytes})
+	return certPEM, keyPEM
 }

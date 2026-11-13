@@ -27,22 +27,22 @@ func TestEnvName() string {
 	return GetEnvVarWithDefault("TEST_ENV_NAME", "localhost")
 }
 
-// TestRetryNumber  get the max retry. Example, for OpenShift it's 40.
+// TestRetryNumber gets the max retry count. Example, for OpenShift it's 40.
 func TestRetryNumber() int {
-	count := GetEnvVarWithDefault("RETRY_MAX", "45")
+	count := GetEnvVarWithDefault("RETRY_MAX", "55")
 	number, err := strconv.Atoi(count)
 	if err != nil {
-		panic(fmt.Errorf("Error when converting to numeric value %v", err))
+		panic(fmt.Errorf("error when converting to numeric value %v", err))
 	}
 	return number
 }
 
-// IsPlatformOpenShift check if the platform is openshift or not
+// IsPlatformOpenShift checks if the platform is openshift or not
 func IsPlatformOpenShift() bool {
 	return TestEnvName() == "openshift"
 }
 
-// GetEnvVarWithDefault get environment variable by key.
+// GetEnvVarWithDefault gets an environment variable by key.
 func GetEnvVarWithDefault(env, defaultValue string) string {
 	val := os.Getenv(env)
 	if val == "" {

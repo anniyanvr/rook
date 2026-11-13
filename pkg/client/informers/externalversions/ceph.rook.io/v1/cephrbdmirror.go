@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,25 +19,54 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	apiscephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	versioned "github.com/rook/rook/pkg/client/clientset/versioned"
 	internalinterfaces "github.com/rook/rook/pkg/client/informers/externalversions/internalinterfaces"
-	v1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
+	cephrookiov1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephRBDMirrorInformer provides access to a shared informer and lister for
-// CephRBDMirrors.
+// CephRBDMirrors. Prefer using the type-safe variant (see [TypedCephRBDMirrorInformer]).
 type CephRBDMirrorInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.CephRBDMirrorLister
+	Lister() cephrookiov1.CephRBDMirrorLister
 }
+
+// TypedCephRBDMirrorInformer provides access to a shared informer and lister for
+// CephRBDMirrors, including the type-safe TypedInformer variant.
+// It is a superset of CephRBDMirrorInformer.
+type TypedCephRBDMirrorInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() CephRBDMirrorIndexInformer
+	Lister() cephrookiov1.CephRBDMirrorLister
+}
+
+// CephRBDMirrorIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type CephRBDMirrorIndexInformer cache.TypedSharedIndexInformer[*apiscephrookiov1.CephRBDMirror]
+
+// CephRBDMirrorHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for CephRBDMirror.
+type CephRBDMirrorHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*apiscephrookiov1.CephRBDMirror]
+
+// CephRBDMirrorDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for CephRBDMirror.
+type CephRBDMirrorDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*apiscephrookiov1.CephRBDMirror]
+
+// CephRBDMirrorFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for CephRBDMirror.
+type CephRBDMirrorFilteringHandler = cache.TypedFilteringResourceEventHandler[*apiscephrookiov1.CephRBDMirror]
+
+// CephRBDMirrorIndexers is a specialization of [cache.TypedIndexers] for CephRBDMirror.
+type CephRBDMirrorIndexers = cache.TypedIndexers[*apiscephrookiov1.CephRBDMirror]
+
+// DeletedCephRBDMirror is a specialization of [cache.DeletedObject] for CephRBDMirror.
+type DeletedCephRBDMirror = cache.DeletedObject[*apiscephrookiov1.CephRBDMirror]
 
 type cephRBDMirrorInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +77,132 @@ type cephRBDMirrorInformer struct {
 // NewCephRBDMirrorInformer constructs a new informer for CephRBDMirror type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephRBDMirrorInformer]).
 func NewCephRBDMirrorInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredCephRBDMirrorInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewCephRBDMirrorInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedCephRBDMirrorInformer constructs a new informer for CephRBDMirror type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephRBDMirrorInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephRBDMirrorIndexers) CephRBDMirrorIndexInformer {
+	return NewTypedCephRBDMirrorInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredCephRBDMirrorInformer constructs a new informer for CephRBDMirror type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredCephRBDMirrorInformer]).
 func NewFilteredCephRBDMirrorInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+	return NewTypedCephRBDMirrorInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredCephRBDMirrorInformer constructs a new informer for CephRBDMirror type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredCephRBDMirrorInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephRBDMirrorIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) CephRBDMirrorIndexInformer {
+	return NewTypedCephRBDMirrorInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewCephRBDMirrorInformerWithOptions constructs a new informer for CephRBDMirror type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephRBDMirrorInformerWithOptions]).
+func NewCephRBDMirrorInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedCephRBDMirrorInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedCephRBDMirrorInformerWithOptions constructs a new informer for CephRBDMirror type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephRBDMirrorInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) CephRBDMirrorIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "ceph.rook.io", Version: "v1", Resource: "cephrbdmirrors"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephRBDMirror](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephRBDMirrors(namespace).List(context.TODO(), options)
+				return client.CephV1().CephRBDMirrors(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephRBDMirrors(namespace).Watch(context.TODO(), options)
+				return client.CephV1().CephRBDMirrors(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephRBDMirrors(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephRBDMirrors(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&apiscephrookiov1.CephRBDMirror{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&cephrookiov1.CephRBDMirror{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *cephRBDMirrorInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredCephRBDMirrorInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedCephRBDMirrorInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *cephRBDMirrorInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&cephrookiov1.CephRBDMirror{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *cephRBDMirrorInformer) Lister() v1.CephRBDMirrorLister {
-	return v1.NewCephRBDMirrorLister(f.Informer().GetIndexer())
+func (f *cephRBDMirrorInformer) TypedInformer() CephRBDMirrorIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephRBDMirror](f.factory.InformerFor(&apiscephrookiov1.CephRBDMirror{}, f.defaultInformer))
+}
+
+func (f *cephRBDMirrorInformer) Lister() cephrookiov1.CephRBDMirrorLister {
+	return cephrookiov1.NewCephRBDMirrorLister(f.Informer().GetIndexer())
+}
+
+// ToTypedCephRBDMirrorInformer converts an untyped informer into a TypedCephRBDMirrorInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephRBDMirror. If that is not the case, calling type-safe methods of the returned
+// TypedCephRBDMirrorInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedCephRBDMirrorInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedCephRBDMirrorInformer(informer CephRBDMirrorInformer) TypedCephRBDMirrorInformer {
+	if informer, ok := informer.(TypedCephRBDMirrorInformer); ok {
+		return informer
+	}
+	return &cephRBDMirrorTypedInformerAdapter{informer}
+}
+
+type cephRBDMirrorTypedInformerAdapter struct {
+	CephRBDMirrorInformer
+}
+
+func (a *cephRBDMirrorTypedInformerAdapter) TypedInformer() CephRBDMirrorIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephRBDMirror](a.Informer())
+}
+
+// ToCephRBDMirrorIndexInformer converts an untyped informer into a CephRBDMirrorIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephRBDMirror. If that is not the case, calling type-safe methods of the returned
+// CephRBDMirrorIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a CephRBDMirrorIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToCephRBDMirrorIndexInformer(informer cache.SharedIndexInformer) CephRBDMirrorIndexInformer {
+	if informer, ok := informer.(CephRBDMirrorIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephRBDMirror](informer)
 }

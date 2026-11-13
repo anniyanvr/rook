@@ -23,11 +23,16 @@ import (
 	v1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/util/dependents"
+	"github.com/rook/rook/pkg/util/log"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-const bucketDependentType = "buckets in the object store (could be from ObjectBucketClaims or COSI Buckets)"
+const (
+	bucketDependentType                = "buckets in the object store (could be from ObjectBucketClaims or COSI Buckets)"
+	zoneIsMasterWithPeersDependentType = "zone is master and has peers"
+)
 
 // CephObjectStoreDependents returns the buckets which exist in the object store that should block
 // deletion.
@@ -39,16 +44,44 @@ func CephObjectStoreDependents(
 	objCtx *Context,
 	opsCtx *AdminOpsContext,
 ) (*dependents.DependentList, error) {
-	nsName := fmt.Sprintf("%s/%s", store.Namespace, store.Name)
+	nsName := controller.NsName(store.Namespace, store.Name)
 	baseErrMsg := fmt.Sprintf("failed to get dependents of CephObjectStore %q", nsName)
 
 	deps := dependents.NewDependentList()
+
+	if store.Spec.IsMultisite() {
+		// stores in multisite configs have different conditions that change what dependents should be checked
+		zoneIsMaster, err := CheckZoneIsMaster(objCtx)
+		if err != nil {
+			return deps, errors.Wrapf(err, "%s", baseErrMsg)
+		}
+		if !zoneIsMaster {
+			// zone is a peer, and the master is the source of truth
+			// we assume master is up-to-date and this peer can be deleted safely
+			// without checking for bucket dependents
+			return deps, nil
+		}
+
+		// check whether any peer zone exists
+		err = getMasterZoneDependents(deps, clusterdCtx, clusterInfo, store, objCtx)
+		if err != nil {
+			return deps, errors.Wrapf(err, "%s. failed to check multisite dependents", baseErrMsg)
+		}
+		if !deps.Empty() {
+			// zone is master with peers; require user intervention
+			log.NamedError(nsName, logger, "%s. Either change the master or remove its peers before the deletion", zoneIsMasterWithPeersDependentType)
+			return deps, errors.Errorf("%s: %q\nall peer zones must be deleted, or a peer zone must be manually set as the master zone after that peer has all necessary data synched to it", zoneIsMasterWithPeersDependentType, deps.OfKind(zoneIsMasterWithPeersDependentType))
+		}
+
+		// this is a master zone with NO peers. it is the last store that has this data,
+		// so we should prevent users from accidentally deleting it by continuing to check for buckets
+	}
 
 	// NOTE: we should still check for buckets when the RGW connection is external since we have no
 	// way of knowing if the bucket was created due to an ObjectBucketClaim or COSI Bucket.
 	err := getBucketDependents(deps, clusterdCtx, clusterInfo, store, objCtx, opsCtx)
 	if err != nil {
-		return deps, errors.Wrapf(err, baseErrMsg)
+		return deps, errors.Wrapf(err, "%s", baseErrMsg)
 	}
 
 	// CephObjectStoreUsers
@@ -60,7 +93,7 @@ func CephObjectStoreDependents(
 		if user.Spec.Store == store.Name {
 			deps.Add("CephObjectStoreUsers", user.Name)
 		}
-		logger.Debugf("found CephObjectStoreUser %q that does not depend on CephObjectStore %q", user.Name, nsName)
+		log.NamedDebug(nsName, logger, "found CephObjectStoreUser %q that does not depend on CephObjectStore %q", user.Name, nsName)
 	}
 
 	return deps, nil
@@ -75,7 +108,7 @@ func getBucketDependents(
 	objCtx *Context,
 	opsCtx *AdminOpsContext,
 ) error {
-	nsName := fmt.Sprintf("%s/%s", store.Namespace, store.Name)
+	nsName := controller.NsName(store.Namespace, store.Name)
 
 	missingPools, err := missingPools(objCtx)
 	if err != nil {
@@ -87,7 +120,7 @@ func getBucketDependents(
 		// Rook operator restarted.
 		// in either case, we cannot get a successful connection to RGW(s) to check for buckets, and
 		// we can assume it is safe for deletion to proceed
-		logger.Infof("skipping check for bucket dependents of CephObjectStore %q. some pools are missing: %v", nsName, missingPools)
+		log.NamedInfo(nsName, logger, "skipping check for bucket dependents of CephObjectStore %q. some pools are missing: %v", nsName, missingPools)
 		return nil
 	}
 
@@ -96,13 +129,37 @@ func getBucketDependents(
 	if err != nil {
 		return errors.Wrapf(err, "failed to list buckets in CephObjectStore %q", nsName)
 	}
-	healthCheckBucket := genHealthCheckerBucketName(string(store.UID))
 	for _, b := range buckets {
-		if b == healthCheckBucket {
-			continue // don't include the health checker bucket as a blocking dependent
-		}
 		deps.Add(bucketDependentType, b)
 	}
 
+	return nil
+}
+
+func getMasterZoneDependents(
+	deps *dependents.DependentList,
+	clusterdCtx *clusterd.Context,
+	clusterInfo *client.ClusterInfo,
+	store *v1.CephObjectStore,
+	objContext *Context,
+) error {
+	realmArg := fmt.Sprintf("--rgw-realm=%s", objContext.Realm)
+	zoneGroupArg := fmt.Sprintf("--rgw-zonegroup=%s", objContext.ZoneGroup)
+	zoneGroupOutput, err := RunAdminCommandNoMultisite(objContext, true, "zonegroup", "get", realmArg, zoneGroupArg)
+	if err != nil {
+		return errors.Wrapf(err, "failed to fetch zonegroup %q", objContext.ZoneGroup)
+	}
+	zoneGroupJson, err := DecodeZoneGroupConfig(zoneGroupOutput)
+	if err != nil {
+		return errors.Wrapf(err, "failed to decode zonegroup %q", objContext.ZoneGroup)
+	}
+	// if only the master zone remains then it is okay to delete
+	if len(zoneGroupJson.Zones) > 1 {
+		for _, zone := range zoneGroupJson.Zones {
+			if zone.Name != store.Spec.Zone.Name {
+				deps.Add(zoneIsMasterWithPeersDependentType, zone.Name)
+			}
+		}
+	}
 	return nil
 }

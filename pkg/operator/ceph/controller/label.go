@@ -43,7 +43,7 @@ func addCephVersionLabel(cephVersion version.CephVersion, labels map[string]stri
 
 // GetCephVersionLabel returns a formatted serialization of a provided CephVersion for use in resource labels.
 func GetCephVersionLabel(cephVersion version.CephVersion) string {
-	return fmt.Sprintf("%d.%d.%d-%d",
+	return fmt.Sprintf("%d.%d.%d-%d", // DO NOT CHANGE FORMAT FROM "Maj.Min.Ext-Bld"
 		cephVersion.Major, cephVersion.Minor, cephVersion.Extra, cephVersion.Build)
 }
 
@@ -55,18 +55,6 @@ func ExtractCephVersionFromLabel(labelVersion string) (*version.CephVersion, err
 // AddCephVersionLabelToDeployment adds a label reporting the Ceph version which Rook has detected is
 // running in the Deployment's pods.
 func AddCephVersionLabelToDeployment(cephVersion version.CephVersion, d *apps.Deployment) {
-	if d == nil {
-		return
-	}
-	if d.Labels == nil {
-		d.Labels = map[string]string{}
-	}
-	addCephVersionLabel(cephVersion, d.Labels)
-}
-
-// AddCephVersionLabelToDaemonSet adds a label reporting the Ceph version which Rook has detected is
-// running in the DaemonSet's pods.
-func AddCephVersionLabelToDaemonSet(cephVersion version.CephVersion, d *apps.DaemonSet) {
 	if d == nil {
 		return
 	}

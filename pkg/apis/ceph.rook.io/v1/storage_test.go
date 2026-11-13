@@ -54,7 +54,7 @@ func TestNodeExists(t *testing.T) {
 }
 
 func TestResolveNodeNotExist(t *testing.T) {
-	// a non existing node should return nil
+	// a nonexistent node should return nil
 	storageSpec := StorageScopeSpec{}
 	node := storageSpec.ResolveNode("fake node")
 	assert.Nil(t, node)
@@ -139,7 +139,7 @@ func TestResolveNodeSpecificProperties(t *testing.T) {
 
 func TestResolveNodeUseAllDevices(t *testing.T) {
 	storageSpec := StorageScopeSpec{
-		Selection: Selection{UseAllDevices: newBool(true)}, // UseAllDevices is set to true on the storage spec
+		Selection: Selection{UseAllDevices: new(true)}, // UseAllDevices is set to true on the storage spec
 		Nodes: []Node{
 			{Name: "node1"}, // node gets nothing but its name set
 		},
@@ -156,16 +156,17 @@ func TestUseAllDevices(t *testing.T) {
 
 	storageSpec = StorageScopeSpec{
 		Selection: Selection{
-			UseAllDevices: newBool(true)}, // UseAllDevices is set to true on the storage spec
+			UseAllDevices: new(true),
+		}, // UseAllDevices is set to true on the storage spec
 	}
 	assert.True(t, storageSpec.AnyUseAllDevices())
 
 	storageSpec = StorageScopeSpec{
-		Selection: Selection{UseAllDevices: newBool(false)},
+		Selection: Selection{UseAllDevices: new(false)},
 		Nodes: []Node{
 			{
 				Name:      "node1",
-				Selection: Selection{UseAllDevices: newBool(true)},
+				Selection: Selection{UseAllDevices: new(true)},
 			},
 		},
 	}
@@ -175,11 +176,11 @@ func TestUseAllDevices(t *testing.T) {
 func TestClearUseAllDevices(t *testing.T) {
 	// create a storage spec with use all devices set to true for the cluster and for all nodes
 	storageSpec := StorageScopeSpec{
-		Selection: Selection{UseAllDevices: newBool(true)},
+		Selection: Selection{UseAllDevices: new(true)},
 		Nodes: []Node{
 			{
 				Name:      "node1",
-				Selection: Selection{UseAllDevices: newBool(true)},
+				Selection: Selection{UseAllDevices: new(true)},
 			},
 		},
 	}
@@ -271,7 +272,8 @@ func TestStorageScopeSpec_NodeWithNameExists(t *testing.T) {
 	spec.Nodes = []Node{
 		{Name: "node0-hostname"},
 		{Name: "node1"},
-		{Name: "node2"}}
+		{Name: "node2"},
+	}
 	assert.True(t, spec.NodeWithNameExists("node0-hostname"))
 	assert.False(t, spec.NodeWithNameExists("node0"))
 	assert.True(t, spec.NodeWithNameExists("node1"))

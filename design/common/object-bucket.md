@@ -2,9 +2,10 @@
 
 ## Overview
 
-An object store bucket is a container holding immutable objects. The Rook-Ceph [operator](https://github.com/yard-turkey/rook/blob/master/cluster/examples/kubernetes/ceph/operator.yaml) creates a controller which automates the provisioning of new and existing buckets.
+An object store bucket is a container holding immutable objects. The Rook-Ceph [operator](https://github.com/rook/rook/blob/master/deploy/examples/operator.yaml) creates a controller which automates the provisioning of new and existing buckets.
 
 A user requests bucket storage by creating an _ObjectBucketClaim_ (OBC). Upon detecting a new OBC, the Rook-Ceph bucket provisioner does the following:
+
 - creates a new bucket and grants user-level access (greenfield), or
 - grants user-level access to an existing bucket (brownfield), and
 - creates a Kubernetes Secret in the same namespace as the OBC
@@ -14,20 +15,20 @@ The secret contains bucket access keys. The configmap contains bucket endpoint i
 
 When the _ObjectBucketClaim_ is deleted all of the Kubernetes resources created by the Rook-Ceph provisioner are deleted, and provisioner specific artifacts, such as dynamic users and access policies are removed. And, depending on the _reclaimPolicy_ in the storage class referenced in the OBC, the bucket will be retained or deleted.
 
-We welcome contributions! In the meantime, features that are not yet implemented may be configured by using the [Rook toolbox](/Documentation/ceph-toolbox.md) to run the `radosgw-admin` and other tools for advanced bucket policies.
+We welcome contributions! In the meantime, features that are not yet implemented may be configured by using the [Rook toolbox](/Documentation/Troubleshooting/ceph-toolbox.md) to run the `radosgw-admin` and other tools for advanced bucket policies.
 
 ### Prerequisites
 
 - A Rook storage cluster must be configured and running in Kubernetes. In this example, it is assumed the cluster is in the `rook` namespace.
 - The following resources, or equivalent, need to be created:
-  - [crd](/cluster/examples/kubernetes/ceph/crds.yaml)
-  - [common](/cluster/examples/kubernetes/ceph/common.yaml)
-  - [operator](/cluster/examples/kubernetes/ceph/operator.yaml)
-  - [cluster](/cluster/examples/kubernetes/ceph/cluster-test.yaml)
-  - [object](/cluster/examples/kubernetes/ceph/object-test.yaml)
-  - [user](/cluster/examples/kubernetes/ceph/object-user.yaml)
-  - [storageclass](/cluster/examples/kubernetes/ceph/storageclass-bucket-retain.yaml)
-  - [claim](/cluster/examples/kubernetes/ceph/object-bucket-claim-retain.yaml)
+  - [crd](/deploy/examples/crds.yaml)
+  - [common](/deploy/examples/common.yaml)
+  - [operator](/deploy/examples/operator.yaml)
+  - [cluster](/deploy/examples/cluster-test.yaml)
+  - [object](/deploy/examples/object-test.yaml)
+  - [user](/deploy/examples/object-user.yaml)
+  - [storageclass](/deploy/examples/storageclass-bucket-retain.yaml)
+  - [claim](/deploy/examples/object-bucket-claim-retain.yaml)
 
 
 ## Object Store Bucket Walkthrough
@@ -79,7 +80,7 @@ The object store settings are exposed to Rook as a Custom Resource Definition (C
 
 ### Pools
 
-The pools are the backing data store for the object store and are created with specific names to be private to an object store. Pools can be configured with all of the settings that can be specified in the [Pool CRD](/Documentation/ceph-pool-crd.md). The underlying schema for pools defined by a pool CRD is the same as the schema under the `metadataPool` and `dataPool` elements of the object store CRD. All metadata pools are created with the same settings, while the data pool can be created with independent settings. The metadata pools must use replication, while the data pool can use replication or erasure coding.
+The pools are the backing data store for the object store and are created with specific names to be private to an object store. Pools can be configured with all of the settings that can be specified in the [Pool CRD](/Documentation/CRDs/Block-Storage/ceph-block-pool-crd.md). The underlying schema for pools defined by a pool CRD is the same as the schema under the `metadataPool` and `dataPool` elements of the object store CRD. All metadata pools are created with the same settings, while the data pool can be created with independent settings. The metadata pools must use replication, while the data pool can use replication or erasure coding.
 
 ```yaml
   metadataPool:
@@ -114,7 +115,7 @@ The gateway settings correspond to the RGW service.
 - `securePort`: The service port where the RGW service will be listening (https)
 - `instances`: The number of RGW pods that will be started for this object store (ignored if allNodes=true)
 - `allNodes`: Whether all nodes in the cluster should run RGW as a daemonset
-- `placement`: The rgw pods can be given standard Kubernetes placement restrictions with `nodeAffinity`, `tolerations`, `podAffinity`, and `podAntiAffinity` similar to placement defined for daemons configured by the [cluster CRD](/cluster/examples/kubernetes/ceph/cluster.yaml).
+- `placement`: The rgw pods can be given standard Kubernetes placement restrictions with `nodeAffinity`, `tolerations`, `podAffinity`, and `podAntiAffinity` similar to placement defined for daemons configured by the [cluster CRD](/deploy/examples/cluster.yaml).
 
 The RGW service can be configured to listen on both http and https by specifying both `port` and `securePort`.
 

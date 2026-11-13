@@ -272,7 +272,7 @@ func TestGetCrushMap(t *testing.T) {
 		}
 		return "", errors.Errorf("unexpected ceph command '%v'", args)
 	}
-	crush, err := GetCrushMap(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"))
+	crush, err := GetCrushMap(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"))
 
 	assert.Nil(t, err)
 	assert.Equal(t, 11, len(crush.Types))
@@ -291,7 +291,7 @@ func TestGetOSDOnHost(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command '%v'", args)
 	}
 
-	_, err := GetOSDOnHost(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"), "my-host")
+	_, err := GetOSDOnHost(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"), "my-host")
 	assert.Nil(t, err)
 }
 
@@ -322,6 +322,7 @@ func TestCrushName(t *testing.T) {
 		assert.True(t, IsNormalizedCrushNameEqual(normalizedCrushName, normalizedCrushName))
 		if i > 0 {
 			// slightly different crush name
+			// #nosec G602 -- i > 0 is checked above so i-1 is always within bounds
 			differentCrushName := crushNames[i-1]
 			differentNormalizedCrushName := NormalizeCrushName(differentCrushName)
 			assert.False(t, IsNormalizedCrushNameEqual(crushName, differentNormalizedCrushName))

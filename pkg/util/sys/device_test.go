@@ -86,11 +86,9 @@ SUBSYSTEM=block
 `
 )
 
-var (
-	lsblkChildOutput = `NAME="ceph--cec981b8--2eca--45cd--bf91--a4472779f2a9-osd--data--428984b7--f94d--40cd--9cb7--1458e1613eab" MAJ:MIN="252:0" RM="0" SIZE="29G" RO="0" TYPE="lvm" MOUNTPOINT=""
+var lsblkChildOutput = `NAME="ceph--cec981b8--2eca--45cd--bf91--a4472779f2a9-osd--data--428984b7--f94d--40cd--9cb7--1458e1613eab" MAJ:MIN="252:0" RM="0" SIZE="29G" RO="0" TYPE="lvm" MOUNTPOINT=""
 NAME="vdb" MAJ:MIN="253:16" RM="0" SIZE="30G" RO="0" TYPE="disk" MOUNTPOINT=""
 NAME="vdb1" MAJ:MIN="253:17" RM="0" SIZE="30G" RO="0" TYPE="part" MOUNTPOINT=""`
-)
 
 func TestFindUUID(t *testing.T) {
 	output := `Disk /dev/sdb: 10485760 sectors, 5.0 GiB
@@ -119,21 +117,21 @@ func TestGetPartitions(t *testing.T) {
 		MockExecuteCommandWithOutput: func(command string, arg ...string) (string, error) {
 			run++
 			logger.Infof("run %d command %s", run, command)
-			switch {
-			case run == 1:
+			switch run {
+			case 1:
 				return `NAME="sdc" SIZE="100000" TYPE="disk" PKNAME=""`, nil
-			case run == 2:
+			case 2:
 				return `NAME="sdb" SIZE="65" TYPE="disk" PKNAME=""
 NAME="sdb2" SIZE="10" TYPE="part" PKNAME="sdb"
 NAME="sdb3" SIZE="20" TYPE="part" PKNAME="sdb"
 NAME="sdb1" SIZE="30" TYPE="part" PKNAME="sdb"`, nil
-			case run == 3:
+			case 3:
 				return fmt.Sprintf(udevPartOutput, "ROOK-OSD0-DB"), nil
-			case run == 4:
+			case 4:
 				return fmt.Sprintf(udevPartOutput, "ROOK-OSD0-BLOCK"), nil
-			case run == 5:
+			case 5:
 				return fmt.Sprintf(udevPartOutput, "ROOK-OSD0-WAL"), nil
-			case run == 6:
+			case 6:
 				return `NAME="sda" SIZE="19818086400" TYPE="disk" PKNAME=""
 NAME="sda4" SIZE="1073741824" TYPE="part" PKNAME="sda"
 NAME="sda2" SIZE="2097152" TYPE="part" PKNAME="sda"
@@ -143,7 +141,7 @@ NAME="sda3" SIZE="1073741824" TYPE="part" PKNAME="sda"
 NAME="usr" SIZE="1065345024" TYPE="crypt" PKNAME="sda3"
 NAME="sda1" SIZE="134217728" TYPE="part" PKNAME="sda"
 NAME="sda6" SIZE="134217728" TYPE="part" PKNAME="sda"`, nil
-			case run == 14:
+			case 14:
 				return `NAME="dm-0" SIZE="100000" TYPE="lvm" PKNAME=""
 NAME="ceph--89fa04fa--b93a--4874--9364--c95be3ec01c6-osd--data--70847bdb--2ec1--4874--98ba--d87d4860a70d" SIZE="31138512896" TYPE="lvm" PKNAME=""`, nil
 			}
@@ -178,6 +176,41 @@ NAME="ceph--89fa04fa--b93a--4874--9364--c95be3ec01c6-osd--data--70847bdb--2ec1--
 	assert.Equal(t, 0, len(partitions))
 }
 
+func TestGetUdevInfo(t *testing.T) {
+	// GetUdevInfo is called both with a kernel name ("sdb") and with a full
+	// device path ("/dev/sdb"). Both must reach udevadm as "/dev/sdb"; a full
+	// path must not become "/dev//dev/sdb", which udevadm rejects.
+	// The argument is asserted exactly rather than with Contains, because a
+	// doubled prefix still contains the device name.
+	tests := []struct {
+		name     string
+		device   string
+		expected string
+	}{
+		{"kernel name", "sdb", "/dev/sdb"},
+		{"full path", "/dev/sdb", "/dev/sdb"},
+		{"by-id path", "/dev/disk/by-id/scsi-36001405d27e5d898829468b90ce4ef8c", "/dev/disk/by-id/scsi-36001405d27e5d898829468b90ce4ef8c"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var gotDevice string
+			executor := &exectest.MockExecutor{
+				MockExecuteCommandWithOutput: func(command string, arg ...string) (string, error) {
+					assert.Equal(t, "udevadm", command)
+					gotDevice = arg[len(arg)-1]
+					return udevOutput, nil
+				},
+			}
+
+			info, err := GetUdevInfo(test.device, executor)
+			assert.NoError(t, err)
+			assert.Equal(t, test.expected, gotDevice)
+			assert.Equal(t, "ext2", info["ID_FS_TYPE"])
+		})
+	}
+}
+
 func TestParseUdevInfo(t *testing.T) {
 	m := parseUdevInfo(udevOutput)
 	assert.Equal(t, m["ID_FS_TYPE"], "ext2")
@@ -195,4 +228,23 @@ func TestListDevicesChildListDevicesChild(t *testing.T) {
 	child, err := ListDevicesChild(executor, device)
 	assert.NoError(t, err)
 	assert.Equal(t, 3, len(child))
+}
+
+func TestGetDiskDeviceType(t *testing.T) {
+	d := &LocalDisk{}
+	assert.Equal(t, "ssd", GetDiskDeviceType(d))
+	d.Rotational = true
+	assert.Equal(t, "hdd", GetDiskDeviceType(d))
+	d.Rotational = false
+	d.RealPath = "nvme"
+	assert.Equal(t, "nvme", GetDiskDeviceType(d))
+}
+
+func TestGetDiskDeviceClass(t *testing.T) {
+	t.Setenv("ROOK_OSD_CRUSH_DEVICE_CLASS", "test")
+	assert.Equal(t, "test", GetDiskDeviceClass("ROOK_OSD_CRUSH_DEVICE_CLASS", "hdd"))
+	t.Setenv("ROOK_OSD_CRUSH_DEVICE_CLASS", "test1")
+	assert.Equal(t, "test1", GetDiskDeviceClass("ROOK_OSD_CRUSH_DEVICE_CLASS", "hdd"))
+	t.Setenv("ROOK_OSD_CRUSH_DEVICE_CLASS", "")
+	assert.Equal(t, "nvme", GetDiskDeviceClass("ROOK_OSD_CRUSH_DEVICE_CLASS", "nvme"))
 }

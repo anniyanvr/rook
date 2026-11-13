@@ -18,13 +18,11 @@ package clients
 
 import (
 	"fmt"
-
-	"github.com/rook/rook/pkg/daemon/ceph/client"
+	"slices"
 )
 
 // IsClusterHealthy determines if the Rook cluster is currently healthy or not.
 func IsClusterHealthy(testClient *TestClient, namespace string) (bool, error) {
-
 	status, err := testClient.Status(namespace)
 	if err != nil {
 		return false, err
@@ -36,17 +34,17 @@ func IsClusterHealthy(testClient *TestClient, namespace string) (bool, error) {
 		return false, fmt.Errorf("too few monitors: %+v", status)
 	}
 	for _, mon := range status.MonMap.Mons {
-		if !monInQuorum(mon, status.Quorum) {
+		if !slices.Contains(status.Quorum, mon.Rank) {
 			return false, fmt.Errorf("mon %s not in quorum: %v", mon.Name, status.Quorum)
 		}
 	}
 
 	// verify there are OSDs and they are all up/in
-	totalOSDs := status.OsdMap.OsdMap.NumOsd
+	totalOSDs := status.OsdMap.NumOsd
 	if totalOSDs == 0 {
 		return false, fmt.Errorf("no OSDs: %+v", status)
 	}
-	if status.OsdMap.OsdMap.NumInOsd != totalOSDs || status.OsdMap.OsdMap.NumUpOsd != totalOSDs {
+	if status.OsdMap.NumInOsd != totalOSDs || status.OsdMap.NumUpOsd != totalOSDs {
 		return false, fmt.Errorf("not all OSDs are up/in: %+v", status)
 	}
 
@@ -72,13 +70,4 @@ func IsClusterHealthy(testClient *TestClient, namespace string) (bool, error) {
 
 	// cluster passed all the basic health checks, seems healthy
 	return true, nil
-}
-
-func monInQuorum(mon client.MonMapEntry, quorum []int) bool {
-	for _, entry := range quorum {
-		if entry == mon.Rank {
-			return true
-		}
-	}
-	return false
 }

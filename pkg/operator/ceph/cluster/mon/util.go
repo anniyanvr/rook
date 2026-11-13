@@ -17,6 +17,7 @@ limitations under the License.
 package mon
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/rook/rook/pkg/daemon/ceph/client"
@@ -26,12 +27,18 @@ import (
 )
 
 func monInQuorum(monitor client.MonMapEntry, quorum []int) bool {
-	for _, rank := range quorum {
-		if rank == monitor.Rank {
-			return true
+	return slices.Contains(quorum, monitor.Rank)
+}
+
+func getMonByID(monID string, monMap client.MonStatusResponse) (info client.MonMapEntry, inQuorum bool) {
+	for _, mon := range monMap.MonMap.Mons {
+		if mon.Name != monID {
+			continue
 		}
+		monRank := mon.Rank
+		return mon, slices.Contains(monMap.Quorum, monRank)
 	}
-	return false
+	return client.MonMapEntry{}, false
 }
 
 // convert the mon name to the numeric mon ID
@@ -53,17 +60,5 @@ func addServicePort(service *v1.Service, name string, port int32) {
 		Port:       port,
 		TargetPort: intstr.FromInt(int(port)),
 		Protocol:   v1.ProtocolTCP,
-	})
-}
-
-// addContainerPort adds a port to a container
-func addContainerPort(container v1.Container, name string, port int32) {
-	if port == 0 {
-		return
-	}
-	container.Ports = append(container.Ports, v1.ContainerPort{
-		Name:          name,
-		ContainerPort: port,
-		Protocol:      v1.ProtocolTCP,
 	})
 }

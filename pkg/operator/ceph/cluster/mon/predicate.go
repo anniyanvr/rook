@@ -21,34 +21,30 @@ import (
 	"reflect"
 	"sort"
 
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/util/log"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
 )
 
-func PredicateMonEndpointChanges() predicate.Funcs {
-	return predicate.Funcs{
-		CreateFunc: func(e event.CreateEvent) bool {
+func PredicateMonEndpointChanges[T *corev1.ConfigMap]() predicate.TypedFuncs[T] {
+	return predicate.TypedFuncs[T]{
+		CreateFunc: func(e event.TypedCreateEvent[T]) bool {
 			return false
 		},
-		DeleteFunc: func(e event.DeleteEvent) bool {
+		DeleteFunc: func(e event.TypedDeleteEvent[T]) bool {
 			return false
 		},
-		GenericFunc: func(e event.GenericEvent) bool {
+		GenericFunc: func(e event.TypedGenericEvent[T]) bool {
 			return false
 		},
-		UpdateFunc: func(e event.UpdateEvent) bool {
-			cmNew, ok := e.ObjectNew.(*corev1.ConfigMap)
-			if !ok {
-				return false
-			}
-			cmOld, ok := e.ObjectOld.(*corev1.ConfigMap)
-			if !ok {
-				return false
-			}
+		UpdateFunc: func(e event.TypedUpdateEvent[T]) bool {
+			cmOld := (*corev1.ConfigMap)(e.ObjectOld)
+			cmNew := (*corev1.ConfigMap)(e.ObjectNew)
 			if cmNew.GetName() == EndpointConfigMapName {
-				if wereMonEndpointsUpdated(cmOld.Data, cmNew.Data) {
-					logger.Info("monitor endpoints changed, updating the bootstrap peer token")
+				if wereMonEndpointsUpdated(cmNew.Namespace, cmOld.Data, cmNew.Data) {
+					log.NamespacedInfo(cmNew.Namespace, logger, "monitor endpoints changed, updating the bootstrap peer token")
 					return true
 				}
 			}
@@ -57,31 +53,31 @@ func PredicateMonEndpointChanges() predicate.Funcs {
 	}
 }
 
-func wereMonEndpointsUpdated(oldCMData, newCMData map[string]string) bool {
+func wereMonEndpointsUpdated(namespace string, oldCMData, newCMData map[string]string) bool {
 	// Check the mapping key first
 	if oldMapping, ok := oldCMData["mapping"]; ok {
 		if newMapping, ok := newCMData["mapping"]; ok {
 			// Unmarshal both into a type
-			var oldMappingToGo Mapping
+			var oldMappingToGo opcontroller.Mapping
 			err := json.Unmarshal([]byte(oldMapping), &oldMappingToGo)
 			if err != nil {
-				logger.Debugf("failed to unmarshal new. %v", err)
+				log.NamespacedDebug(namespace, logger, "failed to unmarshal new. %v", err)
 				return false
 			}
 
-			var newMappingToGo Mapping
+			var newMappingToGo opcontroller.Mapping
 			err = json.Unmarshal([]byte(newMapping), &newMappingToGo)
 			if err != nil {
-				logger.Debugf("failed to unmarshal new. %v", err)
+				log.NamespacedDebug(namespace, logger, "failed to unmarshal new. %v", err)
 				return false
 			}
 
 			// If length is different, monitors are different
 			if len(oldMappingToGo.Schedule) != len(newMappingToGo.Schedule) {
-				logger.Debugf("mons were added or removed from the endpoints cm")
+				log.NamespacedDebug(namespace, logger, "mons were added or removed from the endpoints cm")
 				return true
 			}
-			// Since Schedule is map, it's unordered, so let's order it
+			// Since Schedule is a map, it's unordered, so let's order it
 			oldKeys := make([]string, 0, len(oldMappingToGo.Schedule))
 			for k := range oldMappingToGo.Schedule {
 				oldKeys = append(oldKeys, k)
@@ -97,7 +93,7 @@ func wereMonEndpointsUpdated(oldCMData, newCMData map[string]string) bool {
 			// Iterate over the map and compare the values
 			for _, v := range oldKeys {
 				if !reflect.DeepEqual(oldMappingToGo.Schedule[v], newMappingToGo.Schedule[v]) {
-					logger.Debugf("oldMappingToGo.Schedule[v] AND newMappingToGo.Schedule[v]: %v | %v", oldMappingToGo.Schedule[v], newMappingToGo.Schedule[v])
+					log.NamespacedDebug(namespace, logger, "oldMappingToGo.Schedule[v] AND newMappingToGo.Schedule[v]: %v | %v", oldMappingToGo.Schedule[v], newMappingToGo.Schedule[v])
 					return true
 				}
 			}

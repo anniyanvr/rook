@@ -18,7 +18,7 @@ limitations under the License.
 package realm
 
 import (
-	"context"
+	"regexp"
 	"testing"
 	"time"
 
@@ -30,12 +30,14 @@ import (
 	"github.com/rook/rook/pkg/operator/test"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	k8sfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/events"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 )
@@ -52,7 +54,7 @@ var (
 )
 
 func TestCephObjectRealmController(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	//
 	// TEST 1 SETUP
 	//
@@ -98,7 +100,7 @@ func TestCephObjectRealmController(t *testing.T) {
 	// Create a fake client to mock API calls.
 	cl := fake.NewClientBuilder().WithScheme(r.scheme).WithRuntimeObjects(object...).Build()
 	// Create a ReconcileObjectRealm object with the scheme and fake client.
-	r = &ReconcileObjectRealm{client: cl, scheme: r.scheme, context: r.context}
+	r = &ReconcileObjectRealm{client: cl, scheme: r.scheme, context: r.context, recorder: events.NewFakeRecorder(50)}
 	res, err = r.Reconcile(ctx, req)
 	assert.NoError(t, err)
 	assert.True(t, res.Requeue)
@@ -154,17 +156,17 @@ func TestCephObjectRealmController(t *testing.T) {
 	r.context.Executor = executor
 
 	// Create a ReconcileObjectRealm object with the scheme and fake client.
-	r = &ReconcileObjectRealm{client: cl, scheme: r.scheme, context: r.context}
+	r = &ReconcileObjectRealm{client: cl, scheme: r.scheme, context: r.context, recorder: events.NewFakeRecorder(50)}
 
 	res, err = r.Reconcile(ctx, req)
 	assert.NoError(t, err)
 	assert.False(t, res.Requeue)
-	err = r.client.Get(context.TODO(), req.NamespacedName, objectRealm)
+	err = r.client.Get(t.Context(), req.NamespacedName, objectRealm)
 	assert.NoError(t, err)
 }
 
 func TestPullCephRealm(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	r, objectRealm := getObjectRealmAndReconcileObjectRealm(t)
 
 	secrets := map[string][]byte{
@@ -255,14 +257,14 @@ func getObjectRealmAndReconcileObjectRealm(t *testing.T) (*ReconcileObjectRealm,
 	// Create a fake client to mock API calls.
 	cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
 	// Create a ReconcileObjectRealm object with the scheme and fake client.
-	clusterInfo := cephclient.AdminClusterInfo("rook")
-	r := &ReconcileObjectRealm{client: cl, scheme: s, context: c, clusterInfo: clusterInfo}
+	clusterInfo := cephclient.AdminTestClusterInfo("rook")
+	r := &ReconcileObjectRealm{client: cl, scheme: s, context: c, clusterInfo: clusterInfo, recorder: events.NewFakeRecorder(50)}
 
 	return r, objectRealm
 }
 
 func TestReconcileObjectRealm_createRealmKeys(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	realmName := "my-realm"
 	ns := "my-ns"
 
@@ -282,9 +284,10 @@ func TestReconcileObjectRealm_createRealmKeys(t *testing.T) {
 	t.Run("should be idempotent", func(t *testing.T) {
 		r := ReconcileObjectRealm{
 			context: &clusterd.Context{
-				Clientset: k8sfake.NewSimpleClientset(),
+				Clientset: k8sfake.NewClientset(),
 			},
-			scheme: scheme,
+			scheme:   scheme,
+			recorder: events.NewFakeRecorder(50),
 		}
 
 		for _, tName := range []string{"first reconcile", "second reconcile"} {
@@ -299,6 +302,30 @@ func TestReconcileObjectRealm_createRealmKeys(t *testing.T) {
 				assert.Contains(t, secret.Data, "access-key")
 				assert.Contains(t, secret.Data, "secret-key")
 			})
+		}
+	})
+
+	t.Run("generated keys are URL-safe", func(t *testing.T) {
+		// the access key is embedded in the '/'-delimited SigV4 credential scope, so a '/'
+		// anywhere in it makes "radosgw-admin realm pull" fail with "(22) Invalid argument"
+		urlSafe := regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+		for range 100 {
+			r := ReconcileObjectRealm{
+				context: &clusterd.Context{
+					Clientset: k8sfake.NewClientset(),
+				},
+				scheme:   scheme,
+				recorder: events.NewFakeRecorder(50),
+			}
+
+			res, err := r.createRealmKeys(realm)
+			require.NoError(t, err)
+			assert.True(t, res.IsZero())
+
+			secret, err := r.context.Clientset.CoreV1().Secrets(ns).Get(ctx, realmName+"-keys", metav1.GetOptions{})
+			require.NoError(t, err)
+			assert.Regexp(t, urlSafe, string(secret.Data["access-key"]))
+			assert.Regexp(t, urlSafe, string(secret.Data["secret-key"]))
 		}
 	})
 
@@ -320,9 +347,10 @@ func TestReconcileObjectRealm_createRealmKeys(t *testing.T) {
 
 		r := ReconcileObjectRealm{
 			context: &clusterd.Context{
-				Clientset: k8sfake.NewSimpleClientset(secret),
+				Clientset: k8sfake.NewClientset(secret),
 			},
-			scheme: scheme,
+			scheme:   scheme,
+			recorder: events.NewFakeRecorder(50),
 		}
 
 		_, err := r.createRealmKeys(realm)

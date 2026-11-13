@@ -18,9 +18,8 @@ package integration
 
 import (
 	"fmt"
-	"time"
-
 	"testing"
+	"time"
 
 	"github.com/coreos/pkg/capnslog"
 	"github.com/rook/rook/tests/framework/clients"
@@ -35,12 +34,10 @@ const (
 	defaultNamespace = "default"
 )
 
-var (
-	logger = capnslog.NewPackageLogger("github.com/rook/rook", "integrationTest")
-)
+var logger = capnslog.NewPackageLogger("github.com/rook/rook", "integrationTest")
 
 // Test to make sure all rook components are installed and Running
-func checkIfRookClusterIsInstalled(s suite.Suite, k8sh *utils.K8sHelper, opNamespace, clusterNamespace string, mons int) {
+func checkIfRookClusterIsInstalled(s *suite.Suite, k8sh *utils.K8sHelper, opNamespace, clusterNamespace string, mons int) {
 	logger.Infof("Make sure all Pods in Rook Cluster %s are running", clusterNamespace)
 	assert.True(s.T(), k8sh.CheckPodCountAndState("rook-ceph-operator", opNamespace, 1, "Running"),
 		"Make sure there is 1 rook-operator present in Running state")
@@ -54,13 +51,16 @@ func checkIfRookClusterIsInstalled(s suite.Suite, k8sh *utils.K8sHelper, opNames
 		"Make sure there is at lest 1 rook-ceph-crash present in Running state")
 }
 
-func checkIfRookClusterIsHealthy(s suite.Suite, testClient *clients.TestClient, clusterNamespace string) {
+func checkIfRookClusterIsHealthy(s *suite.Suite, testClient *clients.TestClient, clusterNamespace string) {
 	logger.Infof("Testing cluster %s health", clusterNamespace)
-	var err error
+	var (
+		err     error
+		healthy bool
+	)
 
 	retryCount := 0
 	for retryCount < utils.RetryLoop {
-		healthy, err := clients.IsClusterHealthy(testClient, clusterNamespace)
+		healthy, err = clients.IsClusterHealthy(testClient, clusterNamespace)
 		if healthy {
 			logger.Infof("cluster %s is healthy", clusterNamespace)
 			return
@@ -74,7 +74,13 @@ func checkIfRookClusterIsHealthy(s suite.Suite, testClient *clients.TestClient, 
 	require.Nil(s.T(), err)
 }
 
-func HandlePanics(r interface{}, uninstaller func(), t func() *testing.T) {
+func checkIfRookClusterHasHealthyIngress(s *suite.Suite, k8sh *utils.K8sHelper, clusterNamespace string) {
+	logger.Infof("Testing ingress %s health", clusterNamespace)
+	_, err := k8sh.GetResourceStatus("Ingress", clusterNamespace+"-dashboard", clusterNamespace)
+	assert.NoError(s.T(), err)
+}
+
+func HandlePanics(r any, uninstaller func(), t func() *testing.T) {
 	if r != nil {
 		logger.Infof("unexpected panic occurred during test %s, --> %v", t().Name(), r)
 		t().Fail()
@@ -83,10 +89,11 @@ func HandlePanics(r interface{}, uninstaller func(), t func() *testing.T) {
 	}
 }
 
-// StartTestCluster creates new instance of TestCephSettings struct
+// StartTestCluster installs Rook with the given settings and returns the installer and the k8s helper
 func StartTestCluster(t func() *testing.T, settings *installer.TestCephSettings) (*installer.CephInstaller, *utils.K8sHelper) {
 	k8shelper, err := utils.CreateK8sHelper(t)
 	require.NoError(t(), err)
+	settings.KubernetesVersion = k8shelper.GetK8sServerVersion()
 
 	// Turn on DEBUG logging
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)

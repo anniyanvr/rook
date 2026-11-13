@@ -22,13 +22,10 @@ import (
 	"time"
 
 	"github.com/pkg/errors"
-	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
-	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 )
 
 const (
-	beforeOctopusTime   = "2006-01-02 15:04:05.999999999Z"
-	octopusAndAfterTime = "2006-01-02T15:04:05.999999999Z"
+	timeParser = "2006-01-02T15:04:05.999999999Z"
 )
 
 type ObjectBucketMetadata struct {
@@ -55,20 +52,6 @@ type rgwBucketStats struct {
 	}
 }
 
-type ObjectBuckets []ObjectBucket
-
-func (slice ObjectBuckets) Len() int {
-	return len(slice)
-}
-
-func (slice ObjectBuckets) Less(i, j int) bool {
-	return slice[i].Name < slice[j].Name
-}
-
-func (slice ObjectBuckets) Swap(i, j int) {
-	slice[i], slice[j] = slice[j], slice[i]
-}
-
 func bucketStatsFromRGW(stats rgwBucketStats) ObjectBucketStats {
 	s := ObjectBucketStats{Size: 0, NumberOfObjects: 0}
 	for _, usage := range stats.Usage {
@@ -84,7 +67,6 @@ func GetBucketStats(c *Context, bucketName string) (*ObjectBucketStats, bool, er
 		"bucket",
 		"stats",
 		"--bucket", bucketName)
-
 	if err != nil {
 		if strings.Contains(err.Error(), "exit status 2") {
 			return nil, true, errors.New("not found")
@@ -101,29 +83,6 @@ func GetBucketStats(c *Context, bucketName string) (*ObjectBucketStats, bool, er
 	stat := bucketStatsFromRGW(rgwStats)
 
 	return &stat, false, nil
-}
-
-func GetBucketsStats(c *Context) (map[string]ObjectBucketStats, error) {
-	result, err := runAdminCommand(c,
-		true,
-		"bucket",
-		"stats")
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to list buckets")
-	}
-
-	var rgwStats []rgwBucketStats
-	if err := json.Unmarshal([]byte(result), &rgwStats); err != nil {
-		return nil, errors.Wrapf(err, "failed to read buckets stats result=%s", result)
-	}
-
-	stats := map[string]ObjectBucketStats{}
-
-	for _, rgwStat := range rgwStats {
-		stats[rgwStat.Bucket] = bucketStatsFromRGW(rgwStat)
-	}
-
-	return stats, nil
 }
 
 func getBucketMetadata(c *Context, bucket string) (*ObjectBucketMetadata, bool, error) {
@@ -152,17 +111,6 @@ func getBucketMetadata(c *Context, bucket string) (*ObjectBucketMetadata, bool, 
 	}
 	if err := json.Unmarshal([]byte(match), &s); err != nil {
 		return nil, false, errors.Wrapf(err, "failed to read buckets list result=%s", match)
-	}
-
-	timeParser := octopusAndAfterTime
-	version, err := cephver.ExtractCephVersion(opcontroller.OperatorCephBaseImageVersion)
-	if err != nil {
-		logger.Errorf("failed to extract ceph version. %v", err)
-	} else {
-		vv := *version
-		if !vv.IsAtLeastOctopus() {
-			timeParser = beforeOctopusTime
-		}
 	}
 
 	createdAt, err := time.Parse(timeParser, s.Data.CreationTime)

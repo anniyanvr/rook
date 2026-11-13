@@ -19,9 +19,10 @@ package mgr
 
 import (
 	"fmt"
-	"path"
+	"math"
+	"slices"
 	"strconv"
-	"strings"
+	"sync"
 
 	"github.com/banzaicloud/k8s-objectmatcher/patch"
 	"github.com/coreos/pkg/capnslog"
@@ -32,33 +33,32 @@ import (
 	cephclient "github.com/rook/rook/pkg/daemon/ceph/client"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/config"
+	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
 	"github.com/rook/rook/pkg/operator/ceph/controller"
+	"github.com/rook/rook/pkg/operator/ceph/reporting"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	"github.com/rook/rook/pkg/util/exec"
+	"github.com/rook/rook/pkg/util/log"
 	v1 "k8s.io/api/apps/v1"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/util/retry"
 )
 
 var logger = capnslog.NewPackageLogger("github.com/rook/rook", "op-mgr")
 
-var prometheusRuleName = "prometheus-ceph-vVERSION-rules"
-
-// PrometheusExternalRuleName is the name of the prometheus external rule
-var PrometheusExternalRuleName = "prometheus-ceph-vVERSION-rules-external"
-
 const (
-	AppName                = "rook-ceph-mgr"
-	serviceAccountName     = "rook-ceph-mgr"
-	maxMgrCount            = 2
-	PrometheusModuleName   = "prometheus"
-	crashModuleName        = "crash"
-	PgautoscalerModuleName = "pg_autoscaler"
-	balancerModuleName     = "balancer"
-	balancerModuleMode     = "upmap"
-	monitoringPath         = "/etc/ceph-monitoring/"
-	serviceMonitorFile     = "service-monitor.yaml"
+	AppName                   = "rook-ceph-mgr"
+	serviceAccountName        = "rook-ceph-mgr"
+	PrometheusModuleName      = "prometheus"
+	crashModuleName           = "crash"
+	balancerModuleName        = "balancer"
+	defaultBalancerModuleMode = "upmap"
+	mgrRoleLabelName          = "mgr_role"
+	activeMgrStatus           = "active"
+	standbyMgrStatus          = "standby"
+	serviceMonitorPort        = "http-metrics"
 	// minimum amount of memory in MB to run the pod
 	cephMgrPodMinimumMemory uint64 = 512
 	// DefaultMetricsPort prometheus exporter port
@@ -67,11 +67,15 @@ const (
 
 // Cluster represents the Rook and environment configuration settings needed to set up Ceph mgrs.
 type Cluster struct {
-	context     *clusterd.Context
-	clusterInfo *cephclient.ClusterInfo
-	rookVersion string
-	exitCode    func(err error) (int, bool)
-	spec        cephv1.ClusterSpec
+	context               *clusterd.Context
+	clusterInfo           *cephclient.ClusterInfo
+	rookVersion           string
+	exitCode              func(err error) (int, bool)
+	spec                  cephv1.ClusterSpec
+	shouldRotateCephxKeys bool
+	// moduleWaitGroup tracks the asynchronous module-configuration goroutines
+	// started by startModuleConfiguration so they can be awaited (used by tests).
+	moduleWaitGroup sync.WaitGroup
 }
 
 // New creates an instance of the mgr
@@ -85,8 +89,10 @@ func New(context *clusterd.Context, clusterInfo *cephclient.ClusterInfo, spec ce
 	}
 }
 
-var waitForDeploymentToStart = k8sutil.WaitForDeploymentToStart
-var updateDeploymentAndWait = mon.UpdateCephDeploymentAndWait
+var (
+	waitForDeploymentToStart = k8sutil.WaitForDeploymentToStart
+	updateDeploymentAndWait  = mon.UpdateCephDeploymentAndWait
+)
 
 // for backward compatibility, default to 1 mgr
 func (c *Cluster) getReplicas() int {
@@ -100,10 +106,7 @@ func (c *Cluster) getReplicas() int {
 func (c *Cluster) getDaemonIDs() []string {
 	var daemonIDs []string
 	replicas := c.getReplicas()
-	if replicas > maxMgrCount {
-		replicas = maxMgrCount
-	}
-	for i := 0; i < replicas; i++ {
+	for i := range replicas {
 		daemonIDs = append(daemonIDs, k8sutil.IndexToName(i))
 	}
 	return daemonIDs
@@ -117,9 +120,36 @@ func (c *Cluster) Start() error {
 		return errors.Wrap(err, "error checking pod memory")
 	}
 
-	logger.Infof("start running mgr")
+	log.NamespacedInfo(c.clusterInfo.Namespace, logger, "start running mgr")
+	if err := c.validateMetricsTLS(); err != nil {
+		return err
+	}
+
 	daemonIDs := c.getDaemonIDs()
 	var deploymentsToWaitFor []*v1.Deployment
+
+	mgrsToSkipReconcile, err := controller.GetDaemonsToSkipReconcile(c.clusterInfo.Context, c.context, c.clusterInfo.Namespace, config.MgrType, AppName)
+	if err != nil {
+		return errors.Wrap(err, "failed to check for mgrs to skip reconcile")
+	}
+
+	c.shouldRotateCephxKeys, err = shouldRotateMgrKeys(c.context, c.clusterInfo)
+	if err != nil {
+		return errors.Wrapf(err, "failed to check if cephx keys for mgr daemons in the namespace %q should be rotated", c.clusterInfo.Namespace)
+	}
+
+	if c.shouldRotateCephxKeys {
+		log.NamespacedInfo(c.clusterInfo.Namespace, logger, "cephx keys for mgr daemons in the namespace %q will be rotated", c.clusterInfo.Namespace)
+	}
+
+	metricsTLSSecretResourceVersion := ""
+	if c.isMetricsTLSEnabled() {
+		secret, err := c.context.Clientset.CoreV1().Secrets(c.clusterInfo.Namespace).Get(
+			c.clusterInfo.Context, c.spec.Monitoring.MetricsTLS.SecretName, metav1.GetOptions{})
+		if err == nil {
+			metricsTLSSecretResourceVersion = secret.ResourceVersion
+		}
+	}
 
 	for _, daemonID := range daemonIDs {
 		if c.clusterInfo.Context.Err() != nil {
@@ -134,7 +164,7 @@ func (c *Cluster) Start() error {
 
 		// We set the owner reference of the Secret to the Object controller instead of the replicaset
 		// because we watch for that resource and reconcile if anything happens to it
-		_, err := c.generateKeyring(mgrConfig)
+		secretResourceVersion, err := c.generateKeyring(mgrConfig)
 		if err != nil {
 			return errors.Wrapf(err, "failed to generate keyring for %q", resourceName)
 		}
@@ -145,10 +175,20 @@ func (c *Cluster) Start() error {
 			return errors.Wrapf(err, "failed to create deployment")
 		}
 
+		c.applyMetricsTLSToDeployment(d, metricsTLSSecretResourceVersion)
+
+		// apply cephx secret resource version to the deployment to ensure it restarts when keyring updates
+		d.Spec.Template.Annotations[keyring.CephxKeyIdentifierAnnotation] = secretResourceVersion
+
 		// Set the deployment hash as an annotation
 		err = patch.DefaultAnnotator.SetLastAppliedAnnotation(d)
 		if err != nil {
 			return errors.Wrapf(err, "failed to set annotation for deployment %q", d.Name)
+		}
+
+		if mgrsToSkipReconcile.Has(daemonID) {
+			log.NamespacedWarning(c.clusterInfo.Namespace, logger, "Skipping reconcile of mgr %q labeled with %q", daemonID, cephv1.SkipReconcileLabelKey)
+			continue
 		}
 
 		newDeployment, err := c.context.Clientset.AppsV1().Deployments(c.clusterInfo.Namespace).Create(c.clusterInfo.Context, d, metav1.CreateOptions{})
@@ -156,10 +196,15 @@ func (c *Cluster) Start() error {
 			if !kerrors.IsAlreadyExists(err) {
 				return errors.Wrapf(err, "failed to create mgr deployment %s", resourceName)
 			}
-			logger.Infof("deployment for mgr %s already exists. updating if needed", resourceName)
-
-			if err := updateDeploymentAndWait(c.context, c.clusterInfo, d, config.MgrType, mgrConfig.DaemonID, c.spec.SkipUpgradeChecks, false); err != nil {
-				logger.Errorf("failed to update mgr deployment %q. %v", resourceName, err)
+			log.NamespacedInfo(c.clusterInfo.Namespace, logger, "deployment for mgr %s already exists. updating if needed", resourceName)
+			if err := updateDeploymentAndWait(c.context, c.clusterInfo, d, config.MgrType, mgrConfig.DaemonID, c.spec.SkipUpgradeChecks, c.spec.ContinueUpgradeAfterChecksEvenIfNotHealthy); err != nil {
+				log.NamespacedError(c.clusterInfo.Namespace, logger, "failed to update mgr deployment %q. %v", resourceName, err)
+				if c.spec.ContinueUpgradeAfterChecksEvenIfNotHealthy {
+					log.NamespacedInfo(c.clusterInfo.Namespace, logger, "continuing reconcile of ceph cluster in namespace %s after error waiting for mgr because continueUpgradeAfterChecksEvenIfNotHealthy is true", c.clusterInfo.Namespace)
+				} else {
+					log.NamespacedInfo(c.clusterInfo.Namespace, logger, "stopping reconcile of ceph cluster in namespace %s after error waiting for mgr because continueUpgradeAfterChecksEvenIfNotHealthy is false", c.clusterInfo.Namespace)
+					return errors.Wrapf(err, "failed to update mgr deployment %q", resourceName)
+				}
 			}
 		} else {
 			// wait for the new deployment
@@ -167,10 +212,21 @@ func (c *Cluster) Start() error {
 		}
 	}
 
+	err = updateMgrCephxStatus(c.context, c.clusterInfo, c.shouldRotateCephxKeys)
+	if err != nil {
+		return errors.Wrap(err, "failed to update cephx status for mgr daemons")
+	}
+
+	// Insecure global IDs should be disabled for new clusters immediately.
+	// If we're waiting for the mgr deployments to start, it is a clean deployment
+	if len(deploymentsToWaitFor) > 0 {
+		config.DisableInsecureGlobalID(c.context, c.clusterInfo)
+	}
+
 	// If the mgr is newly created, wait for it to start before continuing with the service and
 	// module configuration
 	for _, d := range deploymentsToWaitFor {
-		if err := waitForDeploymentToStart(c.context, d); err != nil {
+		if err := waitForDeploymentToStart(c.clusterInfo.Context, c.context, d); err != nil {
 			return errors.Wrapf(err, "failed to wait for mgr %q to start", d.Name)
 		}
 	}
@@ -178,18 +234,7 @@ func (c *Cluster) Start() error {
 	// check if any extra mgrs need to be removed
 	c.removeExtraMgrs(daemonIDs)
 
-	activeMgr := daemonIDs[0]
 	if len(daemonIDs) > 1 {
-		// When multiple mgrs are running, the mgr sidecar for the active mgr
-		// will create the services. However, the sidecar will only reconcile all
-		// the services when the active mgr changes. Here as part of the regular reconcile
-		// we trigger reconciling all the services to ensure they are current.
-		activeMgr, err = c.getActiveMgr()
-		if err != nil || activeMgr == "" {
-			activeMgr = ""
-			logger.Infof("cannot reconcile mgr services, no active mgr found. err=%v", err)
-		}
-
 		// reconcile mgr PDB
 		if err := c.reconcileMgrPDB(); err != nil {
 			return errors.Wrap(err, "failed to reconcile mgr PDB")
@@ -198,177 +243,287 @@ func (c *Cluster) Start() error {
 		// delete MGR PDB as the count is less than 2
 		c.deleteMgrPDB()
 	}
-	if activeMgr != "" {
-		if err := c.reconcileServices(activeMgr); err != nil {
-			return errors.Wrap(err, "failed to enable mgr services")
-		}
+
+	if err := c.reconcileServices(); err != nil {
+		return errors.Wrap(err, "failed to enable mgr services")
 	}
 
 	// configure the mgr modules
 	c.configureModules(daemonIDs)
-
-	// enable monitoring if `monitoring: enabled: true`
-	if c.spec.Monitoring.Enabled {
-		// namespace in which the prometheusRule should be deployed
-		// if left empty, it will be deployed in current namespace
-		namespace := c.spec.Monitoring.RulesNamespace
-		if namespace == "" {
-			namespace = c.clusterInfo.Namespace
-		}
-		if err := c.DeployPrometheusRule(prometheusRuleName, namespace); err != nil {
-			logger.Errorf("failed to deploy prometheus rule. %v", err)
-		} else {
-			logger.Infof("prometheusRule deployed")
-		}
-		logger.Debugf("ended monitoring deployment")
-	}
 	return nil
 }
 
 func (c *Cluster) removeExtraMgrs(daemonIDs []string) {
+	options := metav1.ListOptions{LabelSelector: "app=" + AppName}
+	mgrDeployments, err := c.context.Clientset.AppsV1().Deployments(c.clusterInfo.Namespace).List(c.clusterInfo.Context, options)
+	if err != nil {
+		log.NamespacedWarning(c.clusterInfo.Namespace, logger, "failed to check for extra mgrs. %v", err)
+		return
+	}
+	if len(mgrDeployments.Items) == len(daemonIDs) {
+		log.NamespacedDebug(c.clusterInfo.Namespace, logger, "expected number %d of mgrs found", len(daemonIDs))
+		return
+	}
+
 	// In case the mgr count was reduced, delete the extra mgrs
-	for i := maxMgrCount - 1; i >= len(daemonIDs); i-- {
-		mgrName := fmt.Sprintf("%s-%s", AppName, k8sutil.IndexToName(i))
-		err := c.context.Clientset.AppsV1().Deployments(c.clusterInfo.Namespace).Delete(c.clusterInfo.Context, mgrName, metav1.DeleteOptions{})
-		if err == nil {
-			logger.Infof("removed extra mgr %q", mgrName)
-		} else if !kerrors.IsNotFound(err) {
-			logger.Warningf("failed to remove extra mgr %q. %v", mgrName, err)
+	for _, mgrDeployment := range mgrDeployments.Items {
+		id, ok := mgrDeployment.Labels[controller.DaemonIDLabel]
+		if !ok {
+			// skipping evaluation of non-mgr daemon that mistakenly matched the mgr labels
+			continue
+		}
+
+		if !slices.Contains(daemonIDs, id) {
+			err := c.context.Clientset.AppsV1().Deployments(c.clusterInfo.Namespace).Delete(c.clusterInfo.Context, mgrDeployment.Name, metav1.DeleteOptions{})
+			if err == nil {
+				log.NamespacedInfo(c.clusterInfo.Namespace, logger, "removed extra mgr %q", mgrDeployment.Name)
+			} else {
+				log.NamespacedWarning(c.clusterInfo.Namespace, logger, "failed to remove extra mgr %q. %v", mgrDeployment.Name, err)
+			}
 		}
 	}
 }
 
-// ReconcileActiveMgrServices reconciles the services if the active mgr is the one running
-// in the sidecar
-func (c *Cluster) ReconcileActiveMgrServices(daemonNameToUpdate string) error {
-	// If the services are already set to this daemon, no need to attempt to update
-	svc, err := c.context.Clientset.CoreV1().Services(c.clusterInfo.Namespace).Get(c.clusterInfo.Context, AppName, metav1.GetOptions{})
+// SetMgrRoleLabel sets 'mgr_role: active' label to given manager daemon pods if isActive is true.
+// Otherwise sets 'mgr_role: standby' label to manager pods.
+func (c *Cluster) SetMgrRoleLabel(daemonNameToUpdate string, isActive bool) error {
+	pods, err := c.context.Clientset.CoreV1().Pods(c.clusterInfo.Namespace).List(c.clusterInfo.Context, metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("%s=%s,%s=%s", k8sutil.AppAttr, AppName, controller.DaemonIDLabel, daemonNameToUpdate),
+	})
 	if err != nil {
-		logger.Errorf("failed to check current mgr service, proceeding to update. %v", err)
-	} else {
-		currentDaemon := svc.Spec.Selector[controller.DaemonIDLabel]
-		if currentDaemon == daemonNameToUpdate {
-			logger.Infof("mgr services already set to daemon %q, no need to update", daemonNameToUpdate)
-			return nil
+		log.NamespacedInfo(c.clusterInfo.Namespace, logger, "cannot get pod for mgr daemon %s", daemonNameToUpdate)
+		return err // force mgr_role update in the next call
+	}
+
+	newMgrRole := standbyMgrStatus
+	if isActive {
+		newMgrRole = activeMgrStatus
+	}
+	// Normally, there should only be one mgr pod with the specific name daemonNameToUpdate. However,
+	// during transitions, there might be additional mgr pods shutting down. To handle this, the code
+	// updates the label mgrRoleLabelName on all mgr pods. If this update fails, the system rolls back
+	// the currently active manager (currActiveMgr). This way the next call will retry the update.
+	var podLabelUpdErr error
+	for i, pod := range pods.Items {
+		labels := pod.GetLabels()
+		currMgrRole, mgrHasLabel := labels[mgrRoleLabelName]
+		if !mgrHasLabel || currMgrRole != newMgrRole {
+			log.NamespacedInfo(c.clusterInfo.Namespace, logger, "updating mgr_role label value of daemon %s to '%s'. New active mgr is %s.", daemonNameToUpdate, newMgrRole, daemonNameToUpdate)
+			labels[mgrRoleLabelName] = newMgrRole
+			pod.SetLabels(labels)
+			_, err = c.context.Clientset.CoreV1().Pods(c.clusterInfo.Namespace).Update(c.clusterInfo.Context, &pods.Items[i], metav1.UpdateOptions{})
+			if err != nil {
+				// don't return error from here. First try to update all pods from the list and reconcile services.
+				// return error later to update pods on next reconcile.
+				podLabelUpdErr = fmt.Errorf("cannot update the active mgr pod %q. err=%w", pods.Items[i].Name, err)
+			}
 		}
-		logger.Infof("mgr service currently set to %q, checking if need to update to %q", currentDaemon, daemonNameToUpdate)
 	}
 
-	activeName, err := c.getActiveMgr()
+	err = c.reconcileServices()
 	if err != nil {
-		return err
+		return fmt.Errorf("unable to reconcile services: %w", err)
 	}
-	if activeName == "" {
-		return errors.New("active mgr not found")
-	}
-	if daemonNameToUpdate != activeName {
-		logger.Infof("no need for the mgr update since the active mgr is %q, rather than the local mgr %q", activeName, daemonNameToUpdate)
-		return nil
+	if podLabelUpdErr != nil {
+		return podLabelUpdErr
 	}
 
-	return c.reconcileServices(activeName)
+	return nil
 }
 
-func (c *Cluster) getActiveMgr() (string, error) {
-	// The preferred way to query the active mgr is "ceph mgr stat", which is only available in pacific or newer
-	if c.clusterInfo.CephVersion.IsAtLeastPacific() {
-		mgrStat, err := cephclient.CephMgrStat(c.context, c.clusterInfo)
-		if err != nil {
-			return "", errors.Wrap(err, "failed to get mgr stat for the active mgr")
-		}
-		return mgrStat.ActiveName, nil
-	}
-
-	// The legacy way to query the active mgr is with the verbose "ceph mgr dump"
-	mgrMap, err := cephclient.CephMgrMap(c.context, c.clusterInfo)
+func (c *Cluster) GetActiveMgr() (string, error) {
+	mgrStat, err := cephclient.CephMgrStat(c.context, c.clusterInfo)
 	if err != nil {
-		return "", errors.Wrap(err, "failed to get mgr map for the active mgr")
+		return "", errors.Wrap(err, "failed to get mgr stat for the active mgr")
 	}
-
-	return mgrMap.ActiveName, nil
+	return mgrStat.ActiveName, nil
 }
 
-// reconcile the services, if the active mgr is not detected, use the default mgr
-func (c *Cluster) reconcileServices(activeDaemon string) error {
-	logger.Infof("setting services to point to mgr %q", activeDaemon)
-
-	if err := c.configureDashboardService(activeDaemon); err != nil {
+// reconcile the services,
+func (c *Cluster) reconcileServices() error {
+	if err := c.configureDashboardService(); err != nil {
 		return errors.Wrap(err, "failed to configure dashboard svc")
 	}
 
 	// create the metrics service
-	service, err := c.MakeMetricsService(AppName, activeDaemon, serviceMetricName)
+	service, err := c.MakeMetricsService(AppName, serviceMetricName)
 	if err != nil {
 		return err
 	}
-	if _, err := k8sutil.CreateOrUpdateService(c.context.Clientset, c.clusterInfo.Namespace, service); err != nil {
+	if err := c.validateMetricsTLS(); err != nil {
+		return err
+	}
+
+	if err := c.reconcileMetricsService(service); err != nil {
 		return errors.Wrap(err, "failed to create mgr metrics service")
 	}
 
 	// enable monitoring if `monitoring: enabled: true`
 	if c.spec.Monitoring.Enabled {
-		if err := c.EnableServiceMonitor(activeDaemon); err != nil {
-			return errors.Wrap(err, "failed to enable service monitor")
+		if err := c.EnableServiceMonitor(); err != nil {
+			// We don't want to return an error to block the cluster reconcile
+			// since monitoring is an optional service.
+			log.NamespacedError(c.clusterInfo.Namespace, logger, "failed to enable service monitor, prometheus may need to be installed. %v", err)
 		}
 	}
 
+	c.updateServiceSelectors()
 	return nil
+}
+
+// For the upgrade scenario: we remove any selector DaemonIDLabel from all
+// the services since new mgr HA doesn't rely on this label anymore and we add
+// the new "mgr_role=active" instead.
+func (c *Cluster) updateServiceSelectors() {
+	selector := metav1.ListOptions{LabelSelector: "app=rook-ceph-mgr"}
+	services, err := c.context.Clientset.CoreV1().Services(c.clusterInfo.Namespace).List(c.clusterInfo.Context, selector)
+	if err != nil {
+		log.NamespacedError(c.clusterInfo.Namespace, logger, "failed to query mgr services to update labels: %v", err)
+		return
+	}
+	for i, service := range services.Items {
+		if service.Spec.Selector == nil {
+			continue
+		}
+
+		updateService := false
+
+		// Check if the service has a DaemonIDLabel (legacy mgr HA implementation) and remove it
+		_, hasDaemonLabel := service.Spec.Selector[controller.DaemonIDLabel]
+		if hasDaemonLabel {
+			log.NamespacedInfo(c.clusterInfo.Namespace, logger, "removing %s selector label on mgr service %q", controller.DaemonIDLabel, service.Name)
+			delete(service.Spec.Selector, controller.DaemonIDLabel)
+			updateService = true
+		}
+
+		// In case the service doesn't have the new mgr_role DaemonIDLabel we add it
+		_, hasMgrRoleLabel := service.Spec.Selector[mgrRoleLabelName]
+		if !hasMgrRoleLabel {
+			log.NamespacedInfo(c.clusterInfo.Namespace, logger, "adding %s selector label on mgr service %q", mgrRoleLabelName, service.Name)
+			service.Spec.Selector[mgrRoleLabelName] = activeMgrStatus
+			updateService = true
+		}
+
+		if updateService {
+			if _, err := c.context.Clientset.CoreV1().Services(c.clusterInfo.Namespace).Update(c.clusterInfo.Context, &services.Items[i], metav1.UpdateOptions{}); err != nil {
+				log.NamespacedError(c.clusterInfo.Namespace, logger, "failed to update service %q. %v", service.Name, err)
+			} else {
+				log.NamespacedInfo(c.clusterInfo.Namespace, logger, "service %q successfully updated", service.Name)
+			}
+		}
+	}
 }
 
 func (c *Cluster) configureModules(daemonIDs []string) {
 	// Configure the modules asynchronously so we can complete all the configuration much sooner.
-	startModuleConfiguration("prometheus", c.enablePrometheusModule)
-	startModuleConfiguration("dashboard", c.configureDashboardModules)
-	// "crash" is part of the "always_on_modules" list as of Octopus
-	if !c.clusterInfo.CephVersion.IsAtLeastOctopus() {
-		startModuleConfiguration("crash", c.enableCrashModule)
-	} else {
-		// The balancer module must be configured on Octopus
-		// It is a bit confusing but as of Octopus modules that are in the "always_on_modules" list
-		// are "just" enabled, but still they must be configured to work properly
-		startModuleConfiguration("balancer", c.enableBalancerModule)
-	}
-	startModuleConfiguration("mgr module(s) from the spec", c.configureMgrModules)
+	c.startModuleConfiguration("prometheus", c.configurePrometheusModule)
+	c.startModuleConfiguration("dashboard", c.configureDashboardModules)
+
+	// It is a bit confusing but modules that are in the "always_on_modules" list
+	// are "just" enabled, but still they must be configured to work properly
+	c.startModuleConfiguration("balancer", c.enableBalancerModule)
+	c.startModuleConfiguration("mgr module(s) from the spec", c.configureMgrModules)
 }
 
-func startModuleConfiguration(description string, configureModules func() error) {
-	go func() {
+func (c *Cluster) startModuleConfiguration(description string, configureModules func() error) {
+	c.moduleWaitGroup.Go(func() {
 		err := configureModules()
 		if err != nil {
-			logger.Errorf("failed modules: %q. %v", description, err)
+			log.NamespacedError(c.clusterInfo.Namespace, logger, "failed modules: %q. %v", description, err)
 		} else {
-			logger.Infof("successful modules: %s", description)
+			log.NamespacedInfo(c.clusterInfo.Namespace, logger, "successful modules: %s", description)
 		}
-	}()
+	})
 }
 
 // Ceph docs about the prometheus module: http://docs.ceph.com/docs/master/mgr/prometheus/
-func (c *Cluster) enablePrometheusModule() error {
-	if err := cephclient.MgrEnableModule(c.context, c.clusterInfo, PrometheusModuleName, true); err != nil {
-		return errors.Wrap(err, "failed to enable mgr prometheus module")
+func (c *Cluster) configurePrometheusModule() error {
+	if !c.spec.Monitoring.MetricsDisabled {
+		if err := cephclient.MgrEnableModule(c.context, c.clusterInfo, PrometheusModuleName, true); err != nil {
+			return errors.Wrap(err, "failed to enable mgr prometheus module")
+		}
+	} else {
+		if err := cephclient.MgrDisableModule(c.context, c.clusterInfo, PrometheusModuleName); err != nil {
+			log.NamespacedError(c.clusterInfo.Namespace, logger, "failed to disable mgr prometheus module. %v", err)
+		}
+		return nil
+	}
+
+	var (
+		err                error
+		portHasChanged     bool
+		intervalHasChanged bool
+		daemonID           = "mgr"
+	)
+	monStore := config.GetMonStore(c.context, c.clusterInfo)
+	// port
+	if c.spec.Monitoring.Port != 0 {
+		port := strconv.Itoa(c.spec.Monitoring.Port)
+		portHasChanged, err = monStore.SetIfChanged(daemonID, "mgr/prometheus/server_port", port)
+		if err != nil {
+			return err
+		}
+		log.NamespacedInfo(c.clusterInfo.Namespace, logger, "prometheus config will change, port: %s", port)
+	}
+	// scrape interval
+	if c.spec.Monitoring.Interval != nil {
+		interval := c.spec.Monitoring.Interval.Duration.Seconds()
+		intervalHasChanged, err = setFloatOptionIfChanged(monStore, daemonID, "mgr/prometheus/scrape_interval", interval)
+		if err != nil {
+			return err
+		}
+		log.NamespacedInfo(c.clusterInfo.Namespace, logger, "prometheus config will change, interval: %v", interval)
+	}
+
+	if err := c.configurePrometheusTLS(monStore, daemonID); err != nil {
+		return err
+	}
+
+	if portHasChanged || intervalHasChanged {
+		log.NamespacedInfo(c.clusterInfo.Namespace, logger, "prometheus config has changed. restarting the prometheus module")
+		return c.restartMgrModule(PrometheusModuleName)
 	}
 	return nil
 }
 
-// Ceph docs about the crash module: https://docs.ceph.com/docs/master/mgr/crash/
-func (c *Cluster) enableCrashModule() error {
-	if err := cephclient.MgrEnableModule(c.context, c.clusterInfo, crashModuleName, true); err != nil {
-		return errors.Wrap(err, "failed to enable mgr crash module")
+// floatOptionEpsilon is the largest difference at which two float option values are treated as equal.
+// Ceph prints float options with six decimals, so a smaller difference cannot be a real change.
+const floatOptionEpsilon = 1e-6
+
+// setFloatOptionIfChanged sets a float-typed option in the mon config store only if its value has
+// changed. Ceph normalizes float options when storing them (e.g., "60" is read back as
+// "60.000000"), so the values are compared numerically rather than as strings.
+func setFloatOptionIfChanged(monStore *config.MonStore, who, option string, value float64) (bool, error) {
+	currentVal, err := monStore.Get(who, option)
+	if err != nil {
+		return false, errors.Wrapf(err, "failed to get value %q", option)
+	}
+	if current, err := strconv.ParseFloat(currentVal, 64); err == nil && math.Abs(current-value) < floatOptionEpsilon {
+		// no need to update the setting
+		return false, nil
+	}
+
+	newVal := fmt.Sprintf("%v", value)
+	if err := monStore.Set(who, option, newVal); err != nil {
+		return false, errors.Wrapf(err, "failed to set value %s=%s", option, newVal)
+	}
+	return true, nil
+}
+
+func (c *Cluster) restartMgrModule(name string) error {
+	log.NamespacedInfo(c.clusterInfo.Namespace, logger, "restarting the mgr module: %s", name)
+	if err := cephclient.MgrDisableModule(c.context, c.clusterInfo, name); err != nil {
+		return errors.Wrapf(err, "failed to disable mgr module %q.", name)
+	}
+	if err := cephclient.MgrEnableModule(c.context, c.clusterInfo, name, true); err != nil {
+		return errors.Wrapf(err, "failed to enable mgr module %q.", name)
 	}
 	return nil
 }
 
 func (c *Cluster) enableBalancerModule() error {
-	// The order MATTERS, always configure this module first, then turn it on
-
-	// This sets min compat client to luminous and the balancer module mode
-	err := cephclient.ConfigureBalancerModule(c.context, c.clusterInfo, balancerModuleMode)
-	if err != nil {
-		return errors.Wrapf(err, "failed to configure module %q", balancerModuleName)
-	}
-
 	// This turns "on" the balancer
-	err = cephclient.MgrEnableModule(c.context, c.clusterInfo, balancerModuleName, false)
+	err := cephclient.MgrEnableModule(c.context, c.clusterInfo, balancerModuleName, false)
 	if err != nil {
 		return errors.Wrapf(err, "failed to turn on mgr %q module", balancerModuleName)
 	}
@@ -376,7 +531,34 @@ func (c *Cluster) enableBalancerModule() error {
 	return nil
 }
 
+// The rook mgr module has some issues in specific Ceph releases, so we disable it for those versions.
+// v20.2.2 has a memory leak and v20.2.3 and v20.2.4 cause a mgr pod crash.
+func (c *Cluster) rookModuleDisabledForCephVersion() bool {
+	v := c.clusterInfo.CephVersion
+	if v.Major != 20 || v.Minor != 2 {
+		return false
+	}
+	return v.Extra >= 2 && v.Extra <= 4
+}
+
+// disableRookOrchestratorModule clears the orchestrator backend and then disables the
+// rook mgr module. The backend is cleared first so the orchestrator no longer references
+// the rook module that is about to be disabled.
+func (c *Cluster) disableRookOrchestratorModule() {
+	if err := c.setOrchestratorBackend(""); err != nil {
+		logger.Warningf("failed to clear the orchestrator backend. %v", err)
+	}
+	if err := cephclient.MgrDisableModule(c.context, c.clusterInfo, rookModuleName); err != nil {
+		logger.Warningf("failed to disable rook mgr module. %v", err)
+	}
+}
+
 func (c *Cluster) configureMgrModules() error {
+	if c.rookModuleDisabledForCephVersion() {
+		logger.Infof("disabling the rook mgr module for Ceph %s", c.clusterInfo.CephVersion.String())
+		c.disableRookOrchestratorModule()
+	}
+
 	// Enable mgr modules from the spec
 	for _, module := range c.spec.Mgr.Modules {
 		if module.Name == "" {
@@ -385,6 +567,12 @@ func (c *Cluster) configureMgrModules() error {
 		if wellKnownModule(module.Name) {
 			return errors.Errorf("cannot configure mgr module %q that is configured with other cluster settings", module.Name)
 		}
+		if module.Name == rookModuleName && c.rookModuleDisabledForCephVersion() {
+			if module.Enabled {
+				logger.Infof("skipping rook mgr module configuration for Ceph %s", c.clusterInfo.CephVersion.String())
+			}
+			continue
+		}
 		minVersion, versionOK := c.moduleMeetsMinVersion(module.Name)
 		if !versionOK {
 			return errors.Errorf("module %q cannot be configured because it requires at least Ceph version %q", module.Name, minVersion.String())
@@ -392,8 +580,12 @@ func (c *Cluster) configureMgrModules() error {
 
 		if module.Enabled {
 			if module.Name == balancerModuleName {
+				mode := module.Settings.BalancerMode
+				if mode == "" {
+					mode = defaultBalancerModuleMode
+				}
 				// Configure balancer module mode
-				err := cephclient.ConfigureBalancerModule(c.context, c.clusterInfo, balancerModuleMode)
+				err := cephclient.ConfigureBalancerModule(c.context, c.clusterInfo, mode)
 				if err != nil {
 					return errors.Wrapf(err, "failed to configure module %q", module.Name)
 				}
@@ -405,22 +597,15 @@ func (c *Cluster) configureMgrModules() error {
 
 			// Configure special settings for individual modules that are enabled
 			switch module.Name {
-			case PgautoscalerModuleName:
-				monStore := config.GetMonStore(c.context, c.clusterInfo)
-				// Ceph Octopus will have that option enabled
-				err := monStore.Set("global", "osd_pool_default_pg_autoscale_mode", "on")
-				if err != nil {
-					return errors.Wrap(err, "failed to enable pg autoscale mode for newly created pools")
-				}
-				err = monStore.Set("global", "mon_pg_warn_min_per_osd", "0")
-				if err != nil {
-					return errors.Wrap(err, "failed to set minimal number PGs per (in) osd before we warn the admin to")
-				}
 			case rookModuleName:
-				startModuleConfiguration("orchestrator modules", c.configureOrchestratorModules)
+				c.startModuleConfiguration("orchestrator modules", c.configureOrchestratorModules)
 			}
 
 		} else {
+			if module.Name == rookModuleName {
+				c.disableRookOrchestratorModule()
+				continue
+			}
 			if err := cephclient.MgrDisableModule(c.context, c.clusterInfo, module.Name); err != nil {
 				return errors.Wrapf(err, "failed to disable mgr module %q", module.Name)
 			}
@@ -433,7 +618,7 @@ func (c *Cluster) configureMgrModules() error {
 func (c *Cluster) moduleMeetsMinVersion(name string) (*cephver.CephVersion, bool) {
 	minVersions := map[string]cephver.CephVersion{
 		// Put the modules here, example:
-		// pgautoscalerModuleName: {Major: 14},
+		// "moduleName": {Major: 15},
 	}
 	if ver, ok := minVersions[name]; ok {
 		// Check if the required min version is met
@@ -445,77 +630,34 @@ func (c *Cluster) moduleMeetsMinVersion(name string) (*cephver.CephVersion, bool
 
 func wellKnownModule(name string) bool {
 	knownModules := []string{dashboardModuleName, PrometheusModuleName, crashModuleName}
-	for _, known := range knownModules {
-		if name == known {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(knownModules, name)
 }
 
-// EnableServiceMonitor add a servicemonitor that allows prometheus to scrape from the monitoring endpoint of the cluster
-func (c *Cluster) EnableServiceMonitor(activeDaemon string) error {
-	serviceMonitor, err := k8sutil.GetServiceMonitor(path.Join(monitoringPath, serviceMonitorFile))
-	if err != nil {
-		return errors.Wrap(err, "service monitor could not be enabled")
-	}
-	serviceMonitor.SetName(AppName)
-	serviceMonitor.SetNamespace(c.clusterInfo.Namespace)
-	cephv1.GetMonitoringLabels(c.spec.Labels).ApplyToObjectMeta(&serviceMonitor.ObjectMeta)
+// EnableServiceMonitor adds a servicemonitor that allows prometheus to scrape from the monitoring endpoint of the cluster
+func (c *Cluster) EnableServiceMonitor() error {
+	serviceMonitor := k8sutil.GetServiceMonitor(AppName, c.clusterInfo.Namespace, serviceMonitorPort)
+	cephv1.GetMonitoringLabels(c.spec.Labels).OverwriteApplyToObjectMeta(&serviceMonitor.ObjectMeta)
 
 	if c.spec.External.Enable {
 		serviceMonitor.Spec.Endpoints[0].Port = controller.ServiceExternalMetricName
 	}
-	err = c.clusterInfo.OwnerInfo.SetControllerReference(serviceMonitor)
+	k8sutil.ApplyMonitoringTiming(c.spec.Monitoring, serviceMonitor)
+
+	c.applyMetricsTLSToServiceMonitor(serviceMonitor)
+	err := c.clusterInfo.OwnerInfo.SetControllerReference(serviceMonitor)
 	if err != nil {
 		return errors.Wrapf(err, "failed to set owner reference to service monitor %q", serviceMonitor.Name)
 	}
-	serviceMonitor.Spec.NamespaceSelector.MatchNames = []string{c.clusterInfo.Namespace}
-	serviceMonitor.Spec.Selector.MatchLabels = c.selectorLabels(activeDaemon)
 
 	applyMonitoringLabels(c, serviceMonitor)
 
-	if _, err = k8sutil.CreateOrUpdateServiceMonitor(serviceMonitor); err != nil {
+	if _, err = k8sutil.CreateOrUpdateServiceMonitor(c.context, c.clusterInfo.Context, serviceMonitor); err != nil {
 		return errors.Wrap(err, "service monitor could not be enabled")
 	}
 	return nil
 }
 
-// DeployPrometheusRule deploy prometheusRule that adds alerting and/or recording rules to the cluster
-func (c *Cluster) DeployPrometheusRule(name, namespace string) error {
-	version := strconv.Itoa(c.clusterInfo.CephVersion.Major)
-	name = strings.Replace(name, "VERSION", version, 1)
-	prometheusRuleFile := name + ".yaml"
-	prometheusRuleFile = path.Join(monitoringPath, prometheusRuleFile)
-	prometheusRule, err := k8sutil.GetPrometheusRule(prometheusRuleFile)
-	if err != nil {
-		return errors.Wrap(err, "prometheus rule could not be deployed")
-	}
-	prometheusRule.SetName(name)
-	prometheusRule.SetNamespace(namespace)
-	err = c.clusterInfo.OwnerInfo.SetControllerReference(prometheusRule)
-	if err != nil {
-		return errors.Wrapf(err, "failed to set owner reference to prometheus rule %q", prometheusRule.Name)
-	}
-	cephv1.GetMonitoringLabels(c.spec.Labels).ApplyToObjectMeta(&prometheusRule.ObjectMeta)
-	if _, err := k8sutil.CreateOrUpdatePrometheusRule(prometheusRule); err != nil {
-		return errors.Wrap(err, "prometheus rule could not be deployed")
-	}
-	return nil
-}
-
-// IsModuleInSpec returns whether a module is present in the CephCluster manager spec
-func IsModuleInSpec(modules []cephv1.Module, moduleName string) bool {
-	for _, v := range modules {
-		if v.Name == moduleName {
-			return true
-		}
-	}
-
-	return false
-}
-
-// ApplyMonitoringLabels function adds the name of the resource that manages
+// applyMonitoringLabels function adds the name of the resource that manages
 // cephcluster, as a label on the ceph metrics
 func applyMonitoringLabels(c *Cluster, serviceMonitor *monitoringv1.ServiceMonitor) {
 	if c.spec.Labels != nil {
@@ -523,15 +665,69 @@ func applyMonitoringLabels(c *Cluster, serviceMonitor *monitoringv1.ServiceMonit
 			if managedBy, ok := monitoringLabels["rook.io/managedBy"]; ok {
 				relabelConfig := monitoringv1.RelabelConfig{
 					TargetLabel: "managedBy",
-					Replacement: managedBy,
+					Replacement: &managedBy,
 				}
 				serviceMonitor.Spec.Endpoints[0].RelabelConfigs = append(
-					serviceMonitor.Spec.Endpoints[0].RelabelConfigs, &relabelConfig)
+					serviceMonitor.Spec.Endpoints[0].RelabelConfigs, relabelConfig)
 			} else {
-				logger.Info("rook.io/managedBy not specified in monitoring labels")
+				log.NamespacedInfo(serviceMonitor.Namespace, logger, "rook.io/managedBy not specified in monitoring labels")
 			}
 		} else {
-			logger.Info("monitoring labels not specified")
+			log.NamespacedDebug(serviceMonitor.Namespace, logger, "monitoring labels not specified")
 		}
 	}
+}
+
+func shouldRotateMgrKeys(c *clusterd.Context, clusterInfo *cephclient.ClusterInfo) (bool, error) {
+	clusterObj := &cephv1.CephCluster{}
+	if err := c.Client.Get(clusterInfo.Context, clusterInfo.NamespacedName(), clusterObj); err != nil {
+		return false, errors.Wrapf(err, "failed to get cluster %v.", clusterInfo.NamespacedName())
+	}
+	desiredCephVersion := clusterInfo.CephVersion
+	// TODO: for rotation WithCephVersionUpdate fix this to have the right runningCephVersion and desiredCephVersion
+	runningCephVersion := clusterInfo.CephVersion
+
+	// daemon key type always takes the default from setDefaultCephxKeyType()
+	shouldRotateKeys, err := keyring.ShouldRotateCephxKeys(
+		clusterObj.Spec.Security.CephX.Daemon, runningCephVersion, desiredCephVersion, clusterObj.Status.Cephx.Mgr, true, clusterInfo.Namespace)
+	if err != nil {
+		return false, errors.Wrap(err, "failed to check if mgr daemon keys should be rotated or not")
+	}
+
+	return shouldRotateKeys, nil
+}
+
+func updateMgrCephxStatus(c *clusterd.Context, clusterInfo *cephclient.ClusterInfo, didRotate bool) error {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		cluster := &cephv1.CephCluster{}
+		if err := c.Client.Get(clusterInfo.Context, clusterInfo.NamespacedName(), cluster); err != nil {
+			return errors.Wrapf(err, "failed to get cluster %v to update the conditions.", clusterInfo.NamespacedName())
+		}
+		keyType := cephv1.CephxKeyTypeUndefined // daemon key type always takes the default from setDefaultCephxKeyType()
+		updatedStatus := keyring.UpdatedCephxStatus(didRotate, cluster.Spec.Security.CephX.Daemon, clusterInfo.CephVersion, cluster.Status.Cephx.Mgr, keyType)
+		cluster.Status.Cephx.Mgr = updatedStatus
+
+		// Attempt to determine the authoritative key type of the mgr reported by ceph
+		// If this fails, leave the key type as it would have been.
+		mgrKeyType, err := keyring.DetermineCephxKeyTypesForEntityType(c, clusterInfo, cephclient.AuthDumpKeysEntityTypeMgr, "")
+		if err == nil && len(mgrKeyType) == 1 {
+			log.NamespacedDebug(clusterInfo.Namespace, logger, "determined authoritative cephx key type for mgrs is %q", mgrKeyType[0])
+			cluster.Status.Cephx.Mgr.KeyType = cephv1.CephxKeyType(mgrKeyType[0])
+		} else {
+			log.NamespacedInfo(clusterInfo.Namespace, logger, "failed to determine authoritative cephx key type for mgrs having key types [%v]: %v", mgrKeyType, err)
+		}
+
+		log.NamespacedDebug(clusterInfo.Namespace, logger, "updating mgr daemon cephx status to %+v", cluster.Status.Cephx.Mgr)
+		if err := reporting.UpdateStatus(c.Client, cluster); err != nil {
+			return errors.Wrap(err, "failed to update cluster cephx status for mgr daemon")
+		}
+		log.NamespacedInfo(clusterInfo.Namespace, logger, "successfully updated the cephx status for mgr daemon")
+
+		return nil
+	})
+	if err != nil {
+		return errors.Wrap(err, "failed to update cluster cephx status for mgr daemon")
+	}
+
+	return nil
 }

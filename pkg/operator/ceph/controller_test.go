@@ -17,13 +17,11 @@ limitations under the License.
 package operator
 
 import (
-	"context"
 	"os"
 	"testing"
 	"time"
 
 	"github.com/coreos/pkg/capnslog"
-	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	rookclient "github.com/rook/rook/pkg/client/clientset/versioned/fake"
 	"github.com/rook/rook/pkg/client/clientset/versioned/scheme"
 	"github.com/rook/rook/pkg/clusterd"
@@ -31,9 +29,7 @@ import (
 	"github.com/rook/rook/pkg/operator/test"
 	"github.com/rook/rook/pkg/util/exec"
 	"github.com/stretchr/testify/assert"
-	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -41,7 +37,7 @@ import (
 )
 
 func TestOperatorController(t *testing.T) {
-	ctx := context.TODO()
+	ctx := t.Context()
 	// Set DEBUG logging
 	capnslog.SetGlobalLogLevel(capnslog.DEBUG)
 	os.Setenv("ROOK_LOG_LEVEL", "DEBUG")
@@ -64,7 +60,6 @@ func TestOperatorController(t *testing.T) {
 
 		// Register operator types with the runtime scheme.
 		s := scheme.Scheme
-		s.AddKnownTypes(cephv1.SchemeGroupVersion, &v1.ConfigMap{}, &v1.ConfigMapList{})
 
 		// Create a fake client to mock API calls.
 		cl := fake.NewClientBuilder().WithScheme(s).Build()
@@ -95,7 +90,6 @@ func TestOperatorController(t *testing.T) {
 
 		// Register operator types with the runtime scheme.
 		s := scheme.Scheme
-		s.AddKnownTypes(cephv1.SchemeGroupVersion, &v1.ConfigMap{}, &v1.ConfigMapList{})
 
 		// Create a fake client to mock API calls.
 		cl := fake.NewClientBuilder().WithScheme(s).Build()
@@ -110,8 +104,7 @@ func TestOperatorController(t *testing.T) {
 				ServiceAccount:    "foo",
 			},
 		}
-		os.Setenv("ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS", "10")
-		defer os.Unsetenv("ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS")
+		t.Setenv("ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS", "10")
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.False(t, res.Requeue)
@@ -129,23 +122,12 @@ func TestOperatorController(t *testing.T) {
 		// Register operator types with the runtime scheme.
 		// s := scheme.Scheme
 		s := clientgoscheme.Scheme
-		// s.AddKnownTypes(cephv1.SchemeGroupVersion, &v1.ConfigMap{})
 
-		opConfigCM := &v1.ConfigMap{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      controller.OperatorSettingConfigMapName,
-				Namespace: namespace,
-			},
-			Data: map[string]string{
-				"ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS": "20",
-			},
-		}
+		os.Setenv("ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS", "20")
+		defer os.Unsetenv("ROOK_CEPH_COMMANDS_TIMEOUT_SECONDS")
 
-		object := []runtime.Object{
-			opConfigCM,
-		}
 		// Create a fake client to mock API calls.
-		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects(object...).Build()
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects().Build()
 
 		// Create a ReconcileCSI object with the scheme and fake client.
 		r := &ReconcileConfig{
@@ -174,7 +156,6 @@ func TestOperatorController(t *testing.T) {
 
 		// Register operator types with the runtime scheme.
 		s := scheme.Scheme
-		s.AddKnownTypes(cephv1.SchemeGroupVersion, &v1.ConfigMap{}, &v1.ConfigMapList{})
 
 		// Create a fake client to mock API calls.
 		cl := fake.NewClientBuilder().WithScheme(s).Build()
@@ -189,8 +170,7 @@ func TestOperatorController(t *testing.T) {
 				ServiceAccount:    "foo",
 			},
 		}
-		os.Setenv("ROOK_ENABLE_DISCOVERY_DAEMON", "true")
-		defer os.Unsetenv("ROOK_ENABLE_DISCOVERY_DAEMON")
+		t.Setenv("ROOK_ENABLE_DISCOVERY_DAEMON", "true")
 		res, err := r.Reconcile(ctx, req)
 		assert.NoError(t, err)
 		assert.False(t, res.Requeue)
@@ -198,5 +178,40 @@ func TestOperatorController(t *testing.T) {
 		assert.NoError(t, err)
 		assert.Equal(t, 1, len(ds.Items), ds)
 		assert.Equal(t, "rook-discover", ds.Items[0].Name, ds)
+	})
+
+	t.Run("success - cm set for allowing loop devices", func(t *testing.T) {
+		fakeClientSet := test.New(t, 1)
+		test.SetFakeKubernetesVersion(fakeClientSet, "v1.21.0")
+		c := &clusterd.Context{
+			Clientset:     fakeClientSet,
+			RookClientset: rookclient.NewSimpleClientset(),
+		}
+
+		// Register operator types with the runtime scheme.
+		// s := scheme.Scheme
+		s := clientgoscheme.Scheme
+
+		os.Setenv("ROOK_CEPH_ALLOW_LOOP_DEVICES", "true")
+		defer os.Unsetenv("ROOK_CEPH_ALLOW_LOOP_DEVICES")
+
+		// Create a fake client to mock API calls.
+		cl := fake.NewClientBuilder().WithScheme(s).WithRuntimeObjects().Build()
+
+		// Create a ReconcileCSI object with the scheme and fake client.
+		r := &ReconcileConfig{
+			client:  cl,
+			context: c,
+			config: controller.OperatorConfig{
+				OperatorNamespace: namespace,
+				Image:             "rook",
+				ServiceAccount:    "foo",
+			},
+		}
+
+		res, err := r.Reconcile(ctx, req)
+		assert.NoError(t, err)
+		assert.False(t, res.Requeue)
+		assert.True(t, controller.LoopDevicesAllowed())
 	})
 }

@@ -7,23 +7,41 @@
       2,
       "always",
       [
+        "block",
         "bot",
         "build",
-        "ceph",
-        "cephfs-mirror",
+        "cephfsmirror",
         "ci",
         "core",
+        "cosi",
         "csi",
+        "doc",
         "docs",
+        "exporter",
+        "external",
+        "file",
         "helm",
+        "k8sutil",
+        "manifest",
         "mds",
         "mgr",
         "mon",
+        "monitoring",
+        "multus",
+        "network",
+        "nvmeof",
+        "nfs",
+        "object",
+        "operator",
         "osd",
         "pool",
-        "rbd-mirror",
+        "rbdmirror",
         "rgw",
-        "test"
+        "security",
+        "subvolumegroup",
+        "namespace",
+        "test",
+        "tests"
       ]
     ],
     "body-leading-blank": [
@@ -31,7 +49,11 @@
       "always"
     ],
     "footer-leading-blank": [
-      2,
+      1,
+      "always"
+    ],
+    "body-max-line-length": [
+      0,
       "always"
     ]
   }

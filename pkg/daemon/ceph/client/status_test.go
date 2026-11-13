@@ -17,20 +17,29 @@ package client
 
 import (
 	"encoding/json"
+	"regexp"
 	"testing"
 
+	"github.com/pkg/errors"
+	"github.com/rook/rook/pkg/clusterd"
+	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 )
 
 const (
+	activeClean              = "active+clean"
+	activeCleanScrubbing     = "active+clean+scrubbing"
+	activeCleanScrubbingDeep = "active+clean+scrubbing+deep"
+	activeCleanSnaptrim      = "active+clean+snaptrim"
+	activeCleanSnaptrimWait  = "active+clean+snaptrim_wait"
+
 	// this JSON was generated from `ceph status -f json`, using Ceph Luminous 12.1.3
-	CephStatusResponseRaw = `{"fsid":"613975f3-3025-4802-9de1-a2280b950e75","health":{"checks":{"OSD_DOWN":{"severity":"HEALTH_WARN","summary":{"message":"1 osds down"}},"OSD_HOST_DOWN":{"severity":"HEALTH_WARN","summary":{"message":"1 host (1 osds) down"}},"PG_AVAILABILITY":{"severity":"HEALTH_WARN","summary":{"message":"Reduced data availability: 101 pgs stale"}},"POOL_APP_NOT_ENABLED":{"severity":"HEALTH_WARN","summary":{"message":"application not enabled on 1 pool(s)"}}},"status":"HEALTH_WARN","overall_status":"HEALTH_WARN"},"election_epoch":12,"quorum":[0,1,2],"quorum_names":["rook-ceph-mon0","rook-ceph-mon2","rook-ceph-mon1"],"monmap":{"epoch":3,"fsid":"613975f3-3025-4802-9de1-a2280b950e75","modified":"2017-08-11 20:13:02.075679","created":"2017-08-11 20:12:35.314510","features":{"persistent":["kraken","luminous"],"optional":[]},"mons":[{"rank":0,"name":"rook-ceph-mon0","addr":"10.3.0.45:6789/0","public_addr":"10.3.0.45:6789/0"},{"rank":1,"name":"rook-ceph-mon2","addr":"10.3.0.249:6789/0","public_addr":"10.3.0.249:6789/0"},{"rank":2,"name":"rook-ceph-mon1","addr":"10.3.0.252:6789/0","public_addr":"10.3.0.252:6789/0"}]},"osdmap":{"osdmap":{"epoch":17,"num_osds":2,"num_up_osds":1,"num_in_osds":2,"full":false,"nearfull":true,"num_remapped_pgs":0}},"pgmap":{"pgs_by_state":[{"state_name":"stale+active+clean","count":101},{"state_name":"active+clean","count":99}],"num_pgs":200,"num_pools":2,"num_objects":243,"data_bytes":976793635,"bytes_used":13611479040,"bytes_avail":19825307648,"bytes_total":33436786688},"fsmap":{"epoch":1,"by_rank":[]},"mgrmap":{"epoch":3,"active_gid":14111,"active_name":"rook-ceph-mgr0","active_addr":"10.2.73.6:6800/9","available":true,"standbys":[],"modules":["restful","status"],"available_modules":["dashboard","prometheus","restful","status","zabbix"]},"servicemap":{"epoch":1,"modified":"0.000000","services":{}}}`
+	CephStatusResponseRaw = `{"fsid":"613975f3-3025-4802-9de1-a2280b950e75","health":{"checks":{"OSD_DOWN":{"severity":"HEALTH_WARN","summary":{"message":"1 osds down"}},"OSD_HOST_DOWN":{"severity":"HEALTH_WARN","summary":{"message":"1 host (1 osds) down"}},"PG_AVAILABILITY":{"severity":"HEALTH_WARN","summary":{"message":"Reduced data availability: 101 pgs stale"}},"POOL_APP_NOT_ENABLED":{"severity":"HEALTH_WARN","summary":{"message":"application not enabled on 1 pool(s)"}}},"status":"HEALTH_WARN","overall_status":"HEALTH_WARN"},"election_epoch":12,"quorum":[0,1,2],"quorum_names":["rook-ceph-mon0","rook-ceph-mon2","rook-ceph-mon1"],"monmap":{"epoch":3,"fsid":"613975f3-3025-4802-9de1-a2280b950e75","modified":"2017-08-11 20:13:02.075679","created":"2017-08-11 20:12:35.314510","features":{"persistent":["kraken","luminous"],"optional":[]},"mons":[{"rank":0,"name":"rook-ceph-mon0","addr":"10.3.0.45:6789/0","public_addr":"10.3.0.45:6789/0"},{"rank":1,"name":"rook-ceph-mon2","addr":"10.3.0.249:6789/0","public_addr":"10.3.0.249:6789/0"},{"rank":2,"name":"rook-ceph-mon1","addr":"10.3.0.252:6789/0","public_addr":"10.3.0.252:6789/0"}]},"osdmap":{"epoch":17,"num_osds":2,"num_up_osds":1,"num_in_osds":2,"full":false,"nearfull":true,"num_remapped_pgs":0},"pgmap":{"pgs_by_state":[{"state_name":"stale+active+clean","count":101},{"state_name":"active+clean","count":99}],"num_pgs":200,"num_pools":2,"num_objects":243,"data_bytes":976793635,"bytes_used":13611479040,"bytes_avail":19825307648,"bytes_total":33436786688},"fsmap":{"epoch":1,"by_rank":[]},"mgrmap":{"epoch":3,"active_gid":14111,"active_name":"rook-ceph-mgr0","active_addr":"10.2.73.6:6800/9","available":true,"standbys":[],"modules":["restful","status"],"available_modules":["dashboard","prometheus","restful","status","zabbix"]},"servicemap":{"epoch":1,"modified":"0.000000","services":{}}}`
 )
 
-var (
-	// this JSON was generated from `ceph status -f json`, using Ceph Nautilus 14.2.1
-	// It was chopped to only show what the tests are looking for
-	statusFakeRaw = []byte(`{
+// this JSON was generated from `ceph status -f json`, using Ceph Nautilus 14.2.1
+// It was chopped to only show what the tests are looking for
+var statusFakeRaw = []byte(`{
 		"fsmap": {
 		  "epoch": 13,
 		  "id": 1,
@@ -43,13 +52,12 @@ var (
 			  "rank": 0,
 			  "name": "myfs-b",
 			  "status": "up:active",
-			  "gid": 14716
+			  "gid": 13999249051405999408
 			}
 		  ],
 		  "up:standby": 1
 		}
 	  }`)
-)
 
 func TestStatusMarshal(t *testing.T) {
 	var status CephStatus
@@ -70,10 +78,10 @@ func TestStatusMarshal(t *testing.T) {
 	assert.Equal(t, "10.3.0.45:6789/0", status.MonMap.Mons[0].Address)
 
 	// verify some OSD map fields
-	assert.Equal(t, 2, status.OsdMap.OsdMap.NumOsd)
-	assert.Equal(t, 1, status.OsdMap.OsdMap.NumUpOsd)
-	assert.False(t, status.OsdMap.OsdMap.Full)
-	assert.True(t, status.OsdMap.OsdMap.NearFull)
+	assert.Equal(t, 2, status.OsdMap.NumOsd)
+	assert.Equal(t, 1, status.OsdMap.NumUpOsd)
+	assert.False(t, status.OsdMap.Full)
+	assert.True(t, status.OsdMap.NearFull)
 
 	// verify some PG map fields
 	assert.Equal(t, 200, status.PgMap.NumPgs)
@@ -88,12 +96,12 @@ func TestIsClusterClean(t *testing.T) {
 			PgsByState: []PgStateEntry{
 				{StateName: activeClean, Count: 3},
 			},
-			NumPgs: 10,
+			NumPgs: 14,
 		},
 	}
 
 	// not a clean cluster with PGs not adding up
-	_, clean := isClusterClean(status)
+	_, clean := isClusterClean(status, defaultPgHealthyRegexCompiled)
 	assert.False(t, clean)
 
 	// clean cluster
@@ -101,12 +109,21 @@ func TestIsClusterClean(t *testing.T) {
 		PgStateEntry{StateName: activeCleanScrubbing, Count: 5})
 	status.PgMap.PgsByState = append(status.PgMap.PgsByState,
 		PgStateEntry{StateName: activeCleanScrubbingDeep, Count: 2})
-	_, clean = isClusterClean(status)
+	status.PgMap.PgsByState = append(status.PgMap.PgsByState,
+		PgStateEntry{StateName: activeCleanSnaptrim, Count: 2})
+	status.PgMap.PgsByState = append(status.PgMap.PgsByState,
+		PgStateEntry{StateName: activeCleanSnaptrimWait, Count: 2})
+	_, clean = isClusterClean(status, defaultPgHealthyRegexCompiled)
 	assert.True(t, clean)
 
 	// not a clean cluster with PGs in a bad state
 	status.PgMap.PgsByState[0].StateName = "notclean"
-	_, clean = isClusterClean(status)
+	_, clean = isClusterClean(status, defaultPgHealthyRegexCompiled)
+	assert.False(t, clean)
+
+	// clean cluster if the regex is satisfied
+	re := regexp.MustCompile("notclean")
+	_, clean = isClusterClean(status, re)
 	assert.False(t, clean)
 }
 
@@ -136,4 +153,69 @@ func TestIsCephHealthy(t *testing.T) {
 	statusFake.Health.Status = "HEALTH_ERR"
 	s = isCephHealthy(statusFake)
 	assert.False(t, s)
+}
+
+func TestMuteHealthWarning(t *testing.T) {
+	tests := []struct {
+		name           string
+		warning        string
+		value          string
+		expectedArgs   []string
+		mockError      error
+		expectsWarning bool
+	}{
+		{
+			name:           "mute via MuteHealthWarning",
+			warning:        "MON_NETSPLIT",
+			value:          "mute",
+			expectedArgs:   []string{"health", "mute", "MON_NETSPLIT", "--sticky"},
+			mockError:      nil,
+			expectsWarning: false,
+		},
+		{
+			name:           "unmute",
+			warning:        "AUTH_INSECURE_GLOBAL_ID_RECLAIM",
+			value:          "unmute",
+			expectedArgs:   []string{"health", "unmute", "AUTH_INSECURE_GLOBAL_ID_RECLAIM"},
+			mockError:      nil,
+			expectsWarning: false,
+		},
+		{
+			name:           "command failure logs warning",
+			warning:        "MON_NETSPLIT",
+			value:          "mute",
+			expectedArgs:   []string{"health", "mute", "MON_NETSPLIT", "--sticky"},
+			mockError:      errors.New("command execution failed"),
+			expectsWarning: true,
+		},
+		{
+			name:           "unknown value returns error",
+			warning:        "MON_NETSPLIT",
+			value:          "invalid",
+			expectedArgs:   nil,
+			mockError:      nil,
+			expectsWarning: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			executor := &exectest.MockExecutor{}
+			executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+				assert.Equal(t, "ceph", command)
+				assert.Equal(t, tt.expectedArgs, args[:len(tt.expectedArgs)])
+				return "", tt.mockError
+			}
+
+			context := &clusterd.Context{Executor: executor}
+			clusterInfo := AdminTestClusterInfo("mycluster")
+
+			err := MuteHealthWarning(context, clusterInfo, tt.warning, tt.value)
+			if tt.expectedArgs == nil {
+				assert.Error(t, err)
+				return
+			}
+			assert.Equal(t, tt.mockError, err)
+		})
+	}
 }

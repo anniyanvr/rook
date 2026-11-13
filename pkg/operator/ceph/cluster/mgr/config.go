@@ -19,14 +19,19 @@ package mgr
 import (
 	"fmt"
 
+	"github.com/pkg/errors"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/operator/ceph/config"
 	"github.com/rook/rook/pkg/operator/ceph/config/keyring"
-	"k8s.io/apimachinery/pkg/api/errors"
+	"github.com/rook/rook/pkg/util/log"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const (
-	keyringTemplate = `
+	// Ports below 1024 require extra privileges for binding inside a pod
+	minPortWithoutPrivileges = 1024
+	keyringTemplate          = `
 [mgr.%s]
 	key = %s
 	caps mon = "allow profile mgr"
@@ -42,17 +47,37 @@ type mgrConfig struct {
 	DataPathMap  *config.DataPathMap // location to store data in container
 }
 
-func (c *Cluster) dashboardPort() int {
+// dashboardInternalPort gets the port to be used by the service targetPort
+// and the container ports on the mgr pod.
+// If the port is greater than 1024, for backward compatibility the port and
+// targetPort should be the same value. If the port is less than 1024,
+// the internal port must use a higher port number. In that case, the internal
+// port will be the default port number and only the public port will be
+// the desired port in the cluster CR.
+func (c *Cluster) dashboardInternalPort() int {
+	port := c.dashboardPublicPort()
+	if port < minPortWithoutPrivileges {
+		// If the port is less than the allowed range, set it back to the default
+		return c.dashboardDefaultPort()
+	}
+	return port
+}
+
+// dashboardPublicPort is the desired port to be exposed on the service
+func (c *Cluster) dashboardPublicPort() int {
 	if c.spec.Dashboard.Port == 0 {
-		// default port for HTTP/HTTPS
-		if c.spec.Dashboard.SSL {
-			return dashboardPortHTTPS
-		} else {
-			return dashboardPortHTTP
-		}
+		return c.dashboardDefaultPort()
 	}
 	// crd validates port >= 0
 	return c.spec.Dashboard.Port
+}
+
+func (c *Cluster) dashboardDefaultPort() int {
+	// default port for HTTP/HTTPS
+	if c.spec.Dashboard.SSL {
+		return dashboardPortHTTPS
+	}
+	return dashboardPortHTTP
 }
 
 func (c *Cluster) generateKeyring(m *mgrConfig) (string, error) {
@@ -60,21 +85,31 @@ func (c *Cluster) generateKeyring(m *mgrConfig) (string, error) {
 	access := []string{"mon", "allow profile mgr", "mds", "allow *", "osd", "allow *"}
 	s := keyring.GetSecretStore(c.context, c.clusterInfo, c.clusterInfo.OwnerInfo)
 
-	key, err := s.GenerateKey(user, access)
+	keyType := cephv1.CephxKeyTypeUndefined // daemon key type always takes the default from setDefaultCephxKeyType()
+	key, err := s.GenerateKey(user, keyType, access)
 	if err != nil {
 		return "", err
+	}
+
+	if c.shouldRotateCephxKeys {
+		log.NamespacedInfo(c.clusterInfo.Namespace, logger, "rotating cephx key for mgr daemon %q in the namespace %q", m.ResourceName, c.clusterInfo.Namespace)
+		newKey, err := s.RotateKey(user, keyType)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to rotate cephx key for mgr daemon %q", m.ResourceName)
+		}
+		key = newKey
 	}
 
 	// Delete legacy key store for upgrade from Rook v0.9.x to v1.0.x
 	err = c.context.Clientset.CoreV1().Secrets(c.clusterInfo.Namespace).Delete(c.clusterInfo.Context, m.ResourceName, metav1.DeleteOptions{})
 	if err != nil {
-		if errors.IsNotFound(err) {
-			logger.Debugf("legacy mgr key %q is already removed", m.ResourceName)
+		if kerrors.IsNotFound(err) {
+			log.NamespacedDebug(c.clusterInfo.Namespace, logger, "legacy mgr key %q is already removed", m.ResourceName)
 		} else {
-			logger.Warningf("legacy mgr key %q could not be removed. %v", m.ResourceName, err)
+			log.NamespacedWarning(c.clusterInfo.Namespace, logger, "legacy mgr key %q could not be removed. %v", m.ResourceName, err)
 		}
 	}
 
 	keyring := fmt.Sprintf(keyringTemplate, m.DaemonID, key)
-	return keyring, s.CreateOrUpdate(m.ResourceName, keyring)
+	return s.CreateOrUpdate(m.ResourceName, keyring)
 }

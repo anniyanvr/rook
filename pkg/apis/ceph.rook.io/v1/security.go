@@ -20,29 +20,52 @@ import (
 	"strings"
 
 	"github.com/hashicorp/vault/api"
+	"github.com/libopenstorage/secrets"
 	"github.com/libopenstorage/secrets/vault"
 )
 
-var (
-	VaultTLSConnectionDetails = []string{api.EnvVaultCACert, api.EnvVaultClientCert, api.EnvVaultClientKey}
-)
+var VaultTLSConnectionDetails = []string{api.EnvVaultCACert, api.EnvVaultClientCert, api.EnvVaultClientKey}
 
-// IsEnabled return whether a KMS is configured
+// IsEnabled returns whether a KMS is configured
 func (kms *KeyManagementServiceSpec) IsEnabled() bool {
 	return len(kms.ConnectionDetails) != 0
 }
 
-// IsTokenAuthEnabled return whether KMS token auth is enabled
+// IsTokenAuthEnabled returns whether KMS token auth is enabled
 func (kms *KeyManagementServiceSpec) IsTokenAuthEnabled() bool {
 	return kms.TokenSecretName != ""
 }
 
-// IsK8sAuthEnabled return whether KMS Kubernetes auth is enabled
+// IsK8sAuthEnabled returns whether KMS Kubernetes auth is enabled
 func (kms *KeyManagementServiceSpec) IsK8sAuthEnabled() bool {
 	return getParam(kms.ConnectionDetails, vault.AuthMethod) == vault.AuthMethodKubernetes && kms.TokenSecretName == ""
 }
 
-// IsTLSEnabled return KMS TLS details are configured
+// IsAgentAuthEnabled returns whether Vault Agent auth is enabled
+func (kms *KeyManagementServiceSpec) IsAgentAuthEnabled() bool {
+	return getParam(kms.ConnectionDetails, vault.AuthMethod) == "agent" && kms.TokenSecretName == ""
+}
+
+// IsVaultKMS returns whether Vault KMS is configured
+func (kms *KeyManagementServiceSpec) IsVaultKMS() bool {
+	return getParam(kms.ConnectionDetails, "KMS_PROVIDER") == secrets.TypeVault
+}
+
+func (kms *KeyManagementServiceSpec) IsAzureMS() bool {
+	return getParam(kms.ConnectionDetails, "KMS_PROVIDER") == secrets.TypeAzure
+}
+
+// IsIBMKeyProtectKMS returns whether IBM Key Protect KMS is configured
+func (kms *KeyManagementServiceSpec) IsIBMKeyProtectKMS() bool {
+	return getParam(kms.ConnectionDetails, "KMS_PROVIDER") == "ibmkeyprotect"
+}
+
+// IsKMIPKMS returns whether KMIP KMS is configured
+func (kms *KeyManagementServiceSpec) IsKMIPKMS() bool {
+	return getParam(kms.ConnectionDetails, "KMS_PROVIDER") == "kmip"
+}
+
+// IsTLSEnabled returns whether KMS TLS details are configured
 func (kms *KeyManagementServiceSpec) IsTLSEnabled() bool {
 	for _, tlsOption := range VaultTLSConnectionDetails {
 		tlsSecretName := getParam(kms.ConnectionDetails, tlsOption)
@@ -59,4 +82,31 @@ func getParam(kmsConfig map[string]string, param string) string {
 		return strings.TrimSpace(val)
 	}
 	return ""
+}
+
+// KnownCephxKeyTypes is the list of CephX key types known to Rook. This isn't used for input
+// validation (that is covered by CRD enums), but instead for allowing Rook to tell Ceph to allow
+// the full list of key types, when needed.
+// Developers should ensure the last item in the list should be the preferred key type.
+var KnownCephxKeyTypes = []CephxKeyType{
+	CephxKeyTypeAes,
+	CephxKeyTypeAes256k,
+}
+
+// PreferredCephxKeytype returns Rook's preferred key type.
+func PreferredCephxKeyType() CephxKeyType {
+	return KnownCephxKeyTypes[len(KnownCephxKeyTypes)-1]
+}
+
+// KeyTypesListToArgString turns a list of key types into a value compatible with auth_allowed_ciphers.
+func KeyTypesListToArgString(types []CephxKeyType) string {
+	if len(types) == 0 {
+		return ""
+	}
+	var o strings.Builder
+	o.WriteString(string(types[0]))
+	for i := 1; i < len(types); i++ {
+		o.WriteString("," + string(types[i])) // ceph docs show comma-space separation
+	}
+	return o.String()
 }

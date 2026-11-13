@@ -12,285 +12,337 @@ defaults:
     # reference: https://docs.github.com/en/actions/reference/workflow-syntax-for-github-actions#using-a-specific-shell
     shell: bash --noprofile --norc -eo pipefail -x {0}
 
+permissions:
+  contents: read
+
+env:
+  # Required for go-ceph rgw/admin account APIs which are gated behind
+  # the ceph_preview build tag. Can be removed when go-ceph promotes
+  # the account API out of preview.
+  GOFLAGS: "-tags=ceph_preview"
+
 jobs:
+  build-rook-image-amd64:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Free Disk Space (Ubuntu)
+        uses: jlumbroso/free-disk-space@ceedf095f4ec1a097402bc6bd80831f2e1a6fde6 # v2.0.0
+        with:
+          tool-cache: true # removes old golang version but saves ~6GB
+          large-packages: false # takes a long time to run b/c package mgr
+          android: false # takes a long time to run b/c package mgr
+          dotnet: false # takes a long time to run b/c package mgr
+          haskell: false # takes a long time to run b/c package mgr
+
+      - name: setup golang
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: "1.26"
+
+      - name: build rook image
+        run: tests/scripts/github-action-helper.sh build_rook_image_artifact
+
+      - name: upload rook image
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rook-image-amd64
+          path: _output/ci-image
+          retention-days: 7
+          # the payload is already zstd-compressed
+          compression-level: 0
+          overwrite: true
+
   TestCephHelmSuite:
-    runs-on: ubuntu-18.04
+    needs: build-rook-image-amd64
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        kubernetes-versions : ['v1.16.15','v1.18.15','v1.20.5','v1.22.2']
+        kubernetes-version: ["v1.32.11", "v1.34.8", "v1.36.1", "v1.37.0"]
     steps:
-    - name: checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-    - name: setup golang
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.16
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: rook-image-amd64
 
-    - name: setup minikube
-      uses: manusa/actions-setup-minikube@v2.3.1
-      with:
-        minikube version: 'v1.23.2'
-        kubernetes version: ${{ matrix.kubernetes-versions }}
-        start args: --memory 6g --cpus=2
-        github token: ${{ secrets.GITHUB_TOKEN }}
+      - name: TestCephHelmSuite
+        run: |
+          tests/scripts/github-action-helper.sh collect_udev_logs_in_background
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          SKIP_TEST_CLEANUP=false SKIP_CLEANUP_POLICY=false go test -v -timeout 1800s -run CephHelmSuite github.com/rook/rook/tests/integration
 
-    - name: remove read permission from kube config file
-      run: sudo chmod go-r ~/.kube/config
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="helm-ns"
+          export OPERATOR_NAMESPACE="helm-ns-system"
+          tests/scripts/collect-logs.sh
 
-    - name: print k8s cluster status
-      run: tests/scripts/github-action-helper.sh print_k8s_cluster_status
-
-    - name: use local disk
-      run: tests/scripts/github-action-helper.sh use_local_disk_for_integration_test
-
-    - name: build rook
-      run: tests/scripts/github-action-helper.sh build_rook
-
-    - name: TestCephHelmSuite
-      run: |
-        tests/scripts/github-action-helper.sh collect_udev_logs_in_background
-        tests/scripts/minikube.sh helm
-        tests/scripts/helm.sh up
-        export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-        SKIP_TEST_CLEANUP=false SKIP_CLEANUP_POLICY=false go test -v -timeout 1800s -run CephHelmSuite github.com/rook/rook/tests/integration
-
-    - name: collect common logs
-      if: always()
-      run: |
-        export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
-        export CLUSTER_NAMESPACE="helm-ns"
-        export OPERATOR_NAMESPACE="helm-ns-system"
-        tests/scripts/collect-logs.sh
-
-    - name: Artifact
-      uses: actions/upload-artifact@v2
-      if: failure()
-      with:
-        name: ceph-helm-suite-artifact-${{ matrix.kubernetes-versions }}
-        path: /home/runner/work/rook/rook/tests/integration/_output/tests/
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-helm-suite-artifact-${{ matrix.kubernetes-version }}
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
   TestCephMultiClusterDeploySuite:
-    runs-on: ubuntu-18.04
+    needs: build-rook-image-amd64
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        kubernetes-versions : ['v1.16.15','v1.18.15','v1.20.5','v1.22.2']
+        kubernetes-version: ["v1.32.11", "v1.34.8", "v1.36.1", "v1.37.0"]
     steps:
-    - name: checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-    - name: setup golang
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.16
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: rook-image-amd64
 
-    - name: setup minikube
-      uses: manusa/actions-setup-minikube@v2.4.2
-      with:
-        minikube version: 'v1.23.2'
-        kubernetes version: ${{ matrix.kubernetes-versions }}
-        start args: --memory 6g --cpus=2
-        github token: ${{ secrets.GITHUB_TOKEN }}
+      - name: TestCephMultiClusterDeploySuite
+        run: |
+          tests/scripts/github-action-helper.sh collect_udev_logs_in_background
+          DEVICE_NAME="$(tests/scripts/github-action-helper.sh find_extra_block_dev)"
+          export BLOCK="/dev/${DEVICE_NAME}"
+          export TEST_SCRATCH_DEVICE="/dev/${DEVICE_NAME}"
+          export DEVICE_FILTER="$DEVICE_NAME"
+          go test -v -timeout 1800s -run CephMultiClusterDeploySuite github.com/rook/rook/tests/integration
 
-    - name: print k8s cluster status
-      run: tests/scripts/github-action-helper.sh print_k8s_cluster_status
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export OPERATOR_NAMESPACE="multi-core-system"
+          CLUSTER_NAMESPACE="multi-core" tests/scripts/collect-logs.sh
+          CLUSTER_NAMESPACE="multi-external" tests/scripts/collect-logs.sh
 
-    - name: use local disk
-      run: tests/scripts/github-action-helper.sh use_local_disk_for_integration_test
-
-    - name: build rook
-      run: tests/scripts/github-action-helper.sh build_rook
-
-    - name: TestCephMultiClusterDeploySuite
-      run: |
-        tests/scripts/github-action-helper.sh collect_udev_logs_in_background
-        export TEST_SCRATCH_DEVICE=$(sudo lsblk --paths|awk '/14G/ {print $1}'| head -1)1
-        export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-        go test -v -timeout 1800s -run CephMultiClusterDeploySuite github.com/rook/rook/tests/integration
-
-    - name: collect common logs
-      if: always()
-      run: |
-        export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
-        export OPERATOR_NAMESPACE="multi-core-system"
-        CLUSTER_NAMESPACE="multi-core" tests/scripts/collect-logs.sh
-        CLUSTER_NAMESPACE="multi-external" tests/scripts/collect-logs.sh
-
-    - name: Artifact
-      uses: actions/upload-artifact@v2
-      if: failure()
-      with:
-        name: ceph-multi-cluster-deploy-suite-artifact-${{ matrix.kubernetes-versions }}
-        path: /home/runner/work/rook/rook/tests/integration/_output/tests/
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-multi-cluster-deploy-suite-artifact-${{ matrix.kubernetes-version }}
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
   TestCephSmokeSuite:
-    runs-on: ubuntu-18.04
+    needs: build-rook-image-amd64
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        kubernetes-versions : ['v1.16.15','v1.18.15','v1.20.5','v1.22.2']
+        kubernetes-version: ["v1.32.11", "v1.34.8", "v1.36.1", "v1.37.0"]
     steps:
-    - name: checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-    - name: setup golang
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.16
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: rook-image-amd64
 
-    - name: setup minikube
-      uses: manusa/actions-setup-minikube@v2.4.2
-      with:
-        minikube version: 'v1.23.2'
-        kubernetes version: ${{ matrix.kubernetes-versions }}
-        start args: --memory 6g --cpus=2
-        github token: ${{ secrets.GITHUB_TOKEN }}
+      - name: TestCephSmokeSuite
+        run: |
+          tests/scripts/github-action-helper.sh collect_udev_logs_in_background
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          SKIP_CLEANUP_POLICY=false go test -v -timeout 1800s -run CephSmokeSuite github.com/rook/rook/tests/integration
 
-    - name: print k8s cluster status
-      run: tests/scripts/github-action-helper.sh print_k8s_cluster_status
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="smoke-ns"
+          export OPERATOR_NAMESPACE="smoke-ns-system"
+          tests/scripts/collect-logs.sh
 
-    - name: use local disk
-      run: tests/scripts/github-action-helper.sh use_local_disk_for_integration_test
-
-    - name: build rook
-      run: tests/scripts/github-action-helper.sh build_rook
-
-    - name: TestCephSmokeSuite
-      run: |
-        tests/scripts/github-action-helper.sh collect_udev_logs_in_background
-        export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-        SKIP_CLEANUP_POLICY=false go test -v -timeout 1800s -run CephSmokeSuite github.com/rook/rook/tests/integration
-
-    - name: collect common logs
-      if: always()
-      run: |
-        export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
-        export CLUSTER_NAMESPACE="smoke-ns"
-        export OPERATOR_NAMESPACE="smoke-ns-system"
-        tests/scripts/collect-logs.sh
-
-    - name: Artifact
-      uses: actions/upload-artifact@v2
-      if: failure()
-      with:
-        name: ceph-smoke-suite-artifact-${{ matrix.kubernetes-versions }}
-        path: /home/runner/work/rook/rook/tests/integration/_output/tests/
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-smoke-suite-artifact-${{ matrix.kubernetes-version }}
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
   TestCephUpgradeSuite:
-    runs-on: ubuntu-18.04
+    needs: build-rook-image-amd64
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        kubernetes-versions : ['v1.16.15','v1.18.15','v1.20.5','v1.22.2']
+        kubernetes-version: ["v1.32.11", "v1.34.8", "v1.36.1", "v1.37.0"]
     steps:
-    - name: checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-    - name: setup golang
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.16
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: rook-image-amd64
 
-    - name: setup minikube
-      uses: manusa/actions-setup-minikube@v2.4.2
-      with:
-        minikube version: 'v1.23.2'
-        kubernetes version: ${{ matrix.kubernetes-versions }}
-        start args: --memory 6g --cpus=2
-        github token: ${{ secrets.GITHUB_TOKEN }}
+      - name: TestCephUpgradeSuite
+        run: |
+          tests/scripts/github-action-helper.sh collect_udev_logs_in_background
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          go test -v -timeout 2400s -run CephUpgradeSuite/TestUpgradeRook github.com/rook/rook/tests/integration
 
-    - name: print k8s cluster status
-      run: tests/scripts/github-action-helper.sh print_k8s_cluster_status
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="upgrade"
+          export OPERATOR_NAMESPACE="upgrade-system"
+          tests/scripts/collect-logs.sh
 
-    - name: use local disk
-      run: tests/scripts/github-action-helper.sh use_local_disk_for_integration_test
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-upgrade-suite-artifact-${{ matrix.kubernetes-version }}
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
-    - name: build rook
-      run: tests/scripts/github-action-helper.sh build_rook
+  TestHelmUpgradeSuite:
+    needs: build-rook-image-amd64
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        kubernetes-version: ["v1.32.11", "v1.34.8", "v1.36.1", "v1.37.0"]
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-    - name: TestCephUpgradeSuite
-      run: |
-        tests/scripts/github-action-helper.sh collect_udev_logs_in_background
-        export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-        go test -v -timeout 1800s -run CephUpgradeSuite/TestUpgradeRookToMaster github.com/rook/rook/tests/integration
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: rook-image-amd64
 
-    - name: collect common logs
-      if: always()
-      run: |
-        export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
-        export CLUSTER_NAMESPACE="upgrade-ns"
-        export OPERATOR_NAMESPACE="upgrade-ns-system"
-        tests/scripts/collect-logs.sh
+      - name: TestHelmUpgradeSuite
+        run: |
+          tests/scripts/github-action-helper.sh collect_udev_logs_in_background
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          go test -v -timeout 1800s -run CephUpgradeSuite/TestUpgradeHelm github.com/rook/rook/tests/integration
 
-    - name: Artifact
-      uses: actions/upload-artifact@v2
-      if: failure()
-      with:
-        name: ceph-upgrade-suite-artifact-${{ matrix.kubernetes-versions }}
-        path: /home/runner/work/rook/rook/tests/integration/_output/tests/
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="upgrade"
+          export OPERATOR_NAMESPACE="upgrade-system"
+          tests/scripts/collect-logs.sh
+
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-upgrade-suite-artifact-${{ matrix.kubernetes-version }}
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
   TestCephObjectSuite:
-    if: ${{ github.event_name == 'pull_request' && github.ref != 'refs/heads/master' && !contains(github.event.pull_request.labels.*.name, 'skip-ci') }}
-    runs-on: ubuntu-18.04
+    needs: build-rook-image-amd64
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:
-        kubernetes-versions : ['v1.16.15', 'v1.22.2']
+        kubernetes-version: ["v1.32.11"]  # test only on oldest supported k8s version
     steps:
-    - name: checkout
-      uses: actions/checkout@v2
-      with:
-        fetch-depth: 0
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-    - name: setup golang
-      uses: actions/setup-go@v2
-      with:
-        go-version: 1.16
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: rook-image-amd64
 
-    - name: setup minikube
-      uses: manusa/actions-setup-minikube@v2.4.2
-      with:
-        minikube version: 'v1.23.2'
-        kubernetes version: ${{ matrix.kubernetes-versions }}
-        start args: --memory 6g --cpus=2
-        github token: ${{ secrets.GITHUB_TOKEN }}
+      - name: TestCephObjectSuite (without TLS)
+        run: |
+          tests/scripts/github-action-helper.sh collect_udev_logs_in_background
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          SKIP_CLEANUP_POLICY=false go test -v -timeout 2400s -failfast -run CephObjectSuite/TestWithoutTLS github.com/rook/rook/tests/integration
 
-    - name: print k8s cluster status
-      run: tests/scripts/github-action-helper.sh print_k8s_cluster_status
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="object-ns"
+          export OPERATOR_NAMESPACE="object-ns-system"
+          tests/scripts/collect-logs.sh
 
-    - name: use local disk
-      run: tests/scripts/github-action-helper.sh use_local_disk_for_integration_test
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-object-suite-artifact-${{ matrix.kubernetes-version }}
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/
 
-    - name: build rook
-      run: tests/scripts/github-action-helper.sh build_rook
+  TestCephObjectSuiteTLS:
+    needs: build-rook-image-amd64
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        kubernetes-version: ["v1.37.0"]  # test only on latest supported k8s version
+    steps:
+      - name: checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-    - name: TestCephObjectSuite
-      run: |
-        tests/scripts/github-action-helper.sh collect_udev_logs_in_background
-        export DEVICE_FILTER=$(lsblk|awk '/14G/ {print $1}'| head -1)
-        SKIP_CLEANUP_POLICY=false go test -v -timeout 1800s -failfast -run CephObjectSuite github.com/rook/rook/tests/integration
+      - name: setup cluster resources
+        uses: ./.github/workflows/integration-test-setup-cluster-resources
+        with:
+          kubernetes-version: ${{ matrix.kubernetes-version }}
+          rook-image-artifact: rook-image-amd64
 
-    - name: collect common logs
-      if: always()
-      run: |
-        export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
-        export CLUSTER_NAMESPACE="object-ns"
-        export OPERATOR_NAMESPACE="object-ns-system"
-        tests/scripts/collect-logs.sh
+      - name: TestCephObjectSuiteTLS
+        run: |
+          tests/scripts/github-action-helper.sh collect_udev_logs_in_background
+          DEVICE_FILTER=$(tests/scripts/github-action-helper.sh find_extra_block_dev)
+          export DEVICE_FILTER
+          SKIP_CLEANUP_POLICY=false go test -v -timeout 2400s -failfast -run CephObjectSuite/TestWithTLS github.com/rook/rook/tests/integration
 
-    - name: Artifact
-      uses: actions/upload-artifact@v2
-      if: failure()
-      with:
-        name: ceph-object-suite-artifact-${{ matrix.kubernetes-versions }}
-        path: /home/runner/work/rook/rook/tests/integration/_output/tests/
+      - name: collect common logs
+        if: always()
+        run: |
+          export LOG_DIR="/home/runner/work/rook/rook/tests/integration/_output/tests/"
+          export CLUSTER_NAMESPACE="object-ns"
+          export OPERATOR_NAMESPACE="object-ns-system"
+          tests/scripts/collect-logs.sh
+
+      - name: Artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: failure()
+        with:
+          name: ceph-object-suite-tls-artifact-${{ matrix.kubernetes-version }}
+          path: /home/runner/work/rook/rook/tests/integration/_output/tests/

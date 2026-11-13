@@ -18,7 +18,9 @@ package client
 
 import (
 	"context"
+	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -44,10 +46,20 @@ func TestFinalizeCephCommandArgs(t *testing.T) {
 		"--keyring=/var/lib/rook/rook-ceph/rook/client.admin.keyring",
 	}
 
-	clusterInfo := AdminClusterInfo("rook")
-	cmd, args := FinalizeCephCommandArgs(expectedCommand, clusterInfo, args, configDir)
+	clusterInfo := AdminTestClusterInfo("rook")
+	cmd, gotArgs := FinalizeCephCommandArgs(expectedCommand, clusterInfo, args, configDir)
 	assert.Exactly(t, expectedCommand, cmd)
-	assert.Exactly(t, expectedArgs, args)
+	assert.Exactly(t, expectedArgs, gotArgs)
+
+	t.Run("keyring override", func(t *testing.T) {
+		// run the same test as above, but set the keyring override
+		clusterInfo.KeyringFileOverride = "/some/random/file/path.extension"
+		// keyring arg should change but nothing else
+		expectedArgs[len(expectedArgs)-1] = "--keyring=/some/random/file/path.extension"
+		cmd, args := FinalizeCephCommandArgs(expectedCommand, clusterInfo, args, configDir)
+		assert.Exactly(t, expectedCommand, cmd)
+		assert.Exactly(t, expectedArgs, args)
+	})
 }
 
 func TestFinalizeRadosGWAdminCommandArgs(t *testing.T) {
@@ -74,7 +86,7 @@ func TestFinalizeRadosGWAdminCommandArgs(t *testing.T) {
 		"--keyring=/var/lib/rook/rook-ceph/rook/client.admin.keyring",
 	}
 
-	clusterInfo := AdminClusterInfo("rook")
+	clusterInfo := AdminTestClusterInfo("rook")
 	cmd, args := FinalizeCephCommandArgs(expectedCommand, clusterInfo, args, configDir)
 	assert.Exactly(t, expectedCommand, cmd)
 	assert.Exactly(t, expectedArgs, args)
@@ -99,7 +111,7 @@ func TestFinalizeCephCommandArgsToolBox(t *testing.T) {
 		"--connect-timeout=15",
 	}
 
-	clusterInfo := AdminClusterInfo("rook")
+	clusterInfo := AdminTestClusterInfo("rook")
 	exec.CephCommandsTimeout = 15 * time.Second
 	cmd, args := FinalizeCephCommandArgs(expectedCommand, clusterInfo, args, configDir)
 	assert.Exactly(t, "kubectl", cmd)
@@ -111,7 +123,7 @@ func TestNewRBDCommand(t *testing.T) {
 	args := []string{"create", "--size", "1G", "myvol"}
 
 	t.Run("rbd command with no multus", func(t *testing.T) {
-		clusterInfo := AdminClusterInfo("rook")
+		clusterInfo := AdminTestClusterInfo("rook")
 		executor := &exectest.MockExecutor{}
 		executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
 			switch {
@@ -127,10 +139,9 @@ func TestNewRBDCommand(t *testing.T) {
 		output, err := cmd.Run()
 		assert.NoError(t, err)
 		assert.Equal(t, "success", string(output))
-
 	})
 	t.Run("rbd command with multus", func(t *testing.T) {
-		clusterInfo := AdminClusterInfo("rook")
+		clusterInfo := AdminTestClusterInfo("rook")
 		clusterInfo.NetworkSpec.Provider = "multus"
 		executor := &exectest.MockExecutor{}
 		context := &clusterd.Context{Executor: executor, RemoteExecutor: exec.RemotePodCommandExecutor{ClientSet: test.New(t, 3)}}
@@ -144,8 +155,8 @@ func TestNewRBDCommand(t *testing.T) {
 	})
 
 	t.Run("context canceled nothing to run", func(t *testing.T) {
-		clusterInfo := AdminClusterInfo("rook")
-		ctx, cancel := context.WithCancel(context.TODO())
+		clusterInfo := AdminTestClusterInfo("rook")
+		ctx, cancel := context.WithCancel(t.Context())
 		clusterInfo.Context = ctx
 		cancel()
 		executor := &exectest.MockExecutor{}
@@ -156,5 +167,72 @@ func TestNewRBDCommand(t *testing.T) {
 		// This is not the best but it shows we go through the right codepath
 		assert.EqualError(t, err, "context canceled")
 	})
+}
 
+func TestNewGaneshaRadosGraceCommand(t *testing.T) {
+	anyArgContains := func(substr string, args []string) bool {
+		for _, arg := range args {
+			if strings.Contains(arg, substr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	args := []string{"--pool", ".nfs", "--ns", "my-nfs", "add", "node"}
+
+	timeout := time.Second
+
+	ctx := func() *clusterd.Context {
+		return &clusterd.Context{
+			Executor: &exectest.MockExecutor{
+				MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+					t.Logf("command: %s %v", command, arg)
+					assert.Equal(t, time.Second, timeout)
+
+					assert.Equal(t, "ganesha-rados-grace", command)
+					assert.Equal(t, []string{"--pool", ".nfs", "--ns", "my-nfs", "add", "node"}, arg[0:6])
+
+					// ganesha-rados-grace's conf flag is --cephconf
+					assert.True(t, anyArgContains("--cephconf=", arg))
+					// ganesha-rados-grace accepts NO standard flags
+					assert.False(t, anyArgContains("--cluster", arg))
+					assert.False(t, anyArgContains("--conf", arg))
+					assert.False(t, anyArgContains("--name", arg))
+					assert.False(t, anyArgContains("--keyring", arg))
+					assert.False(t, anyArgContains("--format", arg))
+
+					return "", nil
+				},
+			},
+		}
+	}
+
+	clusterInfo := func() *ClusterInfo {
+		return &ClusterInfo{
+			Namespace: "rook-ceph",
+			Context:   context.Background(),
+		}
+	}
+
+	t.Run("normal call", func(t *testing.T) {
+		cmd := NewGaneshaRadosGraceCommand(ctx(), clusterInfo(), args)
+		assert.Equal(t, false, cmd.JsonOutput)
+
+		_, err := cmd.RunWithTimeout(timeout)
+		assert.NoError(t, err)
+	})
+
+	t.Run("error call", func(t *testing.T) {
+		ctx := ctx()
+		ctx.Executor = &exectest.MockExecutor{
+			MockExecuteCommandWithTimeout: func(timeout time.Duration, command string, arg ...string) (string, error) {
+				return "", fmt.Errorf("induced error")
+			},
+		}
+
+		cmd := NewGaneshaRadosGraceCommand(ctx, clusterInfo(), args)
+		_, err := cmd.RunWithTimeout(timeout)
+		assert.Error(t, err)
+	})
 }

@@ -1,11 +1,11 @@
 /*
-Copyright The Kubernetes Authors.
+Copyright 2018 The Rook Authors. All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
 
-    http://www.apache.org/licenses/LICENSE-2.0
+    http://www.apache.org/licenses/LICENSE-2.0
 
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
@@ -19,25 +19,54 @@ limitations under the License.
 package v1
 
 import (
-	"context"
+	context "context"
 	time "time"
 
-	cephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
+	apiscephrookiov1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	versioned "github.com/rook/rook/pkg/client/clientset/versioned"
 	internalinterfaces "github.com/rook/rook/pkg/client/informers/externalversions/internalinterfaces"
-	v1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
+	cephrookiov1 "github.com/rook/rook/pkg/client/listers/ceph.rook.io/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	runtime "k8s.io/apimachinery/pkg/runtime"
+	schema "k8s.io/apimachinery/pkg/runtime/schema"
 	watch "k8s.io/apimachinery/pkg/watch"
 	cache "k8s.io/client-go/tools/cache"
 )
 
 // CephObjectZoneInformer provides access to a shared informer and lister for
-// CephObjectZones.
+// CephObjectZones. Prefer using the type-safe variant (see [TypedCephObjectZoneInformer]).
 type CephObjectZoneInformer interface {
 	Informer() cache.SharedIndexInformer
-	Lister() v1.CephObjectZoneLister
+	Lister() cephrookiov1.CephObjectZoneLister
 }
+
+// TypedCephObjectZoneInformer provides access to a shared informer and lister for
+// CephObjectZones, including the type-safe TypedInformer variant.
+// It is a superset of CephObjectZoneInformer.
+type TypedCephObjectZoneInformer interface {
+	Informer() cache.SharedIndexInformer
+	TypedInformer() CephObjectZoneIndexInformer
+	Lister() cephrookiov1.CephObjectZoneLister
+}
+
+// CephObjectZoneIndexInformer is a wrapper around the underlying [cache.SharedIndexInformer]
+// with type-safe variants of several methods.
+type CephObjectZoneIndexInformer cache.TypedSharedIndexInformer[*apiscephrookiov1.CephObjectZone]
+
+// CephObjectZoneHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerFuncs] for CephObjectZone.
+type CephObjectZoneHandlerFuncs = cache.TypedResourceEventHandlerFuncs[*apiscephrookiov1.CephObjectZone]
+
+// CephObjectZoneDetailedHandlerFuncs is a specialization of [cache.TypedResourceEventHandlerDetailedFuncs] for CephObjectZone.
+type CephObjectZoneDetailedHandlerFuncs = cache.TypedResourceEventHandlerDetailedFuncs[*apiscephrookiov1.CephObjectZone]
+
+// CephObjectZoneFilteringHandler is a specialization of [cache.TypedFilteringResourceEventHandler] for CephObjectZone.
+type CephObjectZoneFilteringHandler = cache.TypedFilteringResourceEventHandler[*apiscephrookiov1.CephObjectZone]
+
+// CephObjectZoneIndexers is a specialization of [cache.TypedIndexers] for CephObjectZone.
+type CephObjectZoneIndexers = cache.TypedIndexers[*apiscephrookiov1.CephObjectZone]
+
+// DeletedCephObjectZone is a specialization of [cache.DeletedObject] for CephObjectZone.
+type DeletedCephObjectZone = cache.DeletedObject[*apiscephrookiov1.CephObjectZone]
 
 type cephObjectZoneInformer struct {
 	factory          internalinterfaces.SharedInformerFactory
@@ -48,43 +77,132 @@ type cephObjectZoneInformer struct {
 // NewCephObjectZoneInformer constructs a new informer for CephObjectZone type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephObjectZoneInformer]).
 func NewCephObjectZoneInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers) cache.SharedIndexInformer {
-	return NewFilteredCephObjectZoneInformer(client, namespace, resyncPeriod, indexers, nil)
+	return NewCephObjectZoneInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers})
+}
+
+// NewTypedCephObjectZoneInformer constructs a new informer for CephObjectZone type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephObjectZoneInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephObjectZoneIndexers) CephObjectZoneIndexInformer {
+	return NewTypedCephObjectZoneInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers)})
 }
 
 // NewFilteredCephObjectZoneInformer constructs a new informer for CephObjectZone type.
 // Always prefer using an informer factory to get a shared informer instead of getting an independent
 // one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedFilteredCephObjectZoneInformer]).
 func NewFilteredCephObjectZoneInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers cache.Indexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) cache.SharedIndexInformer {
-	return cache.NewSharedIndexInformer(
-		&cache.ListWatch{
-			ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+	return NewTypedCephObjectZoneInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: indexers, TweakListOptions: tweakListOptions})
+}
+
+// NewTypedFilteredCephObjectZoneInformer constructs a new informer for CephObjectZone type.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedFilteredCephObjectZoneInformer(client versioned.Interface, namespace string, resyncPeriod time.Duration, indexers CephObjectZoneIndexers, tweakListOptions internalinterfaces.TweakListOptionsFunc) CephObjectZoneIndexInformer {
+	return NewTypedCephObjectZoneInformerWithOptions(client, namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.TypedIndexersToIndexers(indexers), TweakListOptions: tweakListOptions})
+}
+
+// NewCephObjectZoneInformerWithOptions constructs a new informer for CephObjectZone type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+// If you really need an independent one, prefer using the type-safe variant (see [NewTypedCephObjectZoneInformerWithOptions]).
+func NewCephObjectZoneInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) cache.SharedIndexInformer {
+	return NewTypedCephObjectZoneInformerWithOptions(client, namespace, options)
+}
+
+// NewTypedCephObjectZoneInformerWithOptions constructs a new informer for CephObjectZone type with additional options.
+// Always prefer using an informer factory to get a shared informer instead of getting an independent
+// one. This reduces memory footprint and number of connections to the server.
+func NewTypedCephObjectZoneInformerWithOptions(client versioned.Interface, namespace string, options internalinterfaces.InformerOptions) CephObjectZoneIndexInformer {
+	gvr := schema.GroupVersionResource{Group: "ceph.rook.io", Version: "v1", Resource: "cephobjectzones"}
+	identifier := options.InformerName.WithResource(gvr)
+	tweakListOptions := options.TweakListOptions
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephObjectZone](cache.NewSharedIndexInformerWithOptions(
+		cache.ToListWatcherWithWatchListSemantics(&cache.ListWatch{
+			ListFunc: func(opts metav1.ListOptions) (runtime.Object, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephObjectZones(namespace).List(context.TODO(), options)
+				return client.CephV1().CephObjectZones(namespace).List(context.Background(), opts)
 			},
-			WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			WatchFunc: func(opts metav1.ListOptions) (watch.Interface, error) {
 				if tweakListOptions != nil {
-					tweakListOptions(&options)
+					tweakListOptions(&opts)
 				}
-				return client.CephV1().CephObjectZones(namespace).Watch(context.TODO(), options)
+				return client.CephV1().CephObjectZones(namespace).Watch(context.Background(), opts)
 			},
+			ListWithContextFunc: func(ctx context.Context, opts metav1.ListOptions) (runtime.Object, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephObjectZones(namespace).List(ctx, opts)
+			},
+			WatchFuncWithContext: func(ctx context.Context, opts metav1.ListOptions) (watch.Interface, error) {
+				if tweakListOptions != nil {
+					tweakListOptions(&opts)
+				}
+				return client.CephV1().CephObjectZones(namespace).Watch(ctx, opts)
+			},
+		}, client),
+		&apiscephrookiov1.CephObjectZone{},
+		cache.SharedIndexInformerOptions{
+			ResyncPeriod: options.ResyncPeriod,
+			Indexers:     options.Indexers,
+			Identifier:   identifier,
 		},
-		&cephrookiov1.CephObjectZone{},
-		resyncPeriod,
-		indexers,
-	)
+	))
 }
 
 func (f *cephObjectZoneInformer) defaultInformer(client versioned.Interface, resyncPeriod time.Duration) cache.SharedIndexInformer {
-	return NewFilteredCephObjectZoneInformer(client, f.namespace, resyncPeriod, cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, f.tweakListOptions)
+	return NewTypedCephObjectZoneInformerWithOptions(client, f.namespace, internalinterfaces.InformerOptions{ResyncPeriod: resyncPeriod, Indexers: cache.Indexers{cache.NamespaceIndex: cache.MetaNamespaceIndexFunc}, InformerName: f.factory.InformerName(), TweakListOptions: f.tweakListOptions})
 }
 
 func (f *cephObjectZoneInformer) Informer() cache.SharedIndexInformer {
-	return f.factory.InformerFor(&cephrookiov1.CephObjectZone{}, f.defaultInformer)
+	return f.TypedInformer()
 }
 
-func (f *cephObjectZoneInformer) Lister() v1.CephObjectZoneLister {
-	return v1.NewCephObjectZoneLister(f.Informer().GetIndexer())
+func (f *cephObjectZoneInformer) TypedInformer() CephObjectZoneIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephObjectZone](f.factory.InformerFor(&apiscephrookiov1.CephObjectZone{}, f.defaultInformer))
+}
+
+func (f *cephObjectZoneInformer) Lister() cephrookiov1.CephObjectZoneLister {
+	return cephrookiov1.NewCephObjectZoneLister(f.Informer().GetIndexer())
+}
+
+// ToTypedCephObjectZoneInformer converts an untyped informer into a TypedCephObjectZoneInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephObjectZone. If that is not the case, calling type-safe methods of the returned
+// TypedCephObjectZoneInformer leads to runtime panics. A safer alternative is to pass
+// around a TypedCephObjectZoneInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToTypedCephObjectZoneInformer(informer CephObjectZoneInformer) TypedCephObjectZoneInformer {
+	if informer, ok := informer.(TypedCephObjectZoneInformer); ok {
+		return informer
+	}
+	return &cephObjectZoneTypedInformerAdapter{informer}
+}
+
+type cephObjectZoneTypedInformerAdapter struct {
+	CephObjectZoneInformer
+}
+
+func (a *cephObjectZoneTypedInformerAdapter) TypedInformer() CephObjectZoneIndexInformer {
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephObjectZone](a.Informer())
+}
+
+// ToCephObjectZoneIndexInformer converts an untyped informer into a CephObjectZoneIndexInformer.
+//
+// WARNING: this conversion is only safe if the informer handles objects of type
+// *CephObjectZone. If that is not the case, calling type-safe methods of the returned
+// CephObjectZoneIndexInformer leads to runtime panics. A safer alternative is to pass
+// around a CephObjectZoneIndexInformer instances that was obtained from a
+// SharedInformerFactory.
+func ToCephObjectZoneIndexInformer(informer cache.SharedIndexInformer) CephObjectZoneIndexInformer {
+	if informer, ok := informer.(CephObjectZoneIndexInformer); ok {
+		return informer
+	}
+	return cache.NewTypedSharedIndexInformer[*apiscephrookiov1.CephObjectZone](informer)
 }

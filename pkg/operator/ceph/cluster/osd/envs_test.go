@@ -17,15 +17,13 @@ limitations under the License.
 package osd
 
 import (
-	"io/ioutil"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
-var (
-	sysconfig = []byte(`# /etc/sysconfig/ceph
+var sysconfig = []byte(`# /etc/sysconfig/ceph
 #
 # Environment file for ceph daemon systemd unit files.
 #
@@ -43,7 +41,6 @@ TCMALLOC_MAX_TOTAL_THREAD_CACHE_BYTES=134217728
 # currently active on the node.
 #
 CEPH_AUTO_RESTART_ON_UPGRADE=no`)
-)
 
 func TestCephVolumeEnvVar(t *testing.T) {
 	cvEnv := cephVolumeEnvVar()
@@ -74,8 +71,8 @@ func TestGetTcmallocMaxTotalThreadCacheBytes(t *testing.T) {
 	v := getTcmallocMaxTotalThreadCacheBytes("")
 	assert.Equal(t, "", v.Value)
 
-	// File and arg are empty so we can an empty value
-	file, err := ioutil.TempFile("", "")
+	// File and arg are empty so we get an empty value
+	file, err := os.CreateTemp("", "")
 	assert.NoError(t, err)
 	defer os.Remove(file.Name())
 	cephEnvConfigFile = file.Name()
@@ -87,7 +84,7 @@ func TestGetTcmallocMaxTotalThreadCacheBytes(t *testing.T) {
 	assert.Equal(t, "67108864", v.Value)
 
 	// Read the file now
-	err = ioutil.WriteFile(file.Name(), sysconfig, 0444)
+	err = os.WriteFile(file.Name(), sysconfig, 0o400)
 	assert.NoError(t, err)
 	v = getTcmallocMaxTotalThreadCacheBytes("")
 	assert.Equal(t, "134217728", v.Value)

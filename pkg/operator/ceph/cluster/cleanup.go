@@ -29,11 +29,12 @@ import (
 	"github.com/rook/rook/pkg/operator/ceph/cluster/mon"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/osd"
 	"github.com/rook/rook/pkg/operator/ceph/cluster/rbd"
-	"github.com/rook/rook/pkg/operator/ceph/controller"
+	opcontroller "github.com/rook/rook/pkg/operator/ceph/controller"
 	"github.com/rook/rook/pkg/operator/ceph/file/mds"
 	"github.com/rook/rook/pkg/operator/ceph/file/mirror"
 	"github.com/rook/rook/pkg/operator/ceph/object"
 	"github.com/rook/rook/pkg/operator/k8sutil"
+	"github.com/rook/rook/pkg/util/log"
 	batch "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,7 +42,7 @@ import (
 )
 
 const (
-	clusterCleanUpPolicyRetryInterval = 5 //seconds
+	clusterCleanUpPolicyRetryInterval = 5 // seconds
 	// CleanupAppName is the cluster clean up job name
 	CleanupAppName = "rook-ceph-cleanup"
 )
@@ -59,10 +60,10 @@ var (
 )
 
 func (c *ClusterController) startClusterCleanUp(context context.Context, cluster *cephv1.CephCluster, cephHosts []string, monSecret, clusterFSID string) {
-	logger.Infof("starting clean up for cluster %q", cluster.Name)
+	log.NamespacedInfo(cluster.Namespace, logger, "starting clean up for cluster %q", cluster.Name)
 	err := c.waitForCephDaemonCleanUp(context, cluster, time.Duration(clusterCleanUpPolicyRetryInterval)*time.Second)
 	if err != nil {
-		logger.Errorf("failed to wait till ceph daemons are destroyed. %v", err)
+		log.NamespacedError(cluster.Namespace, logger, "failed to wait till ceph daemons are destroyed. %v", err)
 		return
 	}
 
@@ -71,11 +72,11 @@ func (c *ClusterController) startClusterCleanUp(context context.Context, cluster
 
 func (c *ClusterController) startCleanUpJobs(cluster *cephv1.CephCluster, cephHosts []string, monSecret, clusterFSID string) {
 	for _, hostName := range cephHosts {
-		logger.Infof("starting clean up job on node %q", hostName)
-		jobName := k8sutil.TruncateNodeName("cluster-cleanup-job-%s", hostName)
+		log.NamespacedInfo(cluster.Namespace, logger, "starting clean up job on node %q", hostName)
+		jobName := k8sutil.TruncateNodeNameForJob("cluster-cleanup-job-%s", hostName)
 		podSpec := c.cleanUpJobTemplateSpec(cluster, monSecret, clusterFSID)
-		podSpec.Spec.NodeSelector = map[string]string{v1.LabelHostname: hostName}
-		labels := controller.AppLabels(CleanupAppName, cluster.Namespace)
+		podSpec.Spec.NodeSelector = map[string]string{k8sutil.LabelHostname(): hostName}
+		labels := opcontroller.AppLabels(CleanupAppName, cluster.Namespace)
 		labels[CleanupAppName] = "true"
 		job := &batch.Job{
 			ObjectMeta: metav1.ObjectMeta{
@@ -92,8 +93,8 @@ func (c *ClusterController) startCleanUpJobs(cluster *cephv1.CephCluster, cephHo
 		cephv1.GetCleanupAnnotations(cluster.Spec.Annotations).ApplyToObjectMeta(&job.ObjectMeta)
 		cephv1.GetCleanupLabels(cluster.Spec.Labels).ApplyToObjectMeta(&job.ObjectMeta)
 
-		if err := k8sutil.RunReplaceableJob(c.context.Clientset, job, true); err != nil {
-			logger.Errorf("failed to run cluster clean up job on node %q. %v", hostName, err)
+		if err := k8sutil.RunReplaceableJob(c.OpManagerCtx, c.context.Clientset, job, true); err != nil {
+			log.NamespacedError(cluster.Namespace, logger, "failed to run cluster clean up job on node %q. %v", hostName, err)
 		}
 	}
 }
@@ -110,6 +111,7 @@ func (c *ClusterController) cleanUpJobContainer(cluster *cephv1.CephCluster, mon
 		devMount := v1.VolumeMount{Name: "devices", MountPath: "/dev"}
 		volumeMounts = append(volumeMounts, hostPathVolumeMount)
 		volumeMounts = append(volumeMounts, devMount)
+		volumeMounts = append(volumeMounts, v1.VolumeMount{Name: "run-udev", MountPath: "/run/udev"})
 		envVars = append(envVars, []v1.EnvVar{
 			{Name: dataDirHostPath, Value: cluster.Spec.DataDirHostPath},
 			{Name: namespaceDir, Value: cluster.Namespace},
@@ -120,16 +122,26 @@ func (c *ClusterController) cleanUpJobContainer(cluster *cephv1.CephCluster, mon
 			{Name: sanitizeMethod, Value: cluster.Spec.CleanupPolicy.SanitizeDisks.Method.String()},
 			{Name: sanitizeDataSource, Value: cluster.Spec.CleanupPolicy.SanitizeDisks.DataSource.String()},
 			{Name: sanitizeIteration, Value: strconv.Itoa(int(cluster.Spec.CleanupPolicy.SanitizeDisks.Iteration))},
+			{Name: "DM_DISABLE_UDEV", Value: "1"},
 		}...)
+		if opcontroller.LoopDevicesAllowed() {
+			envVars = append(envVars, v1.EnvVar{Name: "CEPH_VOLUME_ALLOW_LOOP_DEVICES", Value: "true"})
+		}
 	}
+
+	// Run as UID 0 since ceph-volume does not support running non-root
+	// See https://tracker.ceph.com/issues/53511
+	// Also, it's hard to catch the ceph version since the cluster is being deleted so not
+	// implementing a version check and simply always run this as root
+	securityContext := opcontroller.PrivilegedContext(true)
 
 	return v1.Container{
 		Name:            "host-cleanup",
 		Image:           c.rookImage,
-		SecurityContext: osd.PrivilegedContext(),
+		SecurityContext: securityContext,
 		VolumeMounts:    volumeMounts,
 		Env:             envVars,
-		Args:            []string{"ceph", "clean"},
+		Args:            []string{"ceph", "clean", "host"},
 		Resources:       cephv1.GetCleanupResources(cluster.Spec.Resources),
 	}
 }
@@ -140,6 +152,7 @@ func (c *ClusterController) cleanUpJobTemplateSpec(cluster *cephv1.CephCluster, 
 	devVolume := v1.Volume{Name: "devices", VolumeSource: v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: "/dev"}}}
 	volumes = append(volumes, hostPathVolume)
 	volumes = append(volumes, devVolume)
+	volumes = append(volumes, v1.Volume{Name: "run-udev", VolumeSource: v1.VolumeSource{HostPath: &v1.HostPathVolumeSource{Path: "/run/udev"}}})
 
 	podSpec := v1.PodTemplateSpec{
 		ObjectMeta: metav1.ObjectMeta{
@@ -149,10 +162,16 @@ func (c *ClusterController) cleanUpJobTemplateSpec(cluster *cephv1.CephCluster, 
 			Containers: []v1.Container{
 				c.cleanUpJobContainer(cluster, monSecret, clusterFSID),
 			},
-			Volumes:           volumes,
-			RestartPolicy:     v1.RestartPolicyOnFailure,
-			PriorityClassName: cephv1.GetCleanupPriorityClassName(cluster.Spec.PriorityClassNames),
+			Volumes:            volumes,
+			RestartPolicy:      v1.RestartPolicyOnFailure,
+			PriorityClassName:  cephv1.GetCleanupPriorityClassName(cluster.Spec.PriorityClassNames),
+			SecurityContext:    &v1.PodSecurityContext{},
+			ServiceAccountName: k8sutil.DefaultServiceAccount,
+			HostNetwork:        cluster.Spec.Network.IsHost(),
 		},
+	}
+	if cluster.Spec.Network.IsHost() {
+		podSpec.Spec.DNSPolicy = v1.DNSClusterFirstWithHostNet
 	}
 
 	cephv1.GetCleanupAnnotations(cluster.Spec.Annotations).ApplyToObjectMeta(&podSpec.ObjectMeta)
@@ -184,7 +203,7 @@ func getCleanupPlacement(c cephv1.ClusterSpec) cephv1.Placement {
 }
 
 func (c *ClusterController) waitForCephDaemonCleanUp(context context.Context, cluster *cephv1.CephCluster, retryInterval time.Duration) error {
-	logger.Infof("waiting for all the ceph daemons to be cleaned up in the cluster %q", cluster.Namespace)
+	log.NamespacedInfo(cluster.Namespace, logger, "waiting for all the ceph daemons to be cleaned up in the cluster %q", cluster.Namespace)
 	for {
 		select {
 		case <-time.After(retryInterval):
@@ -194,11 +213,11 @@ func (c *ClusterController) waitForCephDaemonCleanUp(context context.Context, cl
 			}
 
 			if len(cephHosts) == 0 {
-				logger.Info("all ceph daemons are cleaned up")
+				log.NamespacedInfo(cluster.Namespace, logger, "all ceph daemons are cleaned up")
 				return nil
 			}
 
-			logger.Debugf("waiting for ceph daemons in cluster %q to be cleaned up. Retrying in %q",
+			log.NamespacedDebug(cluster.Namespace, logger, "waiting for ceph daemons in cluster %q to be cleaned up. Retrying in %q",
 				cluster.Namespace, retryInterval.String())
 		case <-context.Done():
 			return errors.Errorf("cancelling the host cleanup job. %s", context.Err())
@@ -209,7 +228,7 @@ func (c *ClusterController) waitForCephDaemonCleanUp(context context.Context, cl
 // getCephHosts returns a list of host names where ceph daemon pods are running
 func (c *ClusterController) getCephHosts(namespace string) ([]string, error) {
 	cephAppNames := []string{mon.AppName, mgr.AppName, osd.AppName, object.AppName, mds.AppName, rbd.AppName, mirror.AppName}
-	nodeNameList := sets.NewString()
+	nodeNameList := sets.New[string]()
 	hostNameList := []string{}
 	var b strings.Builder
 
@@ -229,10 +248,10 @@ func (c *ClusterController) getCephHosts(namespace string) ([]string, error) {
 		fmt.Fprintf(&b, "%s: %d. ", app, len(podList.Items))
 	}
 
-	logger.Infof("existing ceph daemons in the namespace %q. %s", namespace, b.String())
+	log.NamespacedInfo(namespace, logger, "existing ceph daemons in the namespace %q. %s", namespace, b.String())
 
 	for nodeName := range nodeNameList {
-		podHostName, err := k8sutil.GetNodeHostName(c.context.Clientset, nodeName)
+		podHostName, err := k8sutil.GetNodeHostName(c.OpManagerCtx, c.context.Clientset, nodeName)
 		if err != nil {
 			return nil, errors.Wrapf(err, "failed to get hostname from node %q", nodeName)
 		}
@@ -242,8 +261,8 @@ func (c *ClusterController) getCephHosts(namespace string) ([]string, error) {
 	return hostNameList, nil
 }
 
-func (c *ClusterController) getCleanUpDetails(namespace string) (string, string, error) {
-	clusterInfo, _, _, err := mon.LoadClusterInfo(c.context, c.OpManagerCtx, namespace)
+func (c *ClusterController) getCleanUpDetails(cephClusterSpec *cephv1.ClusterSpec, namespace string) (string, string, error) {
+	clusterInfo, _, _, err := opcontroller.LoadClusterInfo(c.context, c.OpManagerCtx, namespace, cephClusterSpec)
 	if err != nil {
 		return "", "", errors.Wrap(err, "failed to get cluster info")
 	}

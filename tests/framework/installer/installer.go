@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"text/template"
 
 	"github.com/coreos/pkg/capnslog"
 	"github.com/rook/rook/tests/framework/utils"
@@ -28,13 +29,8 @@ import (
 )
 
 const (
-	// LocalBuildTag tag for the latest manifests
+	// LocalBuildTag is the tag for the latest manifests
 	LocalBuildTag = "local-build"
-
-	// test suite names
-	CassandraTestSuite = "cassandra"
-	CephTestSuite      = "ceph"
-	NFSTestSuite       = "nfs"
 )
 
 var (
@@ -44,21 +40,6 @@ var (
 	deleteArgs          = []string{"delete", "-f"}
 	deleteFromStdinArgs = append(deleteArgs, "-")
 )
-
-func SkipTestSuite(name string) bool {
-	testsToRun := testStorageProvider()
-	if testsToRun == "" {
-		// run all test suites
-		return false
-	}
-	if strings.EqualFold(testsToRun, name) {
-		// this suite was requested
-		return false
-	}
-
-	logger.Infof("skipping test suite since only %s should be tested rather than %s", testsToRun, name)
-	return true
-}
 
 func SystemNamespace(namespace string) string {
 	if utils.IsPlatformOpenShift() {
@@ -74,4 +55,17 @@ func checkError(t *testing.T, err error, message string) {
 		return
 	}
 	assert.NoError(t, err, "%s. %+v", message, err)
+}
+
+func renderTemplate(templateSource string, data any) string {
+	templateInstance, err := template.New("template").Parse(templateSource)
+	if err != nil {
+		panic(fmt.Errorf("syntax error in template: %s", err))
+	}
+	var builder strings.Builder
+	err = templateInstance.Execute(&builder, data)
+	if err != nil {
+		panic(fmt.Errorf("error while rendering the template: %s", err))
+	}
+	return builder.String()
 }

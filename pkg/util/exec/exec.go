@@ -19,10 +19,8 @@ package exec
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"os"
 	"os/exec"
 	"reflect"
@@ -36,9 +34,15 @@ import (
 	kexec "k8s.io/utils/exec"
 )
 
-var (
-	CephCommandsTimeout = 15 * time.Second
-)
+// TimeoutWaitingForMessage can be used to identify if an error is due to a timeout.
+const TimeoutWaitingForMessage = "exec timeout waiting for"
+
+var CephCommandsTimeout = 15 * time.Second
+
+// outputDrainGracePeriod bounds how long executeCommandWithTimeout waits for the
+// os/exec output-copier goroutines to drain after killing a timed-out process,
+// so a killed command that orphaned a pipe holder cannot block the caller forever.
+var outputDrainGracePeriod = 500 * time.Millisecond
 
 // Executor is the main interface for all the exec commands
 type Executor interface {
@@ -47,17 +51,26 @@ type Executor interface {
 	ExecuteCommandWithOutput(command string, arg ...string) (string, error)
 	ExecuteCommandWithCombinedOutput(command string, arg ...string) (string, error)
 	ExecuteCommandWithTimeout(timeout time.Duration, command string, arg ...string) (string, error)
+	ExecuteCommandWithStdin(timeout time.Duration, command string, stdin *string, arg ...string) error
 }
 
 // CommandExecutor is the type of the Executor
 type CommandExecutor struct{}
 
-// ExecuteCommand starts a process and wait for its completion
+// ExecuteCommand starts a process and waits for its completion
 func (c *CommandExecutor) ExecuteCommand(command string, arg ...string) error {
 	return c.ExecuteCommandWithEnv([]string{}, command, arg...)
 }
 
-// ExecuteCommandWithEnv starts a process with env variables and wait for its completion
+// ExecuteCommandWithStdin starts a process, provides stdin and waits for its completion with timeout.
+func (c *CommandExecutor) ExecuteCommandWithStdin(timeout time.Duration, command string, stdin *string, arg ...string) error {
+	output, err := executeCommandWithTimeout(timeout, command, stdin, arg...)
+	logger.Infof("Command %q output: %q", command, output)
+
+	return err
+}
+
+// ExecuteCommandWithEnv starts a process with env variables and waits for its completion
 func (*CommandExecutor) ExecuteCommandWithEnv(env []string, command string, arg ...string) error {
 	cmd, stdout, stderr, err := startCommand(env, command, arg...)
 	if err != nil {
@@ -73,15 +86,31 @@ func (*CommandExecutor) ExecuteCommandWithEnv(env []string, command string, arg 
 	return nil
 }
 
-// ExecuteCommandWithTimeout starts a process and wait for its completion with timeout.
+// IsTimeout returns true if the error is due to a timeout in the exec function. Note that it cannot
+// determine if a command timed out due to behavior of the command itself; for example if a
+// '--timeout' flag was passed to the command.
+func IsTimeout(err error) bool {
+	return strings.Contains(err.Error(), TimeoutWaitingForMessage)
+}
+
+// ExecuteCommandWithTimeout starts a process and waits for its completion with timeout.
 func (*CommandExecutor) ExecuteCommandWithTimeout(timeout time.Duration, command string, arg ...string) (string, error) {
+	return executeCommandWithTimeout(timeout, command, nil, arg...)
+}
+
+// executeCommandWithTimeout starts a process, provides stdin and waits for its completion with timeout.
+func executeCommandWithTimeout(timeout time.Duration, command string, stdin *string, arg ...string) (string, error) {
 	logCommand(command, arg...)
-	// #nosec G204 Rook controls the input to the exec arguments
+	//nolint:gosec // Rook controls the input to the exec arguments
 	cmd := exec.Command(command, arg...)
 
 	var b bytes.Buffer
 	cmd.Stdout = &b
 	cmd.Stderr = &b
+
+	if stdin != nil {
+		cmd.Stdin = strings.NewReader(*stdin)
+	}
 
 	if err := cmd.Start(); err != nil {
 		return "", err
@@ -97,18 +126,30 @@ func (*CommandExecutor) ExecuteCommandWithTimeout(timeout time.Duration, command
 		select {
 		case <-time.After(timeout):
 			if interruptSent {
-				logger.Infof("timeout waiting for process %s to return after interrupt signal was sent. Sending kill signal to the process", command)
-				var e error
+				logger.Infof("%s process %s to return after interrupt signal was sent. Sending kill signal to the process", TimeoutWaitingForMessage, command)
 				if err := cmd.Process.Kill(); err != nil {
 					logger.Errorf("Failed to kill process %s: %v", command, err)
-					e = fmt.Errorf("timeout waiting for the command %s to return after interrupt signal was sent. Tried to kill the process but that failed: %v", command, err)
-				} else {
-					e = fmt.Errorf("timeout waiting for the command %s to return", command)
+					// The process may still be running with the output-copier
+					// goroutines writing into b, so don't read it here.
+					return "", fmt.Errorf("%s the command %s to return; sent an interrupt, then the kill failed: %v", TimeoutWaitingForMessage, command, err)
 				}
-				return strings.TrimSpace(b.String()), e
+				// Kill() only signals the process; the os/exec goroutines that copy
+				// its output into b are joined only by cmd.Wait() (done). Reading b
+				// before done fires races with those writers, so wait for them. Bound
+				// the wait, though — a killed process can leave an orphaned descendant
+				// holding the output pipe open (a D-state cryptsetup/dmsetup child, or
+				// the downstream of a "sh -c '... | head'" pipeline), so cmd.Wait() may
+				// never return. Give up on the captured output after a grace period
+				// rather than blocking the caller forever.
+				select {
+				case <-done:
+					return strings.TrimSpace(b.String()), fmt.Errorf("%s the command %s to return", TimeoutWaitingForMessage, command)
+				case <-time.After(outputDrainGracePeriod):
+					return "", fmt.Errorf("%s the command %s to return", TimeoutWaitingForMessage, command)
+				}
 			}
 
-			logger.Infof("timeout waiting for process %s to return. Sending interrupt signal to the process", command)
+			logger.Infof("%s process %s to return. Sending interrupt signal to the process", TimeoutWaitingForMessage, command)
 			if err := cmd.Process.Signal(os.Interrupt); err != nil {
 				logger.Errorf("Failed to send interrupt signal to process %s: %v", command, err)
 				// kill signal will be sent next loop
@@ -119,7 +160,7 @@ func (*CommandExecutor) ExecuteCommandWithTimeout(timeout time.Duration, command
 				return strings.TrimSpace(b.String()), err
 			}
 			if interruptSent {
-				return strings.TrimSpace(b.String()), fmt.Errorf("timeout waiting for the command %s to return", command)
+				return strings.TrimSpace(b.String()), fmt.Errorf("%s the command %s to return", TimeoutWaitingForMessage, command)
 			}
 			return strings.TrimSpace(b.String()), nil
 		}
@@ -129,7 +170,7 @@ func (*CommandExecutor) ExecuteCommandWithTimeout(timeout time.Duration, command
 // ExecuteCommandWithOutput executes a command with output
 func (*CommandExecutor) ExecuteCommandWithOutput(command string, arg ...string) (string, error) {
 	logCommand(command, arg...)
-	// #nosec G204 Rook controls the input to the exec arguments
+	//nolint:gosec // Rook controls the input to the exec arguments
 	cmd := exec.Command(command, arg...)
 	return runCommandWithOutput(cmd, false)
 }
@@ -137,102 +178,15 @@ func (*CommandExecutor) ExecuteCommandWithOutput(command string, arg ...string) 
 // ExecuteCommandWithCombinedOutput executes a command with combined output
 func (*CommandExecutor) ExecuteCommandWithCombinedOutput(command string, arg ...string) (string, error) {
 	logCommand(command, arg...)
-	// #nosec G204 Rook controls the input to the exec arguments
+	//nolint:gosec // Rook controls the input to the exec arguments
 	cmd := exec.Command(command, arg...)
 	return runCommandWithOutput(cmd, true)
-}
-
-// ExecuteCommandWithOutputFileTimeout Same as ExecuteCommandWithOutputFile but with a timeout limit.
-// #nosec G307 Calling defer to close the file without checking the error return is not a risk for a simple file open and close
-func (*CommandExecutor) ExecuteCommandWithOutputFileTimeout(timeout time.Duration,
-	command, outfileArg string, arg ...string) (string, error) {
-
-	outFile, err := ioutil.TempFile("", "")
-	if err != nil {
-		return "", errors.Wrap(err, "failed to open output file")
-	}
-	defer outFile.Close()
-	defer os.Remove(outFile.Name())
-
-	arg = append(arg, outfileArg, outFile.Name())
-	logCommand(command, arg...)
-
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
-
-	// #nosec G204 Rook controls the input to the exec arguments
-	cmd := exec.CommandContext(ctx, command, arg...)
-	cmdOut, err := cmd.CombinedOutput()
-	if err != nil {
-		cmdOut = []byte(fmt.Sprintf("%s. %s", string(cmdOut), assertErrorType(err)))
-	}
-
-	// if there was anything that went to stdout/stderr then log it, even before
-	// we return an error
-	if string(cmdOut) != "" {
-		if !strings.Contains(err.Error(), "error calling conf_read_file") {
-			logger.Debug(string(cmdOut))
-		}
-	}
-
-	if ctx.Err() == context.DeadlineExceeded {
-		return string(cmdOut), ctx.Err()
-	}
-
-	if err != nil {
-		return string(cmdOut), &CephCLIError{err: err, output: string(cmdOut)}
-	}
-
-	fileOut, err := ioutil.ReadAll(outFile)
-	if err := outFile.Close(); err != nil {
-		return "", err
-	}
-	return string(fileOut), err
-}
-
-// ExecuteCommandWithOutputFile executes a command with output on a file
-// #nosec G307 Calling defer to close the file without checking the error return is not a risk for a simple file open and close
-func (*CommandExecutor) ExecuteCommandWithOutputFile(command, outfileArg string, arg ...string) (string, error) {
-
-	// create a temporary file to serve as the output file for the command to be run and ensure
-	// it is cleaned up after this function is done
-	outFile, err := ioutil.TempFile("", "")
-	if err != nil {
-		return "", errors.Wrap(err, "failed to open output file")
-	}
-	defer outFile.Close()
-	defer os.Remove(outFile.Name())
-
-	// append the output file argument to the list or args
-	arg = append(arg, outfileArg, outFile.Name())
-
-	logCommand(command, arg...)
-	// #nosec G204 Rook controls the input to the exec arguments
-	cmd := exec.Command(command, arg...)
-	cmdOut, err := cmd.CombinedOutput()
-	if err != nil {
-		cmdOut = []byte(fmt.Sprintf("%s. %s", string(cmdOut), assertErrorType(err)))
-	}
-	// if there was anything that went to stdout/stderr then log it, even before we return an error
-	if string(cmdOut) != "" {
-		logger.Debug(string(cmdOut))
-	}
-	if err != nil {
-		return string(cmdOut), &CephCLIError{err: err, output: string(cmdOut)}
-	}
-
-	// read the entire output file and return that to the caller
-	fileOut, err := ioutil.ReadAll(outFile)
-	if err := outFile.Close(); err != nil {
-		return "", err
-	}
-	return string(fileOut), err
 }
 
 func startCommand(env []string, command string, arg ...string) (*exec.Cmd, io.ReadCloser, io.ReadCloser, error) {
 	logCommand(command, arg...)
 
-	// #nosec G204 Rook controls the input to the exec arguments
+	//nolint:gosec // Rook controls the input to the exec arguments
 	cmd := exec.Command(command, arg...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -298,7 +252,7 @@ func runCommandWithOutput(cmd *exec.Cmd, combinedOutput bool) (string, error) {
 	} else {
 		output, err = cmd.Output()
 		if err != nil {
-			output = []byte(fmt.Sprintf("%s. %s", string(output), assertErrorType(err)))
+			output = fmt.Appendf(nil, "%s. %s", string(output), assertErrorType(err))
 		}
 	}
 
@@ -312,7 +266,7 @@ func runCommandWithOutput(cmd *exec.Cmd, combinedOutput bool) (string, error) {
 }
 
 func logCommand(command string, arg ...string) {
-	logger.Debugf("Running command: %s %s", command, strings.Join(arg, " "))
+	logger.Debugf("Running command: %s", FormatCommand(command, arg...))
 }
 
 func assertErrorType(err error) string {
@@ -345,7 +299,7 @@ func ExtractExitCode(err error) (int, error) {
 		return int(errType.ErrStatus.Code), nil
 
 	default:
-		logger.Debugf(err.Error())
+		logger.Debugf("%s", err.Error())
 		// This is ugly, but it's a decent backup just in case the error isn't a type above.
 		if strings.Contains(err.Error(), "command terminated with exit code") {
 			a := strings.SplitAfter(err.Error(), "command terminated with exit code")

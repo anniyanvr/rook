@@ -19,10 +19,12 @@ package client
 import (
 	"context"
 	"fmt"
+	"maps"
 	"net"
 	"testing"
 	"time"
 
+	"github.com/pkg/errors"
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	"github.com/rook/rook/pkg/operator/k8sutil"
@@ -38,29 +40,49 @@ type ClusterInfo struct {
 	FSID          string
 	MonitorSecret string
 	CephCred      CephCred
-	Monitors      map[string]*MonInfo
-	CephVersion   cephver.CephVersion
-	Namespace     string
-	OwnerInfo     *k8sutil.OwnerInfo
+	// InternalMonitors - monitors managed by Rook or external monitors when Rook manages external cluster.
+	InternalMonitors map[string]*MonInfo
+	// ExternalMons - external monitors listed in CephCluster.spec.mon.externalMonIDs when Rook is managing local cluster.
+	ExternalMons map[string]*MonInfo
+	CephVersion  cephver.CephVersion
+	Namespace    string
+	OwnerInfo    *k8sutil.OwnerInfo
 	// Hide the name of the cluster since in 99% of uses we want to use the cluster namespace.
 	// If the CR name is needed, access it through the NamespacedName() method.
 	name              string
 	OsdUpgradeTimeout time.Duration
 	NetworkSpec       cephv1.NetworkSpec
-	// A context to cancel the context it is used to determine whether the reconcile loop should
-	// exist (if the context has been cancelled). This cannot be in main clusterd context since this
-	// is a pointer passed through the entire life cycle or the operator. If the context is
-	// cancelled it will immedialy be re-created, thus existing reconciles loops will not be
+	CSIDriverSpec     cephv1.CSIDriverSpec
+	// A context to cancel. It is used to determine whether the reconcile loop should
+	// exit (if the context has been cancelled). This cannot be in main clusterd context since this
+	// is a pointer passed through the entire life cycle of the operator. If the context is
+	// cancelled it will immediately be re-created, thus existing reconcile loops will not be
 	// cancelled.
 	// Whereas if passed through clusterInfo, we don't have that problem since clusterInfo is
 	// re-hydrated when a context is cancelled.
 	Context context.Context
+
+	// KeyringFileOverride, if set, configures a ceph client executor to use a specific keyring file
+	// instead of the default.
+	KeyringFileOverride string
+}
+
+func (c *ClusterInfo) AllMonitors() map[string]*MonInfo {
+	if len(c.ExternalMons) == 0 {
+		return c.InternalMonitors
+	}
+	res := make(map[string]*MonInfo, len(c.InternalMonitors)+len(c.ExternalMons))
+	maps.Copy(res, c.InternalMonitors)
+	maps.Copy(res, c.ExternalMons)
+	return res
 }
 
 // MonInfo is a collection of information about a Ceph mon.
 type MonInfo struct {
 	Name     string `json:"name"`
 	Endpoint string `json:"endpoint"`
+	// Whether detected out of quorum by rook. May be different from actual ceph quorum.
+	OutOfQuorum bool `json:"outOfQuorum"`
 }
 
 // CephCred represents the Ceph cluster username and key used by the operator.
@@ -87,58 +109,54 @@ func (c *ClusterInfo) NamespacedName() types.NamespacedName {
 }
 
 // AdminClusterInfo() creates a ClusterInfo with the basic info to access the cluster
-// as an admin. Only a few fields are set in the struct,
-// so this clusterInfo cannot be used to generate the mon config or request the
-// namespacedName. A full cluster info must be populated for those operations.
-func AdminClusterInfo(namespace string) *ClusterInfo {
+// as an admin.
+func AdminClusterInfo(ctx context.Context, namespace, name string) *ClusterInfo {
 	ownerInfo := k8sutil.NewOwnerInfoWithOwnerRef(&metav1.OwnerReference{}, "")
 	return &ClusterInfo{
 		Namespace: namespace,
 		CephCred: CephCred{
 			Username: AdminUsername,
 		},
-		name:      "testing",
+		name:      name,
 		OwnerInfo: ownerInfo,
-		Context:   context.TODO(),
+		Context:   ctx,
 	}
+}
+
+// AdminTestClusterInfo() creates a ClusterInfo with the basic info to access the cluster
+// as an admin. This cluster info should only be used by unit or integration tests.
+func AdminTestClusterInfo(namespace string) *ClusterInfo {
+	return AdminClusterInfo(context.TODO(), namespace, "testing")
 }
 
 // IsInitialized returns true if the critical information in the ClusterInfo struct has been filled
 // in. This method exists less out of necessity than the desire to be explicit about the lifecycle
 // of the ClusterInfo struct during startup, specifically that it is expected to exist after the
 // Rook operator has started up or connected to the first components of the Ceph cluster.
-func (c *ClusterInfo) IsInitialized(logError bool) bool {
-	var isInitialized bool
-
+func (c *ClusterInfo) IsInitialized() error {
 	if c == nil {
-		if logError {
-			logger.Error("clusterInfo is nil")
-		}
-	} else if c.FSID == "" {
-		if logError {
-			logger.Error("cluster fsid is empty")
-		}
-	} else if c.MonitorSecret == "" {
-		if logError {
-			logger.Error("monitor secret is empty")
-		}
-	} else if c.CephCred.Username == "" {
-		if logError {
-			logger.Error("ceph username is empty")
-		}
-	} else if c.CephCred.Secret == "" {
-		if logError {
-			logger.Error("ceph secret is empty")
-		}
-	} else if c.Context == nil {
-		if logError {
-			logger.Error("nil context")
-		}
-	} else {
-		isInitialized = true
+		return errors.New("clusterInfo is nil")
+	}
+	if c.FSID == "" {
+		return errors.New("cluster fsid is empty")
+	}
+	if c.MonitorSecret == "" {
+		return errors.New("monitor secret is empty")
+	}
+	if c.CephCred.Username == "" {
+		return errors.New("ceph username is empty")
+	}
+	if c.CephCred.Secret == "" {
+		return errors.New("ceph secret is empty")
+	}
+	if c.Context == nil {
+		return errors.New("context is nil")
+	}
+	if c.Context.Err() != nil {
+		return c.Context.Err()
 	}
 
-	return isInitialized
+	return nil
 }
 
 // NewMonInfo returns a new Ceph mon info struct from the given inputs.

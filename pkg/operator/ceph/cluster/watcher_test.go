@@ -29,8 +29,10 @@ import (
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
+	apifake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	k8sFake "k8s.io/client-go/kubernetes/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -87,10 +89,13 @@ func TestCheckStorageForNode(t *testing.T) {
 
 func TestOnK8sNode(t *testing.T) {
 	ns := "rook-ceph"
+	opns := "operator"
+	ctx := t.Context()
 	cephCluster := fakeCluster(ns)
 	objects := []runtime.Object{
 		cephCluster,
 	}
+
 	// Create a fake client to mock API calls.
 	client := getFakeClient(objects...)
 
@@ -99,7 +104,9 @@ func TestOnK8sNode(t *testing.T) {
 		return "", errors.New("failed to get osd list on host")
 	}
 	clientCluster := newClientCluster(client, ns, &clusterd.Context{
-		Executor: executor,
+		Executor:            executor,
+		Clientset:           k8sFake.NewClientset(),
+		ApiExtensionsClient: apifake.NewClientset(),
 	})
 
 	node := &corev1.Node{
@@ -136,11 +143,11 @@ func TestOnK8sNode(t *testing.T) {
 	cephCluster.Status.Phase = k8sutil.ReadyStatus
 	client = getFakeClient(objects...)
 	clientCluster.client = client
-	b := clientCluster.onK8sNode(node)
+	b := clientCluster.onK8sNode(ctx, node, opns)
 	assert.True(t, b)
 
 	// node will not reconcile
-	b = clientCluster.onK8sNode(node)
+	b = clientCluster.onK8sNode(ctx, node, opns)
 	assert.False(t, b)
 }
 

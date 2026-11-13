@@ -31,22 +31,25 @@ import (
 )
 
 const (
-	shredUtility = "shred"
-	shredBS      = "10M" // Shred's block size
+	completeShredUtility = "shred"
 )
 
-var (
-	logger = capnslog.NewPackageLogger("github.com/rook/rook", "cleanup")
-)
+var logger = capnslog.NewPackageLogger("github.com/rook/rook", "cleanup")
 
-// DiskSanitizer is simple struct to old the context to execute the commands
+// DiskSanitizer is a simple struct to hold the context to execute the commands
 type DiskSanitizer struct {
 	context           *clusterd.Context
 	clusterInfo       *client.ClusterInfo
 	sanitizeDisksSpec *cephv1.SanitizeDisksSpec
 }
 
-// NewDiskSanitizer is function that returns a full filled DiskSanitizer object
+// ShredCommand is a struct that defines a shred command with its arguments
+type ShredCommand struct {
+	command string
+	args    []string
+}
+
+// NewDiskSanitizer is a function that returns a fully filled DiskSanitizer object
 func NewDiskSanitizer(context *clusterd.Context, clusterInfo *client.ClusterInfo, sanitizeDisksSpec *cephv1.SanitizeDisksSpec) *DiskSanitizer {
 	return &DiskSanitizer{
 		context:           context,
@@ -55,7 +58,7 @@ func NewDiskSanitizer(context *clusterd.Context, clusterInfo *client.ClusterInfo
 	}
 }
 
-// StartSanitizeDisks main entrypoint of the cleanup package
+// StartSanitizeDisks is the main entrypoint of the cleanup package
 func (s *DiskSanitizer) StartSanitizeDisks() {
 	// LVM based OSDs
 	osdLVMList, err := osd.GetCephVolumeLVMOSDs(s.context, s.clusterInfo, s.clusterInfo.FSID, "", false, false)
@@ -63,21 +66,21 @@ func (s *DiskSanitizer) StartSanitizeDisks() {
 		logger.Errorf("failed to list lvm osd(s). %v", err)
 	} else {
 		// Start the sanitizing sequence
-		s.sanitizeLVMDisk(osdLVMList)
+		s.SanitizeLVMDisk(osdLVMList)
 	}
 
 	// Raw based OSDs
-	osdRawList, err := osd.GetCephVolumeRawOSDs(s.context, s.clusterInfo, s.clusterInfo.FSID, "", "", "", false, true)
+	osdRawList, err := osd.GetCephVolumeRawOSDs(s.context, s.clusterInfo, s.clusterInfo.FSID, "", "", "", false, true, nil)
 	if err != nil {
 		logger.Errorf("failed to list raw osd(s). %v", err)
 	} else {
 		// Start the sanitizing sequence
-		s.sanitizeRawDisk(osdRawList)
+		s.SanitizeRawDisk(osdRawList)
 	}
 }
 
-func (s *DiskSanitizer) sanitizeRawDisk(osdRawList []oposd.OSDInfo) {
-	// Initialize work group to wait for completion of all the go routine
+func (s *DiskSanitizer) SanitizeRawDisk(osdRawList []oposd.OSDInfo) {
+	// Initialize work group to wait for completion of all the go routines
 	var wg sync.WaitGroup
 
 	for _, osd := range osdRawList {
@@ -87,14 +90,14 @@ func (s *DiskSanitizer) sanitizeRawDisk(osdRawList []oposd.OSDInfo) {
 		wg.Add(1)
 
 		// Put each sanitize in a go routine to speed things up
-		go s.executeSanitizeCommand(osd.BlockPath, &wg)
+		go s.executeSanitizeCommand(osd, &wg)
 	}
 
 	wg.Wait()
 }
 
-func (s *DiskSanitizer) sanitizeLVMDisk(osdLVMList []oposd.OSDInfo) {
-	// Initialize work group to wait for completion of all the go routine
+func (s *DiskSanitizer) SanitizeLVMDisk(osdLVMList []oposd.OSDInfo) {
+	// Initialize work group to wait for completion of all the go routines
 	var wg sync.WaitGroup
 	pvs := []string{}
 
@@ -112,10 +115,10 @@ func (s *DiskSanitizer) sanitizeLVMDisk(osdLVMList []oposd.OSDInfo) {
 	wg.Wait()
 
 	var wg2 sync.WaitGroup
-	// // purge remaining LVM2 metadata from PV
+	// purge remaining LVM2 metadata from PV
 	for _, pv := range pvs {
 		wg2.Add(1)
-		go s.executeSanitizeCommand(pv, &wg2)
+		go s.executeSanitizeCommand(oposd.OSDInfo{BlockPath: pv}, &wg2)
 	}
 	wg2.Wait()
 }
@@ -156,11 +159,6 @@ func (s *DiskSanitizer) buildShredArgs(disk string) []string {
 		shredArgs = append(shredArgs, "--zero")
 	}
 
-	// If this is a quick pass let's just overwrite the first 10MB
-	if s.sanitizeDisksSpec.Method == cephv1.SanitizeMethodQuick {
-		shredArgs = append(shredArgs, fmt.Sprintf("--size=%s", shredBS))
-	}
-
 	// If the data source for randomness is zero
 	if s.sanitizeDisksSpec.DataSource == cephv1.SanitizeDataSourceZero {
 		shredArgs = append(shredArgs, fmt.Sprintf("--random-source=%s", s.buildDataSource()))
@@ -170,20 +168,69 @@ func (s *DiskSanitizer) buildShredArgs(disk string) []string {
 		"--force",
 		"--verbose",
 		fmt.Sprintf("--iterations=%s", strconv.Itoa(int(s.sanitizeDisksSpec.Iteration))),
-		disk}...)
+		disk,
+	}...)
 
 	return shredArgs
 }
 
-func (s *DiskSanitizer) executeSanitizeCommand(disk string, wg *sync.WaitGroup) {
+func (s *DiskSanitizer) buildQuickShredCommands(disk string) []ShredCommand {
+	return []ShredCommand{
+		{command: "ceph-volume", args: []string{"lvm", "zap", disk}},
+	}
+}
+
+func (s *DiskSanitizer) buildShredCommands(disk string) []ShredCommand {
+	var shredCommands []ShredCommand
+
+	if s.sanitizeDisksSpec.Method == cephv1.SanitizeMethodQuick {
+		return s.buildQuickShredCommands(disk)
+	}
+
+	if s.sanitizeDisksSpec.DataSource == cephv1.SanitizeDataSourceZero {
+		shredCommands = append(shredCommands, ShredCommand{command: completeShredUtility, args: s.buildShredArgs(disk)})
+		return shredCommands
+	}
+
+	shredCommands = append(shredCommands, ShredCommand{command: completeShredUtility, args: s.buildShredArgs(disk)})
+
+	return shredCommands
+}
+
+func (s *DiskSanitizer) executeSanitizeCommand(osdInfo oposd.OSDInfo, wg *sync.WaitGroup) {
 	// On return, notify the WaitGroup that we’re done
 	defer wg.Done()
 
-	output, err := s.context.Executor.ExecuteCommandWithCombinedOutput(shredUtility, s.buildShredArgs(disk)...)
-	if err != nil {
-		logger.Errorf("failed to sanitize osd disk %q. %s. %v", disk, output, err)
+	// If the device is encrypted, get the real path and remove the dm device
+	if osdInfo.Encrypted {
+		realPath, err := osd.GetBackingDeviceForEncryptedBlock(s.context, osdInfo.BlockPath)
+		if err != nil {
+			logger.Errorf("failed to get backing device for encrypted block %q. %v", osdInfo.BlockPath, err)
+		} else {
+			err := osd.RemoveEncryptedDevice(s.context, osdInfo.BlockPath)
+			if err != nil {
+				logger.Errorf("failed to remove dm device %q. %v", osdInfo.BlockPath, err)
+			}
+
+			osdInfo.BlockPath = realPath
+		}
 	}
 
-	logger.Infof("%s\n", output)
-	logger.Infof("successfully sanitized osd disk %q", disk)
+	for _, device := range []string{osdInfo.BlockPath, osdInfo.MetadataPath, osdInfo.WalPath} {
+		if device == "" {
+			continue
+		}
+
+		for _, shredCmd := range s.buildShredCommands(device) {
+			output, err := s.context.Executor.ExecuteCommandWithCombinedOutput(shredCmd.command, shredCmd.args...)
+
+			logger.Infof("%s\n", output)
+
+			if err != nil {
+				logger.Errorf("failed to execute sanitization command for osd disk %q. output: %s, error: %v", device, output, err)
+			} else {
+				logger.Infof("successfully executed sanitization command for osd disk %q", device)
+			}
+		}
+	}
 }

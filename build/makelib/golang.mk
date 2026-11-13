@@ -48,7 +48,7 @@ GO_TEST_FLAGS ?=
 # ====================================================================================
 # Setup go environment
 
-GO_SUPPORTED_VERSIONS ?= 1.16|1.17
+GO_SUPPORTED_VERSIONS ?= 1.26|1.27
 
 GO_PACKAGES := $(foreach t,$(GO_SUBDIRS),$(GO_PROJECT)/$(t)/...)
 GO_INTEGRATION_TEST_PACKAGES := $(foreach t,$(GO_INTEGRATION_TESTS_SUBDIRS),$(GO_PROJECT)/$(t)/integration)
@@ -64,7 +64,6 @@ endif
 GOPATH := $(shell go env GOPATH)
 
 # setup tools used during the build
-GOLINT := $(TOOLS_HOST_DIR)/golint
 GOJUNIT := $(TOOLS_HOST_DIR)/go-junit-report
 
 GO := go
@@ -72,12 +71,22 @@ GOHOST := GOOS=$(GOHOSTOS) GOARCH=$(GOHOSTARCH) go
 GO_VERSION := $(shell $(GO) version | sed -ne 's/[^0-9]*\(\([0-9]\.\)\{0,4\}[0-9][^.]\).*/\1/p')
 GO_FULL_VERSION := $(shell $(GO) version)
 
-GOFMT_VERSION := $(GO_VERSION)
-ifneq ($(findstring $(GOFMT_VERSION),$(GO_VERSION)),)
-GOFMT := $(shell which gofmt)
-else
-GOFMT := $(TOOLS_HOST_DIR)/gofmt$(GOFMT_VERSION)
-endif
+YQ_VERSION = v4.45.1
+YQ := $(TOOLS_HOST_DIR)/yq-$(YQ_VERSION)
+export YQ
+$(YQ): | $(TOOLS_HOST_DIR)
+	@echo === installing yq $(YQ_VERSION) $(REAL_HOST_PLATFORM)
+	@curl -JL https://github.com/mikefarah/yq/releases/download/$(YQ_VERSION)/yq_$(REAL_HOST_PLATFORM) -o $(YQ)
+	@chmod +x $(YQ)
+
+GOLANGCI_LINT_VERSION := $(strip $(shell $(YQ) .jobs.golangci.steps[2].with.version .github/workflows/golangci-lint.yaml))
+GOLANGCI_LINT := $(TOOLS_HOST_DIR)/golangci-lint-$(GOLANGCI_LINT_VERSION)
+
+# KAL is a modified version of golangci-lint with itself built in as an addon. Downloading KAL as a
+# separate binary allows caching the binary between 'make' calls (vs building it into golangci-lint)
+# KAL version list: https://pkg.go.dev/sigs.k8s.io/kube-api-linter?tab=versions
+export KUBE_API_LINT_VERSION=v0.0.0-20260105171240-d42ba1d7b50c
+export KUBE_API_LINT=$(TOOLS_HOST_DIR)/golangci-lint-kube-api-linter-$(KUBE_API_LINT_VERSION)
 
 GO_OUT_DIR := $(abspath $(OUTPUT_DIR)/bin/$(PLATFORM))
 GO_TEST_OUTPUT := $(abspath $(OUTPUT_DIR)/tests/$(PLATFORM))
@@ -104,7 +113,7 @@ ifeq ($(filter help clean distclean prune go.clean, $(MAKECMDGOALS)),)
 .PHONY: go.check
 go.check:
 ifneq ($(shell $(GO) version | grep -q -E '\bgo($(GO_SUPPORTED_VERSIONS))\b' && echo 0 || echo 1), 0)
-	$(error unsupported: $(GO_FULL_VERSION). Please make install one of the following supported version: '$(GO_SUPPORTED_VERSIONS)')
+	$(error unsupported: $(GO_FULL_VERSION). Please install one of the following supported versions: '$(GO_SUPPORTED_VERSIONS)')
 endif
 
 -include go.check
@@ -118,13 +127,13 @@ go.init:
 go.build:
 	@echo === go build $(PLATFORM)
 	$(info Go version: $(shell $(GO) version))
-	$(foreach p,$(GO_STATIC_PACKAGES),@CGO_ENABLED=0 $(GO) build -v -o $(GO_OUT_DIR)/$(lastword $(subst /, ,$(p)))$(GO_OUT_EXT) $(GO_STATIC_FLAGS) $(p)${\n})
-	$(foreach p,$(GO_TEST_PACKAGES),@CGO_ENABLED=0 $(GO) test -v -c -o $(GO_TEST_OUTPUT)/$(lastword $(subst /, ,$(p)))$(GO_OUT_EXT) $(GO_STATIC_FLAGS) $(p)${\n})
+	$(foreach p,$(GO_STATIC_PACKAGES),@CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GO) build -v -o $(GO_OUT_DIR)/$(lastword $(subst /, ,$(p)))$(GO_OUT_EXT) $(GO_STATIC_FLAGS) $(p)$(NEWLINE))
+	$(foreach p,$(GO_TEST_PACKAGES),@CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GO) test -v -c -o $(GO_TEST_OUTPUT)/$(lastword $(subst /, ,$(p)))$(GO_OUT_EXT) $(GO_STATIC_FLAGS) $(p)$(NEWLINE))
 
 .PHONY: go.install
 go.install:
 	@echo === go install $(PLATFORM)
-	$(foreach p,$(GO_STATIC_PACKAGES),@CGO_ENABLED=0 $(GO) install -v $(GO_STATIC_FLAGS) $(p)${\n})
+	$(foreach p,$(GO_STATIC_PACKAGES),@CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GO) install -v $(GO_STATIC_FLAGS) $(p)$(NEWLINE))
 
 # GOJUNIT need to happen in order and NOT in parallel, so call them explicitly
 .PHONY: go.test.unit
@@ -132,34 +141,40 @@ go.test.unit:
 	@$(MAKE) $(GOJUNIT)
 	@echo === go test unit-tests
 	@mkdir -p $(GO_TEST_OUTPUT)
-	CGO_ENABLED=0 $(GOHOST) test -v -cover $(GO_STATIC_FLAGS) $(GO_PACKAGES)
-	CGO_ENABLED=0 $(GOHOST) test -v -cover $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_PACKAGES) 2>&1 | tee $(GO_TEST_OUTPUT)/unit-tests.log
+	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GO) test -v -cover $(GO_STATIC_FLAGS) $(GO_PACKAGES)
+	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GO) test -v -cover $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_PACKAGES) 2>&1 | tee $(GO_TEST_OUTPUT)/unit-tests.log
 	@cat $(GO_TEST_OUTPUT)/unit-tests.log | $(GOJUNIT) -set-exit-code > $(GO_TEST_OUTPUT)/unit-tests.xml
 
 .PHONY:
 go.test.integration: $(GOJUNIT)
 	@echo === go test integration-tests
 	@mkdir -p $(GO_TEST_OUTPUT)
-	CGO_ENABLED=0 $(GOHOST) test -v -i $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES)
-	CGO_ENABLED=0 $(GOHOST) test -v -timeout 7200s $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES) $(TEST_FILTER_PARAM) 2>&1 | tee $(GO_TEST_OUTPUT)/integration-tests.log
+	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GOHOST) test -v -i $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES)
+	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GOHOST) test -v -timeout 7200s $(GO_TEST_FLAGS) $(GO_STATIC_FLAGS) $(GO_INTEGRATION_TEST_PACKAGES) $(TEST_FILTER_PARAM) 2>&1 | tee $(GO_TEST_OUTPUT)/integration-tests.log
 	@cat $(GO_TEST_OUTPUT)/integration-tests.log | $(GOJUNIT) -set-exit-code > $(GO_TEST_OUTPUT)/integration-tests.xml
-
-.PHONY: go.lint
-go.lint: $(GOLINT)
-	@echo === go lint
-	@$(GOLINT) -set_exit_status=true $(GO_PACKAGES) $(GO_INTEGRATION_TEST_PACKAGES)
 
 .PHONY: go.vet
 go.vet:
 	@echo === go vet
-	@CGO_ENABLED=0 $(GOHOST) vet $(GO_COMMON_FLAGS) $(GO_PACKAGES) $(GO_INTEGRATION_TEST_PACKAGES)
+	CGO_ENABLED=$(CGO_ENABLED_VALUE) $(GOHOST) vet $(GO_COMMON_FLAGS) $(GO_PACKAGES) $(GO_INTEGRATION_TEST_PACKAGES)
 
 .PHONY: go.fmt
-# ignore deepcopy generated files since the tool hardcoded the header with a "// +build" which in Golang 1.17 makes it fail gofmt since "////go:build" is preferred
-# see: https://github.com/kubernetes/gengo/blob/master/examples/deepcopy-gen/generators/deepcopy.go#L136
-# https://github.com/kubernetes/gengo/pull/210
-go.fmt: $(GOFMT)
-	@gofmt_out=$$(find $(GO_SUBDIRS) -name "*.go" -not -name "*.deepcopy.go" | xargs $(GOFMT) -s -d -e 2>&1) && [ -z "$${gofmt_out}" ] || (echo "$${gofmt_out}" 1>&2; exit 1)
+go.fmt: $(GOLANGCI_LINT)
+	@$(GOLANGCI_LINT) fmt -d
+
+.PHONY: go.fmt-fix
+go.fmt-fix: $(GOLANGCI_LINT)
+	@$(GOLANGCI_LINT) fmt
+
+.PHONY: go.golangci-lint
+go.golangci-lint: $(GOLANGCI_LINT)
+	@$(GOLANGCI_LINT) run
+
+.PHONY: go.kube-api-lint
+# When KAL was added, 1310 errors were reported in Rook's APIs. Show all by default.
+KUBE_API_LINT_OPTIONS ?= --max-issues-per-linter=2000
+go.kube-api-lint: $(KUBE_API_LINT)
+	cd $(ROOT_DIR)/pkg/apis && $(KUBE_API_LINT) run --config $(ROOT_DIR)/tests/scripts/kube-api-lint.yaml $(KUBE_API_LINT_OPTIONS)
 
 go.validate: go.vet go.fmt
 
@@ -167,11 +182,19 @@ go.validate: go.vet go.fmt
 go.mod.update:
 	@echo === updating modules
 	@$(GOHOST) get -u ./...
+	@echo === updating APIs modules
+	@(cd pkg/apis/; $(GOHOST) get -u ./...)
+	@echo === syncing workspace modules
+	@$(GOHOST) work sync
 
 .PHONY: go.mod.check
 go.mod.check:
-	@echo === ensuring modules are tidied
-	@$(GOHOST) mod tidy
+	@echo === ensuring APIs modules are tidied
+	@(cd pkg/apis/; $(GOHOST) mod tidy -compat=$(GO_VERSION))
+	@echo === ensuring root modules are tidied
+	@$(GOHOST) mod tidy -compat=$(GO_VERSION)
+	@echo === syncing workspace modules
+	@$(GOHOST) work sync
 
 .PHONY: go.mod.clean
 go.mod.clean:
@@ -179,48 +202,44 @@ go.mod.clean:
 	@sudo rm -fr $(WORK_DIR)/cross_pkg
 	@$(GOHOST) clean -modcache
 
-$(GOLINT):
-	@echo === installing golint
+$(GOLANGCI_LINT): | $(TOOLS_HOST_DIR)
+	@echo === installing golangci-lint-$(GOLANGCI_LINT_VERSION)
 	@mkdir -p $(TOOLS_HOST_DIR)/tmp
-	@GOPATH=$(TOOLS_HOST_DIR)/tmp GOBIN=$(TOOLS_HOST_DIR) $(GOHOST) get github.com/golang/lint/golint
+	@curl -sL https://github.com/golangci/golangci-lint/releases/download/$(GOLANGCI_LINT_VERSION)/golangci-lint-$(patsubst v%,%,$(GOLANGCI_LINT_VERSION))-$(shell go env GOHOSTOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
+	@mv $(TOOLS_HOST_DIR)/tmp/golangci-lint-$(patsubst v%,%,$(GOLANGCI_LINT_VERSION))-$(shell go env GOHOSTOS)-$(GOHOSTARCH)/golangci-lint $(GOLANGCI_LINT)
 	@rm -fr $(TOOLS_HOST_DIR)/tmp
 
-$(GOFMT):
-	@echo === installing gofmt$(GOFMT_VERSION)
-	@mkdir -p $(TOOLS_HOST_DIR)/tmp
-	@curl -sL https://dl.google.com/go/go$(GOFMT_VERSION).$(GOHOSTOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
-	@mv $(TOOLS_HOST_DIR)/tmp/go/bin/gofmt $(GOFMT)
-	@rm -fr $(TOOLS_HOST_DIR)/tmp
+$(KUBE_API_LINT): | $(TOOLS_HOST_DIR)
+	@echo === installing kube-api-lint@$(KUBE_API_LINT_VERSION)
+	GOBIN=$(TOOLS_HOST_DIR) go install sigs.k8s.io/kube-api-linter/cmd/golangci-lint-kube-api-linter@$(KUBE_API_LINT_VERSION)
+	@ mv $(TOOLS_HOST_DIR)/golangci-lint-kube-api-linter $(KUBE_API_LINT)
 
-$(GOJUNIT):
+$(GOJUNIT): | $(TOOLS_HOST_DIR)
 	@echo === installing go-junit-report
 	@mkdir -p $(TOOLS_HOST_DIR)/tmp
-	@GOPATH=$(TOOLS_HOST_DIR)/tmp GOBIN=$(TOOLS_HOST_DIR) $(GOHOST) get github.com/jstemmer/go-junit-report
-	@$(GOHOST) clean -modcache
+	@curl -sL https://github.com/jstemmer/go-junit-report/releases/download/v2.1.0/go-junit-report-v2.1.0-$(GOOS)-$(GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
+	@mv $(TOOLS_HOST_DIR)/tmp/go-junit-report $(TOOLS_HOST_DIR)
+	@rm -fr $(TOOLS_HOST_DIR)/tmp
 
 export CONTROLLER_GEN=$(TOOLS_HOST_DIR)/controller-gen-$(CONTROLLER_GEN_VERSION)
-export YQ=$(TOOLS_HOST_DIR)/yq-v3
-$(CONTROLLER_GEN) $(YQ):
+$(CONTROLLER_GEN): | $(TOOLS_HOST_DIR)
 	{ \
 		set -e ;\
-		mkdir -p $(TOOLS_HOST_DIR) ;\
 		CONTROLLER_GEN_TMP_DIR=$$(mktemp -d) ;\
 		cd $$CONTROLLER_GEN_TMP_DIR ;\
 		go mod init tmp;\
 		unset GOOS GOARCH ;\
-		export CGO_ENABLED=0 ;\
+		export CGO_ENABLED=$(CGO_ENABLED_VALUE) ;\
 		export GOBIN=$$CONTROLLER_GEN_TMP_DIR ;\
 		echo === installing controller-gen ;\
-		go get sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION);\
+		go install sigs.k8s.io/controller-tools/cmd/controller-gen@$(CONTROLLER_GEN_VERSION);\
 		mv $$CONTROLLER_GEN_TMP_DIR/controller-gen $(CONTROLLER_GEN) ;\
-		echo === installing yq ;\
-		go get github.com/mikefarah/yq/v3;\
-		mv $$CONTROLLER_GEN_TMP_DIR/yq $(YQ) ;\
 		rm -rf $$CONTROLLER_GEN_TMP_DIR ;\
 	}
 
-export CODE_GENERATOR_VERSION=0.20.0
-export CODE_GENERATOR=$(TOOLS_HOST_DIR)/code-generator-$(CODE_GENERATOR_VERSION)
-$(CODE_GENERATOR):
-	mkdir -p $(TOOLS_HOST_DIR)
-	curl -sL https://github.com/kubernetes/code-generator/archive/refs/tags/v${CODE_GENERATOR_VERSION}.tar.gz | tar -xz -C $(TOOLS_HOST_DIR)
+
+# fetch the code generator tag from the kubernetes version used in the repo
+export KUBE_CODEGEN_TAG := $(shell cd $(ROOT_DIR) && $(GO) list -m -f '{{.Version}}' k8s.io/apimachinery)
+export CODE_GENERATOR=$(TOOLS_HOST_DIR)/code-generator-$(patsubst v%,%,$(KUBE_CODEGEN_TAG))
+$(CODE_GENERATOR): | $(TOOLS_HOST_DIR)
+	curl -sL https://github.com/kubernetes/code-generator/archive/refs/tags/$(KUBE_CODEGEN_TAG).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)

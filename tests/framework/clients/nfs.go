@@ -27,7 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// NFSOperation is a wrapper for k8s rook file operations
+// NFSOperation is a wrapper for k8s rook NFS operations
 type NFSOperation struct {
 	k8sh      *utils.K8sHelper
 	manifests installer.CephManifests
@@ -38,11 +38,15 @@ func CreateNFSOperation(k8sh *utils.K8sHelper, manifests installer.CephManifests
 	return &NFSOperation{k8sh, manifests}
 }
 
-// Create creates a filesystem in Rook
-func (n *NFSOperation) Create(namespace, name, pool string, daemonCount int) error {
+// Create creates the NFS pool and an NFS server in Rook
+func (n *NFSOperation) Create(namespace, name string, daemonCount int) error {
+	logger.Infof("creating the NFS pool")
+	if err := n.k8sh.ResourceOperation("apply", n.manifests.GetNFSPool()); err != nil {
+		return err
+	}
 
 	logger.Infof("creating the NFS daemons via CRD")
-	if err := n.k8sh.ResourceOperation("apply", n.manifests.GetNFS(name, pool, daemonCount)); err != nil {
+	if err := n.k8sh.ResourceOperation("apply", n.manifests.GetNFS(name, daemonCount)); err != nil {
 		return err
 	}
 
@@ -56,7 +60,7 @@ func (n *NFSOperation) Create(namespace, name, pool string, daemonCount int) err
 	return nil
 }
 
-// Delete deletes a filesystem in Rook
+// Delete deletes an NFS server and its pool in Rook
 func (n *NFSOperation) Delete(namespace, name string) error {
 	ctx := context.TODO()
 	options := &metav1.DeleteOptions{}
@@ -66,6 +70,51 @@ func (n *NFSOperation) Delete(namespace, name string) error {
 		return err
 	}
 
+	crdCheckerFunc := func() error {
+		_, err := n.k8sh.RookClientset.CephV1().CephNFSes(namespace).Get(ctx, name, metav1.GetOptions{})
+		return err
+	}
+
 	logger.Infof("Deleted nfs %s in namespace %s", name, namespace)
+	err = n.k8sh.WaitForCustomResourceDeletion(namespace, name, crdCheckerFunc)
+	if err != nil {
+		return err
+	}
+
+	logger.Infof("Deleting .nfs pool in namespace %s", namespace)
+	err = n.k8sh.RookClientset.CephV1().CephBlockPools(namespace).Delete(ctx, "dot-nfs", *options)
+	if err != nil && !errors.IsNotFound(err) {
+		return err
+	}
+
+	crdCheckerFunc = func() error {
+		_, err := n.k8sh.RookClientset.CephV1().CephBlockPools(namespace).Get(ctx, "dot-nfs", metav1.GetOptions{})
+		return err
+	}
+
+	logger.Infof("Deleted .nfs pool %s in namespace %s", name, namespace)
+	err = n.k8sh.WaitForCustomResourceDeletion(namespace, name, crdCheckerFunc)
+	if err != nil {
+		return err
+	}
+
+	logger.Infof("Verified Deletion of nfs %s in namespace %s", name, namespace)
 	return nil
+}
+
+// CreateStorageClass creates a storage class for NFS clients
+func (f *NFSOperation) CreateStorageClass(fsName, nfsClusterName, systemNamespace, namespace, storageClassName string) error {
+	server := fmt.Sprintf("rook-ceph-nfs-%s-a.%s.svc.cluster.local", nfsClusterName, namespace)
+
+	return f.k8sh.ResourceOperation("apply", f.manifests.GetNFSStorageClass(fsName, nfsClusterName, server, storageClassName))
+}
+
+// CreateSnapshotClass creates a Snapshot class for NFS clients
+func (f *NFSOperation) CreateSnapshotClass(fsName, snapshotClassName string) error {
+	return f.k8sh.ResourceOperation("apply", f.manifests.GetNFSSnapshotClass(fsName, snapshotClassName))
+}
+
+// DeleteSnapshotClass deletes a Snapshot class for NFS clients
+func (f *NFSOperation) DeleteSnapshotClass(fsName, snapshotClassName string) error {
+	return f.k8sh.ResourceOperation("delete", f.manifests.GetNFSSnapshotClass(fsName, snapshotClassName))
 }

@@ -25,8 +25,8 @@ import (
 
 	"github.com/coreos/pkg/capnslog"
 	"github.com/pkg/errors"
+	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/daemon/util"
-
 	"github.com/rook/rook/pkg/operator/k8sutil"
 	batch "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
@@ -50,9 +50,12 @@ const (
 	CopyBinariesMountDir = "/rook/copied-binaries"
 )
 
-var (
-	logger = capnslog.NewPackageLogger("github.com/rook/rook", "CmdReporter")
-)
+var logger = capnslog.NewPackageLogger("github.com/rook/rook", "CmdReporter")
+
+type CmdReporterInterface interface {
+	Job() *batch.Job
+	Run(ctx context.Context, timeout time.Duration) (stdout, stderr string, retcode int, retErr error)
+}
 
 // CmdReporter is a wrapper for Rook's cmd-reporter commandline utility allowing operators to use
 // the utility without fully specifying the job, pod, and container templates manually.
@@ -65,15 +68,17 @@ type CmdReporter struct {
 }
 
 type cmdReporterCfg struct {
-	clientset    kubernetes.Interface
-	ownerInfo    *k8sutil.OwnerInfo
-	appName      string
-	jobName      string
-	jobNamespace string
-	cmd          []string
-	args         []string
-	rookImage    string
-	runImage     string
+	clientset       kubernetes.Interface
+	ownerInfo       *k8sutil.OwnerInfo
+	appName         string
+	jobName         string
+	jobNamespace    string
+	cmd             []string
+	args            []string
+	rookImage       string
+	runImage        string
+	imagePullPolicy v1.PullPolicy
+	resources       cephv1.ResourceSpec
 }
 
 // New creates a new CmdReporter.
@@ -94,17 +99,21 @@ func New(
 	appName, jobName, jobNamespace string,
 	cmd, args []string,
 	rookImage, runImage string,
-) (*CmdReporter, error) {
+	imagePullPolicy v1.PullPolicy,
+	resources cephv1.ResourceSpec,
+) (CmdReporterInterface, error) {
 	cfg := &cmdReporterCfg{
-		clientset:    clientset,
-		ownerInfo:    ownerInfo,
-		appName:      appName,
-		jobName:      jobName,
-		jobNamespace: jobNamespace,
-		cmd:          cmd,
-		args:         args,
-		rookImage:    rookImage,
-		runImage:     runImage,
+		clientset:       clientset,
+		ownerInfo:       ownerInfo,
+		appName:         appName,
+		jobName:         jobName,
+		jobNamespace:    jobNamespace,
+		cmd:             cmd,
+		args:            args,
+		rookImage:       rookImage,
+		runImage:        runImage,
+		imagePullPolicy: imagePullPolicy,
+		resources:       resources,
 	}
 
 	// Validate contents of config struct, not inputs to function to catch any developer errors
@@ -120,7 +129,7 @@ func New(
 		return nil, fmt.Errorf("command [%+v] must be specified", cfg.cmd)
 	}
 	if cfg.rookImage == "" || cfg.runImage == "" {
-		return nil, fmt.Errorf("Rook image [%s] and run image [%s] must be specified", cfg.rookImage, cfg.runImage)
+		return nil, fmt.Errorf("rook image [%s] and run image [%s] must be specified", cfg.rookImage, cfg.runImage)
 	}
 
 	job, err := cfg.initJobSpec()
@@ -144,8 +153,7 @@ func (cr *CmdReporter) Job() *batch.Job {
 // and retcode of the command as long as the image ran it, even if the retcode is nonzero (failure).
 // An error is reported only if the command was not run to completion successfully. When this
 // returns, the ConfigMap is cleaned up (destroyed).
-func (cr *CmdReporter) Run(timeout time.Duration) (stdout, stderr string, retcode int, retErr error) {
-	ctx := context.TODO()
+func (cr *CmdReporter) Run(ctx context.Context, timeout time.Duration) (stdout, stderr string, retcode int, retErr error) {
 	jobName := cr.job.Name
 	namespace := cr.job.Namespace
 	errMsg := fmt.Sprintf("failed to run CmdReporter %s successfully", jobName)
@@ -156,16 +164,16 @@ func (cr *CmdReporter) Run(timeout time.Duration) (stdout, stderr string, retcod
 	delOpts.Wait = true
 	delOpts.ErrorOnTimeout = true
 	// configmap's name will be the same as the app
-	err := k8sutil.DeleteConfigMap(cr.clientset, jobName, namespace, delOpts)
+	err := k8sutil.DeleteConfigMap(ctx, cr.clientset, jobName, namespace, delOpts)
 	if err != nil {
 		return "", "", -1, fmt.Errorf("%s. failed to delete existing results ConfigMap %s. %+v", errMsg, jobName, err)
 	}
 
-	if err := k8sutil.RunReplaceableJob(cr.clientset, cr.job, true); err != nil {
+	if err := k8sutil.RunReplaceableJob(ctx, cr.clientset, cr.job, true); err != nil {
 		return "", "", -1, fmt.Errorf("%s. failed to run job. %+v", errMsg, err)
 	}
 
-	if err := cr.waitForConfigMap(timeout); err != nil {
+	if err := cr.waitForConfigMap(ctx, timeout); err != nil {
 		return "", "", -1, fmt.Errorf("%s. failed waiting for results ConfigMap %s. %+v", errMsg, jobName, err)
 	}
 	logger.Debugf("job %s has returned results", jobName)
@@ -175,13 +183,13 @@ func (cr *CmdReporter) Run(timeout time.Duration) (stdout, stderr string, retcod
 		return "", "", -1, fmt.Errorf("%s. results ConfigMap %s should be available, but got an error instead. %+v", errMsg, jobName, err)
 	}
 
-	if err := k8sutil.DeleteBatchJob(cr.clientset, namespace, jobName, false); err != nil {
+	if err := k8sutil.DeleteBatchJob(ctx, cr.clientset, namespace, jobName, false); err != nil {
 		logger.Errorf("continuing after failing delete job %s; user may need to delete it manually. %+v", jobName, err)
 	}
 
 	// just to be explicit: delete idempotently, and don't wait for delete to complete
 	delOpts = &k8sutil.DeleteOptions{MustDelete: false, WaitOptions: k8sutil.WaitOptions{Wait: false}}
-	if err := k8sutil.DeleteConfigMap(cr.clientset, jobName, namespace, delOpts); err != nil {
+	if err := k8sutil.DeleteConfigMap(ctx, cr.clientset, jobName, namespace, delOpts); err != nil {
 		logger.Errorf("continuing after failing to delete ConfigMap %s for job %s; user may need to delete it manually. %+v",
 			jobName, jobName, err)
 	}
@@ -205,9 +213,8 @@ func (cr *CmdReporter) Run(timeout time.Duration) (stdout, stderr string, retcod
 	return stdout, stderr, retcode, nil
 }
 
-// return watcher or nil if configmap exists
-func (cr *CmdReporter) newWatcher() (watch.Interface, error) {
-	ctx := context.TODO()
+// return a watcher or nil if the configmap exists
+func (cr *CmdReporter) newWatcher(ctx context.Context) (watch.Interface, error) {
 	jobName := cr.job.Name
 	namespace := cr.job.Namespace
 
@@ -238,11 +245,11 @@ func (cr *CmdReporter) newWatcher() (watch.Interface, error) {
 	return watcher, nil
 }
 
-// return nil when configmap exists
-func (cr *CmdReporter) waitForConfigMap(timeout time.Duration) error {
+// return nil when the configmap exists
+func (cr *CmdReporter) waitForConfigMap(ctx context.Context, timeout time.Duration) error {
 	jobName := cr.job.Name
 
-	watcher, err := cr.newWatcher()
+	watcher, err := cr.newWatcher(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to start watcher for the results ConfigMap. %+v", err)
 	}
@@ -257,7 +264,8 @@ func (cr *CmdReporter) waitForConfigMap(timeout time.Duration) error {
 
 	// timeout timer cannot be started inline in the select statement, or the timeout will be
 	// restarted any time k8s hangs up on the watcher and a new watcher is started
-	timeoutCh := time.After(timeout)
+	ctxWithTimeout, cancelFunc := context.WithTimeout(ctx, timeout)
+	defer cancelFunc()
 
 	for {
 		select {
@@ -269,14 +277,14 @@ func (cr *CmdReporter) waitForConfigMap(timeout time.Duration) error {
 			// clears its change history, which it keeps for only a limited time (~5 mins default)
 			logger.Infof("Kubernetes hung up the watcher for CmdReporter %s result ConfigMap %s; starting a replacement watcher", jobName, jobName)
 			watcher.Stop() // must clean up existing watcher before replacing it with a new one
-			watcher, err = cr.newWatcher()
+			watcher, err = cr.newWatcher(ctxWithTimeout)
 			if err != nil {
 				return fmt.Errorf("failed to start replacement watcher for the results ConfigMap. %+v", err)
 			}
 			if watcher == nil {
 				return nil
 			}
-		case <-timeoutCh:
+		case <-ctxWithTimeout.Done():
 			return fmt.Errorf("timed out waiting for results ConfigMap")
 		}
 	}
@@ -294,7 +302,10 @@ func (cr *cmdReporterCfg) initJobSpec() (*batch.Job, error) {
 		Containers: []v1.Container{
 			*cmdReporterContainer,
 		},
-		RestartPolicy: v1.RestartPolicyOnFailure,
+		RestartPolicy:      v1.RestartPolicyOnFailure,
+		SecurityContext:    &v1.PodSecurityContext{},
+		ServiceAccountName: k8sutil.DefaultServiceAccount,
+		HostNetwork:        cephv1.EnforceHostNetwork(),
 	}
 	copyBinsVol, _ := copyBinariesVolAndMount()
 	podSpec.Volumes = []v1.Volume{copyBinsVol}
@@ -307,7 +318,7 @@ func (cr *cmdReporterCfg) initJobSpec() (*batch.Job, error) {
 			Labels:    commonLabels,
 		},
 		Spec: batch.JobSpec{
-			Completions: newInt32(1),
+			Completions: new(int32(1)),
 			Template: v1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: commonLabels,
@@ -331,13 +342,18 @@ func (cr *cmdReporterCfg) initContainers() []v1.Container {
 	}
 
 	c := v1.Container{
-		Name: CopyBinariesInitContainerName,
-		// Command: the rook command is the default entrypoint of rook images already
+		Name:    CopyBinariesInitContainerName,
+		Command: []string{"cp"},
 		Args: []string{
-			"copy-binaries",
-			"--copy-to-dir", CopyBinariesMountDir,
+			"--archive",
+			"--force",
+			"--verbose",
+			"/usr/local/bin/rook",
+			CopyBinariesMountDir,
 		},
-		Image: cr.rookImage,
+		Image:           cr.rookImage,
+		ImagePullPolicy: cr.imagePullPolicy,
+		Resources:       cephv1.GetCmdReporterResources(cr.resources),
 	}
 	_, copyBinsMount := copyBinariesVolAndMount()
 	c.VolumeMounts = []v1.VolumeMount{copyBinsMount}
@@ -366,7 +382,9 @@ func (cr *cmdReporterCfg) container() (*v1.Container, error) {
 			"--config-map-name", cr.jobName,
 			"--namespace", cr.jobNamespace,
 		},
-		Image: cr.runImage,
+		Image:           cr.runImage,
+		ImagePullPolicy: cr.imagePullPolicy,
+		Resources:       cephv1.GetCmdReporterResources(cr.resources),
 	}
 	if cr.needToCopyBinaries() {
 		_, copyBinsMount := copyBinariesVolAndMount()
@@ -389,4 +407,33 @@ func copyBinariesVolAndMount() (v1.Volume, v1.VolumeMount) {
 	return v, m
 }
 
-func newInt32(i int32) *int32 { return &i }
+// MockCmdReporterJob creates a job using the package's internal creation mechanism without
+// validating any inputs. Use only for unit testing.
+func MockCmdReporterJob(
+	clientset kubernetes.Interface,
+	ownerInfo *k8sutil.OwnerInfo,
+	appName string,
+	jobName string,
+	jobNamespace string,
+	cmd []string,
+	args []string,
+	rookImage string,
+	runImage string,
+	imagePullPolicy v1.PullPolicy,
+	resources cephv1.ResourceSpec,
+) (*batch.Job, error) {
+	cfg := &cmdReporterCfg{
+		clientset:       clientset,
+		ownerInfo:       ownerInfo,
+		appName:         appName,
+		jobName:         jobName,
+		jobNamespace:    jobNamespace,
+		cmd:             cmd,
+		args:            args,
+		rookImage:       rookImage,
+		runImage:        runImage,
+		imagePullPolicy: imagePullPolicy,
+		resources:       resources,
+	}
+	return cfg.initJobSpec()
+}

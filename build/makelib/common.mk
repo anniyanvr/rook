@@ -15,13 +15,35 @@
 # remove default suffixes as we dont use them
 .SUFFIXES:
 
-SHELL := /bin/bash
+SHELL := /usr/bin/env bash
 ifneq (, $(shell command -v shasum))
 SHA256CMD := shasum -a 256
 else ifneq (, $(shell command -v sha256sum))
 SHA256CMD := sha256sum
 else
 $(error "please install 'shasum' or 'sha256sum'")
+endif
+
+ifneq ($(strip $(CT_VERSION)),)
+CT := go run github.com/helm/chart-testing/v3/ct@$(CT_VERSION)
+endif
+
+ifeq ($(origin DOCKERCMD),undefined)
+DOCKERCMD?=$(shell docker version >/dev/null 2>&1 && echo docker)
+ifeq ($(DOCKERCMD),)
+DOCKERCMD=$(shell podman version >/dev/null 2>&1 && echo podman)
+endif
+endif
+
+.PHONY: check.container.runtime
+check.container.runtime:
+	$(if $(shell $(DOCKERCMD) version >/dev/null 2>&1 && echo available),,$(error no usable container runtime found. Install docker or podman, or set DOCKERCMD to a working command.))
+
+MARKDOWNLINT := $(DOCKERCMD) run --rm -v $$PWD:/workdir davidanson/markdownlint-cli2:$(MARKDOWNLINT_IMAGE_VERSION)
+BLACK := $(DOCKERCMD) run --rm --volume $$PWD:/src --user $$(id -u):$$(id -g) --workdir /src pyfound/black:$(BLACK_VERSION) black
+
+ifneq ($(strip $(YAMLLINT_IMAGE_SHA)),)
+YAMLLINT := $(DOCKERCMD) run  --rm -t -v $(CURDIR):/workdir:ro -w /workdir --entrypoint yamllint cytopia/yamllint@$(YAMLLINT_IMAGE_SHA)
 endif
 
 ifeq ($(origin PLATFORM), undefined)
@@ -38,31 +60,18 @@ GOARCH := $(word 2, $(subst _, ,$(PLATFORM)))
 export GOOS GOARCH
 endif
 
-GOHOSTOS := $(shell go env GOHOSTOS)
+ALL_PLATFORMS ?= darwin_amd64 darwin_arm64 windows_amd64 linux_amd64 linux_arm64
+
+export GOARM
+
+# force the build of a linux binary when running on MacOS
+GOHOSTOS=linux
 GOHOSTARCH := $(shell go env GOHOSTARCH)
 HOST_PLATFORM := $(GOHOSTOS)_$(GOHOSTARCH)
 
-ALL_PLATFORMS ?= darwin_amd64 windows_amd64 linux_amd64 linux_arm64
-
-ifeq ($(PLATFORM),linux_amd64)
-CROSS_TRIPLE = x86_64-linux-gnu
-endif
-ifeq ($(PLATFORM),linux_arm64)
-CROSS_TRIPLE = aarch64-linux-gnu
-endif
-ifeq ($(PLATFORM),darwin_amd64)
-CROSS_TRIPLE=x86_64-apple-darwin15
-endif
-ifeq ($(PLATFORM),windows_amd64)
-CROSS_TRIPLE=x86_64-w64-mingw32
-endif
-export GOARM
-
-ifneq ($(PLATFORM),$(HOST_PLATFORM))
-CC := $(CROSS_TRIPLE)-gcc
-CXX := $(CROSS_TRIPLE)-g++
-export CC CXX
-endif
+# REAL_HOST_PLATFORM is used to determine the correct url to download the various binary tools from and it does not use
+# HOST_PLATFORM which is used to build the program.
+REAL_HOST_PLATFORM=$(shell go env GOHOSTOS)_$(GOHOSTARCH)
 
 # set the version number. you should not need to do this
 # for the majority of scenarios.
@@ -88,15 +97,59 @@ CACHE_DIR := $(ROOT_DIR)/.cache
 endif
 
 TOOLS_DIR := $(CACHE_DIR)/tools
-TOOLS_HOST_DIR := $(TOOLS_DIR)/$(HOST_PLATFORM)
+TOOLS_HOST_DIR := $(TOOLS_DIR)/$(REAL_HOST_PLATFORM)
 
 ifeq ($(origin HOSTNAME), undefined)
 HOSTNAME := $(shell hostname)
 endif
 
+ifneq ($(strip $(KUSTOMIZE_VERSION)),)
+KUSTOMIZE := $(TOOLS_HOST_DIR)/kustomize-$(KUSTOMIZE_VERSION)
+endif
+
+$(KUSTOMIZE): | $(TOOLS_HOST_DIR)
+	@echo === installing kustomize
+	@mkdir -p $(TOOLS_HOST_DIR)/tmp
+	@# kustomize releases use a specific naming convention: kustomize_vX.Y.Z_os_arch.tar.gz
+	@curl -sSL https://github.com/kubernetes-sigs/kustomize/releases/download/kustomize%2F$(KUSTOMIZE_VERSION)/kustomize_$(KUSTOMIZE_VERSION)_$(shell go env GOHOSTOS)_$(shell go env GOHOSTARCH).tar.gz | tar -xz -C $(TOOLS_HOST_DIR)/tmp
+	@mv -f $(TOOLS_HOST_DIR)/tmp/kustomize $(KUSTOMIZE)
+	@rm -rf $(TOOLS_HOST_DIR)/tmp
+	@chmod +x $(KUSTOMIZE)
+
+ifneq ($(strip $(SHELLCHECK_VERSION)),)
+
+SHELLCHECK := $(TOOLS_HOST_DIR)/shellcheck-$(SHELLCHECK_VERSION)
+
+# architecture mapping:
+# shellcheck uses aarch64 instead of arm64 for published darwin binaries
+# so we can't use go env GOHOSTARCH as usual.
+UNAME_M := $(shell uname -m)
+UNAME_S := $(shell uname -s)
+UNAME_S_LC := $(shell uname -s | tr '[:upper:]' '[:lower:]')
+SC_OS := $(UNAME_S_LC)
+
+# Map arm64 (Mac) and aarch64 (Linux) to ShellCheck's 'aarch64'
+ifeq ($(UNAME_M),x86_64)
+	SC_ARCH := x86_64
+else ifeq ($(UNAME_M),arm64)
+	SC_ARCH := aarch64
+else
+	SC_ARCH := $(UNAME_M)
+endif
+
+$(SHELLCHECK): | $(TOOLS_HOST_DIR)
+	@echo === installing shellcheck ===
+	@mkdir -p $(TOOLS_HOST_DIR)/tmp
+	@curl -fsSL -o $(TOOLS_HOST_DIR)/tmp/shellcheck.tar.xz https://github.com/koalaman/shellcheck/releases/download/$(SHELLCHECK_VERSION)/shellcheck-$(SHELLCHECK_VERSION).$(SC_OS).$(SC_ARCH).tar.xz
+	@tar xJf $(TOOLS_HOST_DIR)/tmp/shellcheck.tar.xz -C $(TOOLS_HOST_DIR)/tmp
+
+	@mv -f $(TOOLS_HOST_DIR)/tmp/shellcheck-$(SHELLCHECK_VERSION)/shellcheck $(SHELLCHECK)
+	@rm -rf $(TOOLS_HOST_DIR)/tmp
+endif # SHELLCHECK_VERSION
+
 # a registry that is scoped to the current build tree on this host
 ifeq ($(origin BUILD_REGISTRY), undefined)
-BUILD_REGISTRY := build-$(shell echo $(HOSTNAME)-$(ROOT_DIR) | $(SHA256CMD) | cut -c1-8)
+BUILD_REGISTRY := build-$(shell echo "$(HOSTNAME)-$(ROOT_DIR)" | $(SHA256CMD) | cut -c1-8)
 endif
 ifeq ($(BUILD_REGISTRY),build-)
 $(error Failed to get unique ID for host+dir. Check that '$(SHA256CMD)' functions or override SHA256CMD)
@@ -106,18 +159,18 @@ SED_IN_PLACE = $(ROOT_DIR)/build/sed-in-place
 export SED_IN_PLACE
 
 # This is a neat little target that prints any variable value from the Makefile
-# Usage: make echo.IMAGES echo.PLATFORM
+# Usage: make echo.PLATFORM
 echo.%: ; @echo $* = $($*)
 
-# Select which images (backends) to make; default to all possible images
-IMAGES ?= ceph
+# Target for creating the build tools directory
+$(TOOLS_HOST_DIR):
+	@mkdir -p $@
 
 COMMA := ,
 SPACE :=
 SPACE +=
 
 # define a newline
-define \n
-
+define NEWLINE
 
 endef

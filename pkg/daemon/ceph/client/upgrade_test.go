@@ -25,6 +25,7 @@ import (
 	cephv1 "github.com/rook/rook/pkg/apis/ceph.rook.io/v1"
 	"github.com/rook/rook/pkg/clusterd"
 	"github.com/rook/rook/pkg/daemon/ceph/client/fake"
+	cephver "github.com/rook/rook/pkg/operator/ceph/version"
 	exectest "github.com/rook/rook/pkg/util/exec/test"
 	"github.com/stretchr/testify/assert"
 )
@@ -37,7 +38,7 @@ func TestGetCephMonVersionString(t *testing.T) {
 	}
 	context := &clusterd.Context{Executor: executor}
 
-	_, err := getCephMonVersionString(context, AdminClusterInfo("mycluster"))
+	_, err := getCephMonVersionString(context, AdminTestClusterInfo("mycluster"))
 	assert.NoError(t, err)
 }
 
@@ -49,21 +50,8 @@ func TestGetCephMonVersionsString(t *testing.T) {
 	}
 	context := &clusterd.Context{Executor: executor}
 
-	_, err := getAllCephDaemonVersionsString(context, AdminClusterInfo("mycluster"))
+	_, err := getAllCephDaemonVersionsString(context, AdminTestClusterInfo("mycluster"))
 	assert.Nil(t, err)
-}
-
-func TestEnableMessenger2(t *testing.T) {
-	executor := &exectest.MockExecutor{}
-	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
-		assert.Equal(t, "mon", args[0])
-		assert.Equal(t, "enable-msgr2", args[1])
-		return "", nil
-	}
-	context := &clusterd.Context{Executor: executor}
-
-	err := EnableMessenger2(context, AdminClusterInfo("mycluster"))
-	assert.NoError(t, err)
 }
 
 func TestEnableReleaseOSDFunctionality(t *testing.T) {
@@ -75,7 +63,7 @@ func TestEnableReleaseOSDFunctionality(t *testing.T) {
 	}
 	context := &clusterd.Context{Executor: executor}
 
-	err := EnableReleaseOSDFunctionality(context, AdminClusterInfo("mycluster"), "octopus")
+	err := EnableReleaseOSDFunctionality(context, AdminTestClusterInfo("mycluster"), "squid")
 	assert.NoError(t, err)
 }
 
@@ -92,7 +80,7 @@ func TestOkToStopDaemon(t *testing.T) {
 	context := &clusterd.Context{Executor: executor}
 
 	deployment := "rook-ceph-mon-a"
-	err := okToStopDaemon(context, AdminClusterInfo("mycluster"), deployment, "mon", "a")
+	err := okToStopDaemon(context, AdminTestClusterInfo("mycluster"), deployment, "mon", "a")
 	assert.NoError(t, err)
 
 	// Second test
@@ -105,7 +93,7 @@ func TestOkToStopDaemon(t *testing.T) {
 	context = &clusterd.Context{Executor: executor}
 
 	deployment = "rook-ceph-mgr-a"
-	err = okToStopDaemon(context, AdminClusterInfo("mycluster"), deployment, "mgr", "a")
+	err = okToStopDaemon(context, AdminTestClusterInfo("mycluster"), deployment, "mgr", "a")
 	assert.NoError(t, err)
 
 	// Third test
@@ -118,7 +106,7 @@ func TestOkToStopDaemon(t *testing.T) {
 	context = &clusterd.Context{Executor: executor}
 
 	deployment = "rook-ceph-dummy-a"
-	err = okToStopDaemon(context, AdminClusterInfo("mycluster"), deployment, "dummy", "a")
+	err = okToStopDaemon(context, AdminTestClusterInfo("mycluster"), deployment, "dummy", "a")
 	assert.NoError(t, err)
 }
 
@@ -126,7 +114,7 @@ func TestOkToContinue(t *testing.T) {
 	executor := &exectest.MockExecutor{}
 	context := &clusterd.Context{Executor: executor}
 
-	err := OkToContinue(context, AdminClusterInfo("mycluster"), "rook-ceph-mon-a", "mon", "a") // mon is not checked on ok-to-continue so nil is expected
+	err := OkToContinue(context, AdminTestClusterInfo("mycluster"), "rook-ceph-mon-a", "mon", "a") // mon is not checked on ok-to-continue so nil is expected
 	assert.NoError(t, err)
 }
 
@@ -138,23 +126,26 @@ func TestFindFSName(t *testing.T) {
 }
 
 func TestDaemonMapEntry(t *testing.T) {
-	dummyVersionsRaw := []byte(`
-	{
-		"mon": {
-			"ceph version 16.2.5 (cbff874f9007f1869bfd3821b7e33b2a6ffd4988) pacific (stable)": 1,
-			"ceph version 17.2.0 (3a54b2b6d167d4a2a19e003a705696d4fe619afc) quincy (stable)": 2
-		}
-	}`)
+	dummyVersions := cephv1.CephDaemonsVersions{
+		Mon: map[string]int{"mon": 1},
+		Osd: map[string]int{"osd": 1},
+	}
+	tests := []struct {
+		daemonType string
+		expected   map[string]int
+	}{
+		{"mon", dummyVersions.Mon},
+		{"osd", dummyVersions.Osd},
+	}
+	for _, tt := range tests {
+		t.Run(tt.daemonType, func(t *testing.T) {
+			m, err := daemonMapEntry(&dummyVersions, tt.daemonType)
+			assert.NoError(t, err)
+			assert.Equal(t, tt.expected, m)
+		})
+	}
 
-	var dummyVersions cephv1.CephDaemonsVersions
-	err := json.Unmarshal([]byte(dummyVersionsRaw), &dummyVersions)
-	assert.NoError(t, err)
-
-	m, err := daemonMapEntry(&dummyVersions, "mon")
-	assert.NoError(t, err)
-	assert.Equal(t, dummyVersions.Mon, m)
-
-	_, err = daemonMapEntry(&dummyVersions, "dummy")
+	_, err := daemonMapEntry(&dummyVersions, "dummy")
 	assert.Error(t, err)
 }
 
@@ -300,7 +291,7 @@ func TestGetRetryConfig(t *testing.T) {
 }
 
 func TestOSDUpdateShouldCheckOkToStop(t *testing.T) {
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 	lsOutput := ""
 	treeOutput := ""
 	context := &clusterd.Context{
@@ -336,7 +327,7 @@ func TestOSDUpdateShouldCheckOkToStop(t *testing.T) {
 	t.Run("1 node with 3 OSDs", func(t *testing.T) {
 		lsOutput = fake.OsdLsOutput(3)
 		treeOutput = fake.OsdTreeOutput(1, 3)
-		assert.False(t, OSDUpdateShouldCheckOkToStop(context, clusterInfo))
+		assert.True(t, OSDUpdateShouldCheckOkToStop(context, clusterInfo))
 	})
 
 	t.Run("2 nodes with 1 OSD each", func(t *testing.T) {
@@ -362,6 +353,51 @@ func TestOSDUpdateShouldCheckOkToStop(t *testing.T) {
 	t.Run("0 nodes with down OSDs", func(t *testing.T) {
 		lsOutput = fake.OsdLsOutput(3)
 		treeOutput = fake.OsdTreeOutput(0, 1)
-		assert.False(t, OSDUpdateShouldCheckOkToStop(context, clusterInfo))
+		assert.True(t, OSDUpdateShouldCheckOkToStop(context, clusterInfo))
 	})
+}
+
+func TestLeastUptodateDaemonVersion(t *testing.T) {
+	clusterCtx := &clusterd.Context{
+		Executor: &exectest.MockExecutor{
+			MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+				if command != "ceph" || args[0] != "versions" {
+					panic("not a 'ceph versions' call")
+				}
+				return `{
+  "mon": {
+    "ceph version 20.3.0-661-g68f47b56 (68f47b56a9717515844599c880de2b56a7135786) tentacle (dev - Debug)": 2,
+    "ceph version 20.3.0-660-ababababa (abababababababababababababababababababab) tentacle (dev - Debug)": 1
+  },
+  "osd": {},
+  "overall": {
+    "ceph version 20.3.0-661-g68f47b56 (68f47b56a9717515844599c880de2b56a7135786) tentacle (dev - Debug)": 8
+  }
+}`, nil
+			},
+		},
+	}
+	clusterInfo := ClusterInfo{}
+	ctx := t.Context()
+	clusterInfo.Context = ctx
+
+	passed := 0
+	iterations := 100
+	for i := range iterations { // iterate the test to ensure consistent detection (#15930)
+		got, err := LeastUptodateDaemonVersion(clusterCtx, &clusterInfo, "mon")
+		assert.NoError(t, err)
+		pass := assert.Equalf(t, cephver.CephVersion{Major: 20, Minor: 3, Extra: 0, Build: 660, CommitID: "abababababababababababababababababababab"}, got, "i=%d: got %#v", i, got)
+		if pass {
+			passed++
+		}
+	}
+	assert.Equal(t, iterations, passed)
+
+	got, err := LeastUptodateDaemonVersion(clusterCtx, &clusterInfo, "osd")
+	assert.NoError(t, err)
+	assert.Zero(t, got)
+
+	got, err = LeastUptodateDaemonVersion(clusterCtx, &clusterInfo, "mgr")
+	assert.Error(t, err)
+	assert.Equal(t, cephver.CephVersion{}, got)
 }

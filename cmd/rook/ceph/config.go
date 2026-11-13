@@ -17,7 +17,6 @@ limitations under the License.
 package ceph
 
 import (
-	"io/ioutil"
 	"os"
 
 	"github.com/pkg/errors"
@@ -83,8 +82,9 @@ mon_host = ` + monHost + `
 keyring = ` + keyring + `
 `
 
-	var fileMode os.FileMode = 0444 // read-only
-	err := ioutil.WriteFile(cephclient.DefaultConfigFilePath(), []byte(cfg), fileMode)
+	var fileMode os.FileMode = 0o444 // read-only
+	// #nosec G703 -- path is a constant returned by DefaultConfigFilePath, not user input
+	err := os.WriteFile(cephclient.DefaultConfigFilePath(), []byte(cfg), fileMode)
 	if err != nil {
 		rook.TerminateFatal(errors.Wrapf(err, "failed to write config file"))
 	}

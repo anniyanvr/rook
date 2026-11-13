@@ -76,17 +76,99 @@ func TestHostTree(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	tree, err := HostTree(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"))
+	tree, err := HostTree(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"))
 	assert.NoError(t, err)
 	assert.Equal(t, 2, len(tree.Nodes))
 	assert.Equal(t, "minikube", tree.Nodes[0].Name)
 	assert.Equal(t, 3, len(tree.Nodes[0].Children))
 
 	emptyTreeResult = true
-	tree, err = HostTree(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"))
+	tree, err = HostTree(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"))
 	assert.Error(t, err)
 	assert.Equal(t, 0, len(tree.Nodes))
+}
 
+func TestGetDestroyedIDs(t *testing.T) {
+	treeWithDestroyed := `{
+		"nodes": [
+			{"id": -1, "name": "default", "type": "root", "type_id": 10, "children": [-3]},
+			{"id": -3, "name": "node1", "type": "host", "type_id": 1, "children": [0, 1, 2]},
+			{"id": 0, "name": "osd.0", "type": "osd", "type_id": 0, "exists": 1, "status": "up"},
+			{"id": 1, "name": "osd.1", "type": "osd", "type_id": 0, "exists": 1, "status": "destroyed"},
+			{"id": 2, "name": "osd.2", "type": "osd", "type_id": 0, "exists": 1, "status": "down"}
+		],
+		"stray": []
+	}`
+
+	executor := &exectest.MockExecutor{}
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+		if args[0] == "osd" && args[1] == "tree" {
+			return treeWithDestroyed, nil
+		}
+		return "", errors.Errorf("unexpected ceph command %q", args)
+	}
+
+	tree, err := HostTree(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"))
+	assert.NoError(t, err)
+	assert.Equal(t, []int{1}, tree.GetDestroyedIDs())
+
+	// no destroyed slots
+	executor.MockExecuteCommandWithOutput = func(command string, args ...string) (string, error) {
+		if args[0] == "osd" && args[1] == "tree" {
+			return fakeOsdTree, nil
+		}
+		return "", errors.Errorf("unexpected ceph command %q", args)
+	}
+	tree, err = HostTree(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"))
+	assert.NoError(t, err)
+	assert.Empty(t, tree.GetDestroyedIDs())
+}
+
+func TestOSDLifecycleHelpers(t *testing.T) {
+	var gotArgs []string
+	failNext := false
+	executor := &exectest.MockExecutor{
+		MockExecuteCommandWithOutput: func(command string, args ...string) (string, error) {
+			gotArgs = args
+			if failNext {
+				return "", errors.New("boom")
+			}
+			return "", nil
+		},
+	}
+	ctx := &clusterd.Context{Executor: executor}
+	info := AdminTestClusterInfo("mycluster")
+	// the ceph command appends global flags (--cluster, --conf, ...); assert only the leading args.
+	hasPrefix := func(prefix ...string) bool {
+		if len(gotArgs) < len(prefix) {
+			return false
+		}
+		for i, p := range prefix {
+			if gotArgs[i] != p {
+				return false
+			}
+		}
+		return true
+	}
+
+	assert.NoError(t, OSDOut(ctx, info, 5))
+	assert.True(t, hasPrefix("osd", "out", "5"), "got %v", gotArgs)
+
+	assert.NoError(t, OSDIn(ctx, info, 5))
+	assert.True(t, hasPrefix("osd", "in", "5"), "got %v", gotArgs)
+
+	assert.NoError(t, OSDDown(ctx, info, 5))
+	assert.True(t, hasPrefix("osd", "down", "5"), "got %v", gotArgs)
+
+	assert.NoError(t, OSDDestroy(ctx, info, 5))
+	assert.True(t, hasPrefix("osd", "destroy", "osd.5", "--yes-i-really-mean-it"), "got %v", gotArgs)
+
+	// error propagation
+	failNext = true
+	assert.Error(t, OSDOut(ctx, info, 5))
+	assert.Error(t, OSDIn(ctx, info, 5))
+	assert.Error(t, OSDDown(ctx, info, 5))
+	assert.Error(t, OSDDestroy(ctx, info, 5))
 }
 
 func TestOsdListNum(t *testing.T) {
@@ -104,12 +186,12 @@ func TestOsdListNum(t *testing.T) {
 		return "", errors.Errorf("unexpected ceph command %q", args)
 	}
 
-	list, err := OsdListNum(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"))
+	list, err := OsdListNum(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"))
 	assert.NoError(t, err)
 	assert.Equal(t, 3, len(list))
 
 	emptyOsdListNumResult = true
-	list, err = OsdListNum(&clusterd.Context{Executor: executor}, AdminClusterInfo("mycluster"))
+	list, err = OsdListNum(&clusterd.Context{Executor: executor}, AdminTestClusterInfo("mycluster"))
 	assert.Error(t, err)
 	assert.Equal(t, 0, len(list))
 }
@@ -127,7 +209,7 @@ func TestOSDDeviceClasses(t *testing.T) {
 	}
 
 	context := &clusterd.Context{Executor: executor}
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 
 	t.Run("device classes returned", func(t *testing.T) {
 		deviceClasses, err := OSDDeviceClasses(context, clusterInfo, []string{"0"})
@@ -139,6 +221,18 @@ func TestOSDDeviceClasses(t *testing.T) {
 		_, err := OSDDeviceClasses(context, clusterInfo, []string{})
 		assert.Error(t, err)
 	})
+}
+
+func TestConvertKibibytesToTebibytes(t *testing.T) {
+	kib := "1024"
+	terabyte, err := convertKibibytesToTebibytes(kib)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(9.5367431640625e-07), terabyte)
+
+	kib = "1073741824"
+	terabyte, err = convertKibibytesToTebibytes(kib)
+	assert.NoError(t, err)
+	assert.Equal(t, float64(1), terabyte)
 }
 
 func TestOSDOkToStop(t *testing.T) {
@@ -161,16 +255,16 @@ func TestOSDOkToStop(t *testing.T) {
 	}
 
 	context := &clusterd.Context{Executor: executor}
-	clusterInfo := AdminClusterInfo("mycluster")
+	clusterInfo := AdminTestClusterInfo("mycluster")
 
 	doSetup := func() {
 		seenArgs = []string{}
 	}
 
-	t.Run("pacific output ok to stop", func(t *testing.T) {
+	t.Run("output ok to stop", func(t *testing.T) {
 		doSetup()
-		clusterInfo.CephVersion = version.Pacific
-		returnString = fake.OsdOkToStopOutput(1, []int{1, 2}, true)
+		clusterInfo.CephVersion = version.Squid
+		returnString = fake.OsdOkToStopOutput(1, []int{1, 2})
 		returnOkResult = true
 		osds, err := OSDOkToStop(context, clusterInfo, 1, 2)
 		assert.NoError(t, err)
@@ -179,10 +273,10 @@ func TestOSDOkToStop(t *testing.T) {
 		assert.Equal(t, "--max=2", seenArgs[3])
 	})
 
-	t.Run("pacific output not ok to stop", func(t *testing.T) {
+	t.Run("output not ok to stop", func(t *testing.T) {
 		doSetup()
-		clusterInfo.CephVersion = version.Pacific
-		returnString = fake.OsdOkToStopOutput(3, []int{}, true)
+		clusterInfo.CephVersion = version.Squid
+		returnString = fake.OsdOkToStopOutput(3, []int{})
 		returnOkResult = false
 		_, err := OSDOkToStop(context, clusterInfo, 3, 5)
 		assert.Error(t, err)
@@ -190,10 +284,10 @@ func TestOSDOkToStop(t *testing.T) {
 		assert.Equal(t, "--max=5", seenArgs[3])
 	})
 
-	t.Run("pacific handles maxReturned=0", func(t *testing.T) {
+	t.Run("handle maxReturned=0", func(t *testing.T) {
 		doSetup()
-		clusterInfo.CephVersion = version.Pacific
-		returnString = fake.OsdOkToStopOutput(4, []int{4, 8}, true)
+		clusterInfo.CephVersion = version.Squid
+		returnString = fake.OsdOkToStopOutput(4, []int{4, 8})
 		returnOkResult = true
 		osds, err := OSDOkToStop(context, clusterInfo, 4, 0)
 		assert.NoError(t, err)
@@ -201,28 +295,5 @@ func TestOSDOkToStop(t *testing.T) {
 		assert.Equal(t, "4", seenArgs[2])
 		// should just pass through as --max=0; don't do any special processing
 		assert.Equal(t, "--max=0", seenArgs[3])
-	})
-
-	t.Run("octopus output not ok to stop", func(t *testing.T) {
-		doSetup()
-		clusterInfo.CephVersion = version.Octopus
-		returnString = fake.OsdOkToStopOutput(3, []int{}, false)
-		returnOkResult = false
-		_, err := OSDOkToStop(context, clusterInfo, 3, 5)
-		assert.Error(t, err)
-		assert.Equal(t, "3", seenArgs[2])
-		assert.NotContains(t, seenArgs[3], "--max") // do not issue the "--max" flag below pacific
-	})
-
-	t.Run("octopus output ok to stop", func(t *testing.T) {
-		doSetup()
-		clusterInfo.CephVersion = version.Octopus
-		returnString = fake.OsdOkToStopOutput(50, []int{50}, false)
-		returnOkResult = true
-		osds, err := OSDOkToStop(context, clusterInfo, 50, 2)
-		assert.NoError(t, err)
-		assert.ElementsMatch(t, osds, []int{50})
-		assert.Equal(t, "50", seenArgs[2])
-		assert.NotContains(t, seenArgs[3], "--max") // do not issue the "--max" flag below pacific
 	})
 }

@@ -32,7 +32,7 @@ type BootstrapPeerToken struct {
 	Token string `json:"token"`
 }
 
-// RemoveFilesystemMirrorPeer add a mirror peer in the cephfs-mirror configuration
+// RemoveFilesystemMirrorPeer removes a mirror peer from the cephfs-mirror configuration
 func RemoveFilesystemMirrorPeer(context *clusterd.Context, clusterInfo *ClusterInfo, peerUUID string) error {
 	logger.Infof("removing cephfs-mirror peer %q", peerUUID)
 
@@ -68,7 +68,7 @@ func EnableFilesystemSnapshotMirror(context *clusterd.Context, clusterInfo *Clus
 	return nil
 }
 
-// DisableFilesystemSnapshotMirror enables filesystem snapshot mirroring
+// DisableFilesystemSnapshotMirror disables filesystem snapshot mirroring
 func DisableFilesystemSnapshotMirror(context *clusterd.Context, clusterInfo *ClusterInfo, filesystem string) error {
 	logger.Infof("disabling ceph filesystem snapshot mirror for filesystem %q", filesystem)
 
@@ -165,13 +165,15 @@ func GetSnapshotScheduleStatus(context *clusterd.Context, clusterInfo *ClusterIn
 	return filesystemSnapshotSchedulesStatusSpec, nil
 }
 
-// ImportFSMirrorBootstrapPeer add a mirror peer in the cephfs-mirror configuration
+// ImportFSMirrorBootstrapPeer adds a mirror peer in the cephfs-mirror configuration
 func ImportFSMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *ClusterInfo, fsName, token string) error {
 	logger.Infof("importing cephfs bootstrap peer token for filesystem %q", fsName)
 
 	// Build command
-	args := []string{"fs", "snapshot", "mirror", "peer_bootstrap", "import", fsName, token}
+	args := []string{"fs", "snapshot", "mirror", "peer_bootstrap", "import", fsName, strings.TrimSpace(token)}
 	cmd := NewCephCommand(context, clusterInfo, args)
+	cmd.JsonOutput = false
+	cmd.combinedOutput = true
 
 	// Run command
 	output, err := cmd.Run()
@@ -183,7 +185,7 @@ func ImportFSMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *Cluster
 	return nil
 }
 
-// CreateFSMirrorBootstrapPeer add a mirror peer in the cephfs-mirror configuration
+// CreateFSMirrorBootstrapPeer creates a bootstrap peer token for the cephfs-mirror configuration
 func CreateFSMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *ClusterInfo, fsName string) ([]byte, error) {
 	logger.Infof("create cephfs-mirror bootstrap peer token for filesystem %q", fsName)
 
@@ -200,7 +202,12 @@ func CreateFSMirrorBootstrapPeer(context *clusterd.Context, clusterInfo *Cluster
 	// Unmarshal JSON into Go struct
 	var bootstrapPeerToken BootstrapPeerToken
 	if err := json.Unmarshal(output, &bootstrapPeerToken); err != nil {
-		return nil, errors.Wrapf(err, "failed to unmarshal cephfs-mirror peer token create response. %s", output)
+		// the response carries the peer bootstrap token, and this error reaches the
+		// operator log and a Kubernetes event by way of ReportReconcileResult. A type
+		// error names the offending field, but a syntax error reports only its message,
+		// so report the response size in its place.
+		logger.Tracef("failed to unmarshal cephfs-mirror peer token create response: %s", string(output)) // only trace(insecure) logged, per the TRACE_INSECURE contract
+		return nil, errors.Wrapf(err, "failed to unmarshal cephfs-mirror peer token create response (%d bytes)", len(output))
 	}
 
 	logger.Infof("successfully created cephfs-mirror bootstrap peer token for filesystem %q", fsName)
@@ -213,7 +220,7 @@ func GetFSMirrorDaemonStatus(context *clusterd.Context, clusterInfo *ClusterInfo
 	logger.Debugf("retrieving filesystem mirror status for filesystem %q", fsName)
 
 	// Build command
-	args := []string{"fs", "snapshot", "mirror", "daemon", "status", fsName}
+	args := []string{"fs", "snapshot", "mirror", "daemon", "status"}
 	cmd := NewCephCommand(context, clusterInfo, args)
 
 	// Run command

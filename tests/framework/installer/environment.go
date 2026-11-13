@@ -18,27 +18,23 @@ package installer
 
 import (
 	"os"
+	"os/exec"
 )
 
-// testHelmPath gets the helm path
-func testHelmPath() string {
-	return getEnvVarWithDefault("TEST_HELM_PATH", "/tmp/rook-tests-scripts-helm/helm")
+// TestHelmPath gets the path of the helm binary
+func TestHelmPath() string {
+	helmPath := os.Getenv("TEST_HELM_PATH")
+	if helmPath == "" {
+		if path, err := exec.LookPath("helm"); err == nil {
+			helmPath = path
+		}
+	}
+	return helmPath
 }
 
 // TestLogCollectionLevel gets whether to collect all logs
 func TestLogCollectionLevel() string {
 	return getEnvVarWithDefault("TEST_LOG_COLLECTION_LEVEL", "")
-}
-
-// testStorageProvider gets the storage provider for which tests should be run
-func testStorageProvider() string {
-	return getEnvVarWithDefault("STORAGE_PROVIDER_TESTS", "")
-}
-
-// TestIsOfficialBuild gets the storage provider for which tests should be run
-func TestIsOfficialBuild() bool {
-	// PRs will set this to "false", but the official build will not set it, so we compare against "false"
-	return getEnvVarWithDefault("TEST_IS_OFFICIAL_BUILD", "") != "false"
 }
 
 func StorageClassName() string {
@@ -64,12 +60,12 @@ func baseTestDir() (string, error) {
 	return val, nil
 }
 
-// TestScratchDevice get the scratch device to be used for OSD
+// TestScratchDevice gets the scratch device to be used for OSD
 func TestScratchDevice() string {
 	return getEnvVarWithDefault("TEST_SCRATCH_DEVICE", "/dev/nvme0n1")
 }
 
-// getDeviceFilter get the device name used for OSD
+// getDeviceFilter gets the device filter used to select OSD devices
 func getDeviceFilter() string {
 	return getEnvVarWithDefault("DEVICE_FILTER", `""`)
 }
